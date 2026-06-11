@@ -86,10 +86,12 @@ func prefixToIPNet(p netip.Prefix) *net.IPNet {
 	addr := p.Masked().Addr()
 	var ip net.IP
 	if addr.Is4() {
-		ip = addr.As4()[:]
+		b4 := addr.As4()
+		ip = b4[:]
 		return &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, 32)}
 	}
-	ip = addr.As16()[:]
+	b16 := addr.As16()
+	ip = b16[:]
 	return &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, 128)}
 }
 
