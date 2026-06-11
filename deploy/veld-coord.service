@@ -1,0 +1,39 @@
+# /etc/systemd/system/veld-coord.service
+# Install: sudo cp veld-coord.service /etc/systemd/system/
+#          sudo systemctl daemon-reload
+#          sudo systemctl enable --now veld-coord
+
+[Unit]
+Description=Veld Coordination Server
+Documentation=https://github.com/veldmesh/veld
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/veld-coord \
+    -listen :50051 \
+    -db /var/lib/veld/coord.db
+
+# Restart policy: always restart, back off up to 60 s between attempts.
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=5
+StartLimitIntervalSec=60s
+
+# Sandboxing: DynamicUser creates a transient system account so the process
+# never runs as root and the UID is released on stop.
+DynamicUser=yes
+StateDirectory=veld
+StateDirectoryMode=0750
+
+# Reduce attack surface.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

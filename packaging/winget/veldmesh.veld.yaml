@@ -1,0 +1,35 @@
+# Winget manifest — submit via PR to microsoft/winget-pkgs under
+# manifests/v/veldmesh/veld/<version>/
+# Run `winget validate --manifest .` locally before submitting.
+PackageIdentifier: veldmesh.veld
+PackageVersion: 0.1.0
+PackageName: Veld
+Publisher: Veld Authors
+PublisherUrl: https://veld.io
+PublisherSupportUrl: https://github.com/veldmesh/veld/issues
+PackageUrl: https://veld.io
+License: MIT
+LicenseUrl: https://github.com/veldmesh/veld/blob/main/LICENSE
+ShortDescription: Zero-trust mesh VPN daemon and CLI
+Description: >-
+  Veld is a peer-to-peer encrypted mesh VPN. Per-network pricing, not per-user.
+  Built on Noise IK. Traffic never passes through Veld's servers.
+Tags:
+  - vpn
+  - networking
+  - wireguard
+  - mesh
+  - zero-trust
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    InstallerUrl: https://github.com/veldmesh/veld/releases/download/v0.1.0/veld-v0.1.0-windows_amd64.tar.gz
+    InstallerSha256: FILL_IN_FROM_CHECKSUMS_TXT
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: veld.exe
+        PortableCommandAlias: veld
+      - RelativeFilePath: veld-daemon.exe
+        PortableCommandAlias: veld-daemon
+ManifestType: singleton
+ManifestVersion: 1.6.0

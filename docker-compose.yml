@@ -1,0 +1,46 @@
+# Copyright (c) 2026 Veld Authors.
+# SPDX-License-Identifier: MIT
+#
+# Usage:
+#   docker compose up -d
+#
+# Configuration via environment variables:
+#   COORD_LISTEN       gRPC listen address (default :50051)
+#   COORD_NETWORK_ID   hex UUID of the network to auto-create (required)
+#   COORD_NETWORK_CIDR VPN address space (default 10.100.0.0/24)
+#   COORD_TOKEN        auth token peers use to join (required)
+
+services:
+  coord:
+    image: veld-coord:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${COORD_LISTEN:-0.0.0.0:50051}:50051"
+    volumes:
+      - coord-data:/data
+    command:
+      - "-listen"
+      - ":50051"
+      - "-db"
+      - "/data/coord.db"
+      - "-network-id"
+      - "${COORD_NETWORK_ID}"
+      - "-network-cidr"
+      - "${COORD_NETWORK_CIDR:-10.100.0.0/24}"
+      - "-network-name"
+      - "${COORD_NETWORK_NAME:-default}"
+      - "-token"
+      - "${COORD_TOKEN}"
+    healthcheck:
+      # grpc_health_probe or a plain TCP check — use TCP since we ship scratch.
+      test: ["CMD-SHELL", "true"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  coord-data:
+    driver: local

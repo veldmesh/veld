@@ -1,0 +1,33 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - goheader
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+linters-settings:
+  goheader:
+    template: |-
+      Copyright (c) 2026 Veld Authors.
+      SPDX-License-Identifier: {{ SPDX }}
+    values:
+      regexp:
+        SPDX: "MIT|BUSL-1\\.1"
+  errcheck:
+    # Ignore WriteTo / conn.WriteTo errors — packet send errors are best-effort
+    # and logged elsewhere. Also ignore hkdf.Read which never errors.
+    exclude-functions:
+      - (net.PacketConn).WriteTo
+      - (net.Conn).Write
+      - io.ReadFull
+
+issues:
+  exclude-rules:
+    # Test files: allow unhandled errors in test helpers.
+    - path: _test\.go
+      linters: [errcheck]

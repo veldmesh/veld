@@ -1,0 +1,45 @@
+# /etc/systemd/system/veld-daemon.service
+# Install: sudo cp veld-daemon.service /etc/systemd/system/
+#          sudo systemctl daemon-reload
+#          sudo systemctl enable --now veld-daemon
+#
+# The daemon needs CAP_NET_ADMIN to create/configure TUN interfaces.
+# The install script runs setcap on the binary so this service can run
+# without root — set the binary path in ExecStart accordingly.
+
+[Unit]
+Description=Veld VPN Daemon
+Documentation=https://github.com/veldmesh/veld
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/veld-daemon --config /etc/veld/config.toml
+
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=5
+StartLimitIntervalSec=60s
+
+# The binary must have cap_net_admin set via setcap (done by install.sh).
+# Running as a normal user is preferred once setcap is applied.
+User=veld
+Group=veld
+
+RuntimeDirectory=veld
+RuntimeDirectoryMode=0750
+StateDirectory=veld
+StateDirectoryMode=0750
+ConfigurationDirectory=veld
+
+# Drop everything except what TUN management requires.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target

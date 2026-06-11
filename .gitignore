@@ -1,0 +1,42 @@
+# Claude Code internal files — never publish
+CLAUDE.md
+.claude/
+
+# Binaries
+veld-daemon
+veld-coord
+veld
+*.exe
+
+# Build output
+dist/
+bin/
+
+# Generated protobuf stubs (committed separately via make proto)
+# gen/ is intentionally committed — remove this line if you want to gitignore it
+
+# Go
+*.test
+*.out
+*.db
+vendor/
+
+# Config and secrets
+*.key
+*.pem
+known_peers.toml
+config.toml
+
+# Node / web
+web/node_modules/
+web/.next/
+web/out/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

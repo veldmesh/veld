@@ -1,0 +1,9 @@
+# Normalize line endings to LF on commit
+* text=auto eol=lf
+
+# Binary files — no line-ending conversion, no diff
+*.exe    binary
+*.pb.go  -diff
+
+# Lock files — tracked but excluded from diffs
+go.sum text eol=lf -diff

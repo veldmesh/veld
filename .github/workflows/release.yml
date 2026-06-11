@@ -1,0 +1,204 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write    # create GitHub Release and upload assets
+  id-token: write    # Sigstore keyless OIDC signing
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm && format('/v{0}', matrix.goarm) || '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64             }
+          - { goos: linux,   goarch: arm64             }
+          - { goos: linux,   goarch: arm,   goarm: '7' }
+          - { goos: linux,   goarch: arm,   goarm: '6' }
+          - { goos: linux,   goarch: mips              }
+          - { goos: linux,   goarch: mipsle            }
+          - { goos: darwin,  goarch: amd64             }
+          - { goos: darwin,  goarch: arm64             }
+          - { goos: windows, goarch: amd64             }
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Set build variables
+        id: vars
+        run: |
+          PLATFORM="${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.goarm && format('_v{0}', matrix.goarm) || '' }}"
+          EXT="${{ matrix.goos == 'windows' && '.exe' || '' }}"
+          echo "platform=$PLATFORM" >> "$GITHUB_OUTPUT"
+          echo "ext=$EXT"           >> "$GITHUB_OUTPUT"
+          echo "outdir=dist/$PLATFORM" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm || '' }}
+        run: |
+          OUTDIR="${{ steps.vars.outputs.outdir }}"
+          EXT="${{ steps.vars.outputs.ext }}"
+          mkdir -p "$OUTDIR"
+          go build -trimpath -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+            -o "$OUTDIR/veld-daemon$EXT" ./cmd/veld-daemon
+          go build -trimpath -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+            -o "$OUTDIR/veld-coord$EXT" ./cmd/veld-coord
+          go build -trimpath -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+            -o "$OUTDIR/veld$EXT" ./cmd/veld
+
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        with:
+          path: ${{ steps.vars.outputs.outdir }}
+          output-file: ${{ steps.vars.outputs.outdir }}/sbom.spdx.json
+          format: spdx-json
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5  # v3.10.1
+
+      - name: Sign binaries and SBOM (Sigstore keyless)
+        run: |
+          OUTDIR="${{ steps.vars.outputs.outdir }}"
+          EXT="${{ steps.vars.outputs.ext }}"
+          for bin in veld-daemon veld-coord veld; do
+            cosign sign-blob --yes \
+              --bundle "$OUTDIR/${bin}${EXT}.bundle" \
+              "$OUTDIR/${bin}${EXT}"
+          done
+          cosign sign-blob --yes \
+            --bundle "$OUTDIR/sbom.spdx.json.bundle" \
+            "$OUTDIR/sbom.spdx.json"
+
+      - name: Create release archive
+        # Binaries are placed at the archive root (no subdirectory) so package
+        # managers and manual installs can extract directly into a bin/ directory.
+        run: |
+          PLATFORM="${{ steps.vars.outputs.platform }}"
+          OUTDIR="${{ steps.vars.outputs.outdir }}"
+          EXT="${{ steps.vars.outputs.ext }}"
+          tar -czf "veld-${{ github.ref_name }}-${PLATFORM}.tar.gz" \
+            -C "$OUTDIR" \
+            "veld${EXT}" "veld-daemon${EXT}" "veld-coord${EXT}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: release-${{ steps.vars.outputs.platform }}
+          path: |
+            veld-${{ github.ref_name }}-${{ steps.vars.outputs.platform }}.tar.gz
+            ${{ steps.vars.outputs.outdir }}/sbom.spdx.json
+            ${{ steps.vars.outputs.outdir }}/*.bundle
+          retention-days: 1
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      checksums: ${{ steps.checksums.outputs.file }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets/
+
+      - name: Generate checksums
+        id: checksums
+        run: |
+          cd release-assets
+          sha256sum veld-*.tar.gz > checksums.txt
+          echo "file=release-assets/checksums.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
+        with:
+          files: |
+            release-assets/veld-*.tar.gz
+            release-assets/checksums.txt
+            release-assets/*.bundle
+            release-assets/*.spdx.json
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+      - name: Upload checksums artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: checksums
+          path: release-assets/checksums.txt
+          retention-days: 1
+
+  update-homebrew-tap:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    # Skip for pre-releases (alpha/beta/rc tags contain a hyphen).
+    if: ${{ !contains(github.ref_name, '-') }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - name: Download checksums
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: checksums
+          path: .
+
+      # Generate a short-lived installation token scoped only to homebrew-tap.
+      # Requires: HOMEBREW_APP_ID variable + HOMEBREW_APP_PRIVATE_KEY secret set
+      # on this repo, and the app installed on veldmesh/homebrew-tap.
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547  # v1.12.0
+        with:
+          app-id: ${{ vars.HOMEBREW_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: veldmesh
+          repositories: homebrew-tap
+
+      - name: Push updated formula to homebrew-tap
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION_NUM="${VERSION#v}"
+
+          SHA_DARWIN_ARM64=$(grep "darwin_arm64.tar.gz"  checksums.txt | awk '{print $1}')
+          SHA_DARWIN_AMD64=$(grep "darwin_amd64.tar.gz"  checksums.txt | awk '{print $1}')
+          SHA_LINUX_ARM64=$(grep  "linux_arm64.tar.gz"   checksums.txt | awk '{print $1}')
+          SHA_LINUX_AMD64=$(grep  "linux_amd64.tar.gz"   checksums.txt | awk '{print $1}')
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/veldmesh/homebrew-tap.git" tap
+          cd tap
+
+          sed \
+            -e "s|__VERSION__|${VERSION_NUM}|g" \
+            -e "s|__SHA_DARWIN_ARM64__|${SHA_DARWIN_ARM64}|g" \
+            -e "s|__SHA_DARWIN_AMD64__|${SHA_DARWIN_AMD64}|g" \
+            -e "s|__SHA_LINUX_ARM64__|${SHA_LINUX_ARM64}|g" \
+            -e "s|__SHA_LINUX_AMD64__|${SHA_LINUX_AMD64}|g" \
+            ../packaging/homebrew/veld.rb.tmpl > Formula/veld.rb
+
+          git config user.name  "veld-release-bot[bot]"
+          git config user.email "veld-release-bot[bot]@users.noreply.github.com"
+          git add Formula/veld.rb
+          git diff --cached --quiet || git commit -m "veld ${VERSION}"
+          git push

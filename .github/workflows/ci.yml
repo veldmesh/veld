@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test & Vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: go test
+        run: go test ./...
+
+      - name: go vet
+        run: go vet ./...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@55c2c1448f86e01eaae002a5a3a9624417608d84  # v6.5.2
+        with:
+          version: latest
+          args: --timeout=5m
+
+  build-check:
+    name: Cross-compile check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64   }
+          - { goos: linux,   goarch: arm64   }
+          - { goos: linux,   goarch: arm,    goarm: '7' }
+          - { goos: linux,   goarch: arm,    goarm: '6' }
+          - { goos: linux,   goarch: mips    }
+          - { goos: linux,   goarch: mipsle  }
+          - { goos: darwin,  goarch: amd64   }
+          - { goos: darwin,  goarch: arm64   }
+          - { goos: windows, goarch: amd64   }
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Build all binaries
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm || '' }}
+        run: |
+          go build ./cmd/veld-daemon
+          go build ./cmd/veld-coord
+          go build ./cmd/veld
