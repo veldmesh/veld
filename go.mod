@@ -1,11 +1,13 @@
 module github.com/veldmesh/veld
 
-go 1.22
+go 1.26
 
 require (
 	github.com/BurntSushi/toml v1.3.2
 	github.com/flynn/noise v1.1.0
 	github.com/golang/protobuf v1.5.4
+	github.com/hashicorp/mdns v1.0.6
+	github.com/spf13/cobra v1.8.1
 	github.com/vishvananda/netlink v1.3.0
 	go.etcd.io/bbolt v1.3.10
 	golang.org/x/crypto v0.32.0
@@ -14,10 +16,8 @@ require (
 )
 
 require (
-	github.com/hashicorp/mdns v1.0.6 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/miekg/dns v1.1.55 // indirect
-	github.com/spf13/cobra v1.8.1 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/vishvananda/netns v0.0.4 // indirect
 	golang.org/x/mod v0.17.0 // indirect

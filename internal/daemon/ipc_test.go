@@ -11,7 +11,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
@@ -234,7 +233,6 @@ func TestIPCServer_StartStop(t *testing.T) {
 	tmpDir := t.TempDir()
 	socketPath := filepath.Join(tmpDir, "daemon.sock")
 
-	var wg sync.WaitGroup
 	srv := NewIPCServer(socketPath, func() {})
 
 	// Test that Start/Stop work
@@ -276,5 +274,4 @@ func TestIPCServer_StartStop(t *testing.T) {
 		t.Errorf("socket still exists after Stop")
 	}
 
-	_ = wg // suppress unused
 }
