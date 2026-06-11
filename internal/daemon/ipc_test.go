@@ -17,9 +17,20 @@ import (
 	"github.com/veldmesh/veld/internal/peer"
 )
 
+// tempSock returns a socket path short enough for macOS's 104-byte sun_path limit.
+// t.TempDir() embeds the full test name and can exceed that limit.
+func tempSock(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "v-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "d.sock")
+}
+
 func TestIPCServer_Status(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "daemon.sock")
+	socketPath := tempSock(t)
 
 	stopCh := make(chan struct{})
 	srv := NewIPCServer(socketPath, func() { close(stopCh) })
@@ -66,8 +77,7 @@ func TestIPCServer_Status(t *testing.T) {
 }
 
 func TestIPCServer_UpdateStatus(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "daemon.sock")
+	socketPath := tempSock(t)
 
 	srv := NewIPCServer(socketPath, func() {})
 	err := srv.Start()
@@ -128,8 +138,7 @@ func TestIPCServer_UpdateStatus(t *testing.T) {
 }
 
 func TestIPCServer_Shutdown(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "daemon.sock")
+	socketPath := tempSock(t)
 
 	stopped := make(chan struct{})
 	srv := NewIPCServer(socketPath, func() { close(stopped) })
@@ -171,8 +180,7 @@ func TestIPCServer_Shutdown(t *testing.T) {
 }
 
 func TestIPCServer_MethodNotAllowed(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "daemon.sock")
+	socketPath := tempSock(t)
 
 	srv := NewIPCServer(socketPath, func() {})
 	err := srv.Start()
@@ -230,8 +238,7 @@ func TestPeerTableSnapshot(t *testing.T) {
 }
 
 func TestIPCServer_StartStop(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "daemon.sock")
+	socketPath := tempSock(t)
 
 	srv := NewIPCServer(socketPath, func() {})
 
