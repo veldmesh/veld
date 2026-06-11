@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package veld.coord.v1;
+
+option go_package = "github.com/veldmesh/veld/gen/veld/coord/v1;coordv1";
+
+// Peer represents a registered node in a network.
+message Peer {
+  string id                        = 1;  // Ed25519 hex
+  string name                      = 2;
+  string vpn_addr                  = 3;
+  string ed25519_public            = 4;  // base64 encoded
+  string x25519_public             = 5;  // base64 encoded
+  string endpoint                  = 6;  // "ip:port" or ""
+  repeated string subnet_routes    = 7;  // CIDR prefixes this peer advertises
+}
+
+// RegisterRequest is sent by a daemon to join a network.
+message RegisterRequest {
+  string network_id                = 1;
+  string token                     = 2;
+  string name                      = 3;
+  string ed25519_public            = 4;  // base64 encoded
+  string x25519_public             = 5;  // base64 encoded
+  string endpoint                  = 6;  // "ip:port" or ""
+  repeated string subnet_routes    = 7;  // CIDR prefixes to advertise
+}
+
+message RegisterResponse {
+  string vpn_addr   = 1;  // assigned VPN IP, e.g. "10.100.0.1"
+  string peer_id    = 2;  // Ed25519 hex ID
+  string network_id = 3;  // echoed from request
+}
+
+message ListPeersRequest {
+  string network_id = 1;
+  string token      = 2;
+}
+
+message ListPeersResponse {
+  repeated Peer peers = 1;
+}
+
+message WatchRequest {
+  string network_id = 1;
+  string token      = 2;
+  string peer_id    = 3;  // caller's peer ID — used to filter self-events
+}
+
+enum EventType {
+  JOIN            = 0;
+  LEAVE           = 1;
+  ENDPOINT_UPDATE = 2;
+  ROUTE_UPDATE    = 3;
+  SIGNAL          = 4;  // peer-to-peer opaque signal (NAT candidates, etc.)
+}
+
+// SignalEvent carries an opaque peer-to-peer signal payload.
+// The payload is encrypted for the recipient — the coord server never reads it.
+message SignalEvent {
+  string from_peer_id = 1;
+  bytes  payload      = 2;
+}
+
+// PeerEvent is streamed by Watch.
+message PeerEvent {
+  EventType   type   = 1;
+  Peer        peer   = 2;
+  SignalEvent signal = 3;  // set when type == SIGNAL
+}
+
+// SendSignalRequest relays an encrypted ICE candidate to a peer.
+// The coord server treats payload as opaque bytes — it never reads them.
+message SendSignalRequest {
+  string token       = 1;
+  string from_peer_id = 2;
+  string to_peer_id  = 3;
+  bytes  payload     = 4;
+}
+
+message SendSignalResponse {}
+
+message LeaveRequest {
+  string token   = 1;
+  string peer_id = 2;
+}
+
+message LeaveResponse {}
+
+service Coord {
+  // Register assigns a VPN IP to the calling daemon and validates its Ed25519 sig.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // ListPeers returns all currently registered peers in the network.
+  rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
+
+  // Watch streams peer join/leave/update events until the client disconnects.
+  rpc Watch(WatchRequest) returns (stream PeerEvent);
+
+  // SendSignal relays an encrypted ICE candidate payload to a recipient peer.
+  // The server never reads the payload.
+  rpc SendSignal(SendSignalRequest) returns (SendSignalResponse);
+
+  // Leave removes the calling daemon from the network.
+  rpc Leave(LeaveRequest) returns (LeaveResponse);
+}

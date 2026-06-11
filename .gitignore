@@ -3,9 +3,9 @@ CLAUDE.md
 .claude/
 
 # Binaries
-veld-daemon
-veld-coord
-veld
+./veld-daemon
+./veld-coord
+./veld
 *.exe
 
 # Build output
@@ -26,11 +26,6 @@ vendor/
 *.pem
 known_peers.toml
 config.toml
-
-# Node / web
-web/node_modules/
-web/.next/
-web/out/
 
 # OS
 .DS_Store
