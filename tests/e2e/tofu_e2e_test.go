@@ -35,10 +35,8 @@ func newTOFUConn() *tofuConn {
 }
 
 func (c *tofuConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	select {
-	case <-c.closed:
-		return 0, nil, net.ErrClosed
-	}
+	<-c.closed
+	return 0, nil, net.ErrClosed
 }
 func (c *tofuConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	buf := make([]byte, len(p))

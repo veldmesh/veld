@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"os"
@@ -130,7 +131,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	conn, err := net.ListenPacket("udp", cfg.Node.ListenAddr)
 	if err != nil {
 		if tunDev != nil {
-			tunDev.Close()
+			_ = tunDev.Close()
 		}
 		return nil, fmt.Errorf("listen %s: %w", cfg.Node.ListenAddr, err)
 	}
@@ -138,9 +139,9 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	peerTbl, err := buildPeerTable(cfg.Peers)
 	if err != nil {
 		if tunDev != nil {
-			tunDev.Close()
+			_ = tunDev.Close()
 		}
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("build peer table: %w", err)
 	}
 
@@ -171,9 +172,9 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	tofuStore, err := tofu.New(tofuPath)
 	if err != nil {
 		if tunDev != nil {
-			tunDev.Close()
+			_ = tunDev.Close()
 		}
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("load TOFU store: %w", err)
 	}
 	d.hsMgr.TOFUCheck = tofuStore.Check
@@ -360,8 +361,11 @@ func (d *Daemon) Start() {
 		d.mdnsDisco.Start()
 	}
 	if d.ipcSrv != nil {
-		d.ipcSrv.Start()
-		d.updateIPCStatus()
+		if err := d.ipcSrv.Start(); err != nil {
+			log.Printf("ipc server: %v", err)
+		} else {
+			d.updateIPCStatus()
+		}
 	}
 }
 
@@ -378,7 +382,7 @@ func (d *Daemon) Stop() {
 		d.mdnsDisco.Stop()
 	}
 	if d.routeMgr != nil {
-		d.routeMgr.Close()
+		_ = d.routeMgr.Close()
 	}
 	if d.ipcSrv != nil {
 		d.ipcSrv.Stop()

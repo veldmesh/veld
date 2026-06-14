@@ -94,7 +94,7 @@ func (d *Discovery) Start() {
 func (d *Discovery) Stop() {
 	close(d.stopCh)
 	d.wg.Wait()
-	d.server.Shutdown()
+	_ = d.server.Shutdown()
 }
 
 func (d *Discovery) browseLoop() {

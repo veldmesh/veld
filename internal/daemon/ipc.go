@@ -77,7 +77,7 @@ func (s *IPCServer) Start() error {
 func (s *IPCServer) Stop() {
 	s.srv.Shutdown(context.Background())
 	if s.listener != nil {
-		s.listener.Close()
+		_ = s.listener.Close()
 	}
 	os.Remove(s.socketPath)
 }
@@ -91,7 +91,9 @@ func (s *IPCServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	st := s.status
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(st)
+	if err := json.NewEncoder(w).Encode(st); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
 }
 
 func (s *IPCServer) handleShutdown(w http.ResponseWriter, r *http.Request) {

@@ -71,9 +71,9 @@ func (d *Dispatcher) Start() {
 func (d *Dispatcher) Stop() {
 	d.stopOnce.Do(func() {
 		if d.tun != nil {
-			d.tun.Close()
+			_ = d.tun.Close()
 		}
-		d.conn.Close()
+		_ = d.conn.Close()
 	})
 }
 
@@ -204,7 +204,11 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 		}
 		entry.Touch()
 		if d.tun != nil {
-			d.tun.Write(plain)
+			if _, err := d.tun.Write(plain); err != nil {
+				// TODO: log err before stopping — Dispatcher has no logger yet
+				d.Stop()
+				return
+			}
 		}
 
 	case TypeKeepalive:

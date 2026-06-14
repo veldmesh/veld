@@ -33,7 +33,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("registry: %v", err)
 	}
-	defer reg.Close()
+	defer func() { _ = reg.Close() }()
 
 	// Auto-create network if --network-id is set
 	if *networkID != "" {
@@ -81,7 +81,11 @@ func main() {
 
 	log.Printf("veld-coord listening on %s", *listenAddr)
 
-	go grpcSrv.Serve(ln)
+	go func() {
+		if err := grpcSrv.Serve(ln); err != nil {
+			log.Printf("grpc serve: %v", err)
+		}
+	}()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

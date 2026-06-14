@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Veld Authors.
 // SPDX-License-Identifier: MIT
+
 // Package tofu implements Trust-On-First-Use Ed25519 fingerprint pinning.
 // On the first successful handshake with a peer, their Ed25519 fingerprint is
 // saved to disk. Subsequent handshakes from a different key for the same peer

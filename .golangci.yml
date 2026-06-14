@@ -4,7 +4,6 @@ linters:
   enable:
     - errcheck
     - goheader
-    - gosimple
     - govet
     - ineffassign
     - staticcheck
@@ -18,13 +17,19 @@ linters:
         regexp:
           SPDX: "MIT|BUSL-1\\.1"
     errcheck:
-      # Packet send errors are best-effort and logged elsewhere; hkdf.Read never errors.
       exclude-functions:
         - (net.PacketConn).WriteTo
         - (net.Conn).Write
         - io.ReadFull
+        - (io.Closer).Close      # deferred cleanup; callers can't act on close errors
+        - os.Remove              # best-effort stale-socket cleanup
+        - crypto/rand.Read       # never errors since Go 1.20
+        - (*net/http.Server).Serve    # returns ErrServerClosed after graceful shutdown
+        - (*net/http.Server).Shutdown # cleanup
 
   exclusions:
+    paths:
+      - gen/ # hand-generated proto stubs; linted separately when regenerated
     rules:
       # Test files: allow unhandled errors in test helpers.
       - path: _test\.go

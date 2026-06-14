@@ -153,7 +153,7 @@ func runUp(cobraCmd *cobra.Command, args []string) error {
 	}
 
 	// Release the process (don't wait for it)
-	daemonCmd.Process.Release()
+	_ = daemonCmd.Process.Release()
 
 	// Poll until daemon is running
 	deadline := time.Now().Add(10 * time.Second)
@@ -498,7 +498,7 @@ func loadConfigOrNew(cfgPath string) (*config.Config, error) {
 	return cfg, nil
 }
 
-func writeConfig(path string, cfg *config.Config) error {
+func writeConfig(path string, cfg *config.Config) (err error) {
 	// Ensure directory exists
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
@@ -508,7 +508,11 @@ func writeConfig(path string, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}()
 
 	return toml.NewEncoder(f).Encode(cfg)
 }
@@ -543,7 +547,7 @@ func getStatus(sock string) (*daemon.StatusResponse, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		io.ReadAll(resp.Body)
+		_, _ = io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("status code %d", resp.StatusCode)
 	}
 
@@ -560,7 +564,7 @@ func ipcPost(sock string, path string) error {
 	if err != nil {
 		return err
 	}
-	io.ReadAll(resp.Body)
+	_, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	return nil
 }

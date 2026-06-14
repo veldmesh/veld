@@ -32,13 +32,15 @@ func QuerySTUN(ctx context.Context, stunAddr string) (netip.AddrPort, error) {
 	if err != nil {
 		return netip.AddrPort{}, fmt.Errorf("listen for stun: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	deadline := time.Now().Add(5 * time.Second)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
-	conn.SetDeadline(deadline)
+	if err := conn.SetDeadline(deadline); err != nil {
+		return netip.AddrPort{}, fmt.Errorf("set deadline: %w", err)
+	}
 
 	// Build STUN Binding Request (20-byte header, no attributes)
 	var req [20]byte

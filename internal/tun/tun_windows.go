@@ -30,12 +30,12 @@ func CreateTUN(name string, ip netip.Prefix, mtu int) (TUN, error) {
 
 	realName, err := dev.Name()
 	if err != nil {
-		dev.Close()
+		_ = dev.Close()
 		return nil, fmt.Errorf("tun get name: %w", err)
 	}
 
 	if err := windowsConfigureIface(realName, ip); err != nil {
-		dev.Close()
+		_ = dev.Close()
 		return nil, err
 	}
 

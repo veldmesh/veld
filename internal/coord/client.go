@@ -145,7 +145,7 @@ func (c *Client) run(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	defer grpcConn.Close()
+	defer func() { _ = grpcConn.Close() }()
 	gc := coordv1.NewCoordClient(grpcConn)
 
 	c.gcMu.Lock()

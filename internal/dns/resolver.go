@@ -73,7 +73,7 @@ func (r *Resolver) Start(listenAddr string) error {
 // Stop closes the listener and waits for the serve goroutine to exit.
 func (r *Resolver) Stop() {
 	if r.conn != nil {
-		r.conn.Close()
+		_ = r.conn.Close()
 	}
 	r.wg.Wait()
 }

@@ -63,7 +63,7 @@ func NewRegistry(path string) (*Registry, error) {
 		return nil
 	})
 	if err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("init buckets: %w", err)
 	}
 	return &Registry{db: db}, nil
@@ -301,7 +301,9 @@ func (r *Registry) RemovePeer(peerID string) (peerRecord, error) {
 				}
 				updated, err := json.Marshal(netRec)
 				if err == nil {
-					nb.Put([]byte(removed.NetworkID), updated)
+					if err := nb.Put([]byte(removed.NetworkID), updated); err != nil {
+						return err
+					}
 				}
 			}
 		}

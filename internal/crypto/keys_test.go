@@ -33,7 +33,7 @@ func TestGenerateAndFingerprint(t *testing.T) {
 
 		// Verify all characters are valid hex
 		for _, ch := range fp {
-			if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+			if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
 				t.Errorf("%s: fingerprint contains non-hex character: %c", tt.name, ch)
 			}
 		}

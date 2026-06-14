@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Veld Authors.
 // SPDX-License-Identifier: MIT
+
 // Package nat implements NAT hole-punching for Veld peers.
 //
 // Flow:
