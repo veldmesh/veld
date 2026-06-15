@@ -30,24 +30,24 @@ func CreateTUN(name string, ip netip.Prefix, mtu int) (TUN, error) {
 
 	realName, err := dev.Name()
 	if err != nil {
-		dev.Close()
+		_ = dev.Close()
 		return nil, fmt.Errorf("tun get name: %w", err)
 	}
 
 	link, err := netlink.LinkByName(realName)
 	if err != nil {
-		dev.Close()
+		_ = dev.Close()
 		return nil, fmt.Errorf("netlink find %s: %w", realName, err)
 	}
 
 	nlAddr := &netlink.Addr{IPNet: prefixToIPNet(ip)}
 	if err := netlink.AddrAdd(link, nlAddr); err != nil {
-		dev.Close()
+		_ = dev.Close()
 		return nil, fmt.Errorf("netlink addr add %s on %s: %w", ip, realName, err)
 	}
 
 	if err := netlink.LinkSetUp(link); err != nil {
-		dev.Close()
+		_ = dev.Close()
 		return nil, fmt.Errorf("netlink link up %s: %w", realName, err)
 	}
 
