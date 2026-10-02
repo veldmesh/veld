@@ -30,7 +30,7 @@ func startService(t *testing.T, id *crypto.Identity) string {
 	}
 	svc := NewService(id, ln)
 	go svc.Serve(context.Background()) //nolint:errcheck
-	t.Cleanup(func() { svc.Close() })
+	t.Cleanup(func() { _ = svc.Close() })
 	return svc.Addr()
 }
 
@@ -49,7 +49,8 @@ func TestChannelID(t *testing.T) {
 	})
 
 	t.Run("deterministic", func(t *testing.T) {
-		if ChannelID(a, b) != ChannelID(a, b) {
+		first := ChannelID(a, b)
+		if ChannelID(a, b) != first {
 			t.Error("ChannelID must be deterministic")
 		}
 	})
@@ -97,8 +98,8 @@ func dialPair(t *testing.T, relayAddr string, relayKey [32]byte, idA, idB *crypt
 		conns = append(conns, r.c)
 	}
 	t.Cleanup(func() {
-		conns[0].Close()
-		conns[1].Close()
+		_ = conns[0].Close()
+		_ = conns[1].Close()
 	})
 	return conns[0], conns[1]
 }

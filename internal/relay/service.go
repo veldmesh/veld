@@ -55,7 +55,7 @@ func (s *Service) Serve(ctx context.Context) error {
 	go func() {
 		select {
 		case <-ctx.Done():
-			s.Close()
+			_ = s.Close()
 		case <-s.done:
 		}
 	}()
@@ -86,7 +86,7 @@ func (s *Service) Close() error {
 	s.waiting = make(map[[ChannelIDSize]byte]*serverConn)
 	s.mu.Unlock()
 	for _, sc := range waiting {
-		sc.raw.Close()
+		_ = sc.raw.Close()
 	}
 	return s.ln.Close()
 }
@@ -104,19 +104,19 @@ func (s *Service) handleConn(raw net.Conn) {
 		},
 	})
 	if err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return
 	}
 
 	msg1, err := readFrame(raw)
 	if err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return
 	}
 	payload, _, _, err := hs.ReadMessage(nil, msg1)
 	if err != nil || len(payload) != ChannelIDSize {
 		// Silent drop: no error reply — an error would be an oracle.
-		raw.Close()
+		_ = raw.Close()
 		return
 	}
 	var channel [ChannelIDSize]byte
@@ -124,11 +124,11 @@ func (s *Service) handleConn(raw net.Conn) {
 
 	msg2, cs1, cs2, err := hs.WriteMessage(nil, nil)
 	if err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return
 	}
 	if err := writeFrame(raw, msg2); err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return
 	}
 
@@ -138,7 +138,7 @@ func (s *Service) handleConn(raw net.Conn) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		raw.Close()
+		_ = raw.Close()
 		return
 	}
 	other := s.waiting[channel]
@@ -178,6 +178,6 @@ func splice(dst, src *serverConn) {
 			break
 		}
 	}
-	src.raw.Close()
-	dst.raw.Close()
+	_ = src.raw.Close()
+	_ = dst.raw.Close()
 }

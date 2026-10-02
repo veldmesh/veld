@@ -142,27 +142,27 @@ func Dial(ctx context.Context, addr string, relayX25519 [32]byte, id *crypto.Ide
 		PeerStatic: relayX25519[:],
 	})
 	if err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return nil, err
 	}
 
 	msg1, _, _, err := hs.WriteMessage(nil, channelID[:])
 	if err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return nil, fmt.Errorf("relay handshake msg1: %w", err)
 	}
 	if err := writeFrame(raw, msg1); err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return nil, fmt.Errorf("relay handshake send: %w", err)
 	}
 
 	msg2, err := readFrame(raw)
 	if err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return nil, fmt.Errorf("relay handshake recv: %w", err)
 	}
 	if _, cs1, cs2, err := hs.ReadMessage(nil, msg2); err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return nil, fmt.Errorf("relay handshake msg2: %w", err)
 	} else {
 		// Initiator: cs1 = send, cs2 = recv.

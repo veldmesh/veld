@@ -54,8 +54,8 @@ func (p *Proxy) LocalAddr() netip.AddrPort {
 func (p *Proxy) Close() error {
 	p.closeOnce.Do(func() {
 		close(p.done)
-		p.udp.Close()
-		p.stream.Close()
+		_ = p.udp.Close()
+		_ = p.stream.Close()
 	})
 	return nil
 }
@@ -68,14 +68,14 @@ func (p *Proxy) udpToStream() {
 	for {
 		n, _, err := p.udp.ReadFromUDP(buf)
 		if err != nil {
-			p.Close()
+			_ = p.Close()
 			return
 		}
 		frame := make([]byte, 2+n)
 		binary.BigEndian.PutUint16(frame[0:2], uint16(n))
 		copy(frame[2:], buf[:n])
 		if err := p.stream.WriteMessage(frame); err != nil {
-			p.Close()
+			_ = p.Close()
 			return
 		}
 	}
@@ -88,7 +88,7 @@ func (p *Proxy) streamToUDP() {
 	for {
 		frame, err := p.stream.ReadMessage()
 		if err != nil {
-			p.Close()
+			_ = p.Close()
 			return
 		}
 		if len(frame) < 2 {
@@ -99,7 +99,7 @@ func (p *Proxy) streamToUDP() {
 			continue
 		}
 		if _, err := p.udp.WriteToUDP(frame[2:], p.target); err != nil {
-			p.Close()
+			_ = p.Close()
 			return
 		}
 	}
