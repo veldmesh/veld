@@ -88,6 +88,9 @@ func TestRelayFallback_TwoPeers(t *testing.T) {
 			return
 		}
 		p, err := relay.NewProxy(rc, dataTargetA)
+		if err != nil {
+			_ = rc.Close()
+		}
 		fellBackA <- fallback{proxy: p, err: err}
 	}
 	mgrB.OnPunchTimeout = func(peerID [32]byte) {
@@ -99,6 +102,9 @@ func TestRelayFallback_TwoPeers(t *testing.T) {
 			return
 		}
 		p, err := relay.NewProxy(rc, dataTargetB)
+		if err != nil {
+			_ = rc.Close()
+		}
 		fellBackB <- fallback{proxy: p, err: err}
 	}
 
@@ -147,9 +153,11 @@ func TestRelayFallback_TwoPeers(t *testing.T) {
 	buf := make([]byte, 2048)
 	// Stray in-flight NAT probes from the timed-out punching round may still
 	// arrive on the data conn (the real dispatcher filters them by packet
-	// type); skip anything that isn't the expected datagram.
-	connB.SetReadDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
+	// type); skip anything that isn't the expected datagram. A bounded
+	// deadline is set per iteration so skipped packets can't extend the
+	// overall wait indefinitely.
 	for {
+		connB.SetReadDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
 		n, fromB, err := connB.ReadFrom(buf)
 		if err != nil {
 			t.Fatalf("B read: %v", err)
@@ -168,11 +176,10 @@ func TestRelayFallback_TwoPeers(t *testing.T) {
 	if _, err := connB.WriteTo(reply, net.UDPAddrFromAddrPort(proxyB.LocalAddr())); err != nil {
 		t.Fatalf("B write: %v", err)
 	}
-	// Stray in-flight NAT probes from the timed-out punching round may still
-	// arrive on the data conn (the real dispatcher filters them by packet
-	// type); skip anything that isn't the expected reply.
-	connA.SetReadDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
+	// Same stray-probe filtering as above, with a bounded per-iteration
+	// deadline.
 	for {
+		connA.SetReadDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
 		n, fromA, err := connA.ReadFrom(buf)
 		if err != nil {
 			t.Fatalf("A read: %v", err)

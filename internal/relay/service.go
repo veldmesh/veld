@@ -50,15 +50,20 @@ func NewService(id *crypto.Identity, ln net.Listener) *Service {
 func (s *Service) Addr() string { return s.ln.Addr().String() }
 
 // Serve accepts connections until the listener is closed or ctx is cancelled.
-// It returns nil on clean shutdown.
+// It returns nil on clean shutdown and never returns while its internal
+// watcher goroutine is still running.
 func (s *Service) Serve(ctx context.Context) error {
+	watchDone := make(chan struct{})
 	go func() {
+		defer close(watchDone)
 		select {
 		case <-ctx.Done():
 			_ = s.Close()
 		case <-s.done:
 		}
 	}()
+	// Join the watcher before returning so no goroutine outlives Serve.
+	defer func() { <-watchDone }()
 	for {
 		c, err := s.ln.Accept()
 		if err != nil {
@@ -66,8 +71,11 @@ func (s *Service) Serve(ctx context.Context) error {
 			case <-s.done:
 				return nil
 			default:
-				return err
 			}
+			// Accept failed for a reason other than shutdown: close the
+			// service so the watcher unblocks, then report the error.
+			_ = s.Close()
+			return err
 		}
 		go s.handleConn(c)
 	}
