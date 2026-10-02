@@ -23,7 +23,7 @@ Unlike Tailscale, the coordination server never sees, routes, or authenticates y
 
 - **Custom Noise IK handshake** — Ed25519 identity keys, X25519 session keys, ChaCha20-Poly1305 encryption, forward secrecy
 - **No kernel modules** — userspace TUN via `wireguard/tun`; no WireGuard daemon
-- **NAT traversal** — UDP hole-punching via ICE; covers ~85–90% of home/office networks
+- **NAT traversal** — UDP hole-punching via ICE; when hole-punching fails (symmetric NATs), falls back to a DERP-style relay over a Noise IK-encrypted channel through a volunteer mesh peer — never the coord server
 - **Three operating modes** — static config (no server), LAN mDNS discovery, full coord server
 - **Name-based routing** — `ping server1.veld` via local DNS stub
 - **Subnet routing** — expose a whole LAN through one Veld node (IoT gateway)

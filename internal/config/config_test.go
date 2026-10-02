@@ -3,8 +3,10 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -184,4 +186,40 @@ func TestLoadFile_NotExist(t *testing.T) {
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("expected os.ErrNotExist, got %v", err)
 	}
+}
+
+// TestParseConfig_RelayFallback verifies relay_addr / relay_x25519 validation.
+func TestParseConfig_RelayFallback(t *testing.T) {
+	keyB64 := base64.StdEncoding.EncodeToString(make([]byte, 32))
+
+	t.Run("valid relay config", func(t *testing.T) {
+		src := strings.Replace(coordModeTOML, "token      = \"tok\"",
+			"token      = \"tok\"\nrelay_addr = \"relay.example.com:7878\"\nrelay_x25519 = \""+keyB64+"\"", 1)
+		cfg, err := ParseConfig(src)
+		if err != nil {
+			t.Fatalf("ParseConfig: %v", err)
+		}
+		if cfg.Coord.RelayAddr != "relay.example.com:7878" {
+			t.Errorf("relay_addr: got %q", cfg.Coord.RelayAddr)
+		}
+		if cfg.Coord.RelayX25519 != keyB64 {
+			t.Errorf("relay_x25519: got %q", cfg.Coord.RelayX25519)
+		}
+	})
+
+	t.Run("relay_addr without key", func(t *testing.T) {
+		src := strings.Replace(coordModeTOML, "token      = \"tok\"",
+			"token      = \"tok\"\nrelay_addr = \"relay.example.com:7878\"", 1)
+		if _, err := ParseConfig(src); err == nil {
+			t.Fatal("expected error for relay_addr without relay_x25519")
+		}
+	})
+
+	t.Run("relay_addr with bad key", func(t *testing.T) {
+		src := strings.Replace(coordModeTOML, "token      = \"tok\"",
+			"token      = \"tok\"\nrelay_addr = \"relay.example.com:7878\"\nrelay_x25519 = \"aGVsbG8=\"", 1)
+		if _, err := ParseConfig(src); err == nil {
+			t.Fatal("expected error for relay_x25519 that is not 32 bytes")
+		}
+	})
 }

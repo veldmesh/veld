@@ -24,6 +24,7 @@ import (
 	"github.com/veldmesh/veld/internal/mdns"
 	"github.com/veldmesh/veld/internal/nat"
 	"github.com/veldmesh/veld/internal/peer"
+	"github.com/veldmesh/veld/internal/relay"
 	"github.com/veldmesh/veld/internal/route"
 	"github.com/veldmesh/veld/internal/tofu"
 	"github.com/veldmesh/veld/internal/tun"
@@ -44,10 +45,11 @@ type Daemon struct {
 	localID   *crypto.Identity
 	networkID [16]byte
 
-	mu        sync.Mutex
-	vpnAddr   netip.Addr
-	peerID    string
-	coordAddr string
+	mu           sync.Mutex
+	vpnAddr      netip.Addr
+	peerID       string
+	coordAddr    string
+	relayProxies []*relay.Proxy
 }
 
 // New creates a Daemon from pre-constructed components.
@@ -213,6 +215,48 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 			if e, ok := peerTbl.LookupByID(peerID); ok {
 				d.hsMgr.Initiate(e)
 			}
+
+			// Relay fallback: if hole punching times out (e.g. symmetric NATs),
+			// open a Noise IK-encrypted channel through a volunteer relay peer
+			// and re-point the data plane through a local loopback proxy. The
+			// P2P-first model is unchanged — the relay is only a fallback, and
+			// traffic still never transits the coord server.
+			if cfg.Coord.RelayAddr != "" {
+				relayKeyBytes, err := base64.StdEncoding.DecodeString(cfg.Coord.RelayX25519)
+				if err != nil || len(relayKeyBytes) != 32 {
+					fmt.Printf("warning: invalid coord.relay_x25519, relay fallback disabled\n")
+				} else {
+					var relayKey [32]byte
+					copy(relayKey[:], relayKeyBytes)
+					var selfID [32]byte
+					copy(selfID[:], localID.Ed25519Public)
+					dataTarget := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(localPort)}
+
+					d.natMgr.OnPunchTimeout = func(peerID [32]byte) {
+						dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+						defer cancel()
+						rc, err := relay.Dial(dialCtx, cfg.Coord.RelayAddr, relayKey, localID, relay.ChannelID(selfID, peerID))
+						if err != nil {
+							fmt.Printf("warning: relay dial for peer %x: %v\n", peerID[:8], err)
+							return
+						}
+						proxy, err := relay.NewProxy(rc, dataTarget)
+						if err != nil {
+							_ = rc.Close()
+							fmt.Printf("warning: relay proxy for peer %x: %v\n", peerID[:8], err)
+							return
+						}
+						d.mu.Lock()
+						d.relayProxies = append(d.relayProxies, proxy)
+						d.mu.Unlock()
+
+						peerTbl.UpdateEndpoint(peerID, proxy.LocalAddr())
+						if e, ok := peerTbl.LookupByID(peerID); ok {
+							d.hsMgr.Initiate(e)
+						}
+					}
+				}
+			}
 		}
 
 		d.coordCli.OnPeerAdded = func(e *peer.Entry) {
@@ -372,6 +416,13 @@ func (d *Daemon) Start() {
 // Stop signals all components to exit.
 func (d *Daemon) Stop() {
 	d.disp.Stop()
+	d.mu.Lock()
+	proxies := d.relayProxies
+	d.relayProxies = nil
+	d.mu.Unlock()
+	for _, p := range proxies {
+		_ = p.Close()
+	}
 	if d.coordCli != nil {
 		d.coordCli.Stop()
 	}

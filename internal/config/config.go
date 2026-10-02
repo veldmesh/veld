@@ -3,6 +3,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -49,11 +50,13 @@ type NodeConfig struct {
 // CoordConfig holds settings for connecting to a coord server.
 // All fields are optional; if Addr is empty, coord mode is disabled.
 type CoordConfig struct {
-	Addr        string `toml:"addr"`             // e.g. "coord.example.com:50051"
+	Addr        string `toml:"addr"` // e.g. "coord.example.com:50051"
 	NetworkID   string `toml:"network_id"`
 	Token       string `toml:"token"`
 	TLSInsecure bool   `toml:"tls_insecure"`
-	STUNServer  string `toml:"stun_server"`      // e.g. "stun.l.google.com:19302"; empty = skip STUN
+	STUNServer  string `toml:"stun_server"`  // e.g. "stun.l.google.com:19302"; empty = skip STUN
+	RelayAddr   string `toml:"relay_addr"`   // e.g. "relay.example.com:7878"; empty = no relay fallback
+	RelayX25519 string `toml:"relay_x25519"` // base64 32-byte pinned relay static key; required if relay_addr set
 }
 
 // DaemonConfig holds daemon process settings.
@@ -118,6 +121,15 @@ func (c *Config) Validate() error {
 	}
 	if len(strings.TrimSpace(networkID)) != 32 {
 		return fmt.Errorf("config: network_id must be 32 hex characters (in node.network_id or coord.network_id)")
+	}
+
+	// Relay fallback: the pinned relay key must be present and well-formed
+	// whenever a relay address is configured.
+	if c.Coord.RelayAddr != "" {
+		b, err := base64.StdEncoding.DecodeString(c.Coord.RelayX25519)
+		if err != nil || len(b) != 32 {
+			return fmt.Errorf("config: coord.relay_x25519 must be a base64-encoded 32-byte key when coord.relay_addr is set")
+		}
 	}
 
 	// Validate peers only if any are present

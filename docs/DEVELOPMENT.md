@@ -161,6 +161,7 @@ E2E test progression:
 | `tests/e2e/tunnel_e2e_test.go` | Two daemons (static config), ping succeeds, no plaintext on wire | Task 8 |
 | `tests/e2e/coord_e2e_test.go` | Two daemons + real coord server, auto-discover and connect | Task 12 |
 | `tests/e2e/nat_e2e_test.go` | Two daemons behind simulated NAT, hole-punch succeeds | Task 14 |
+| `tests/e2e/relay_e2e_test.go` | Two peers behind symmetric NATs fall back to the relay path; datagrams delivered | Task 15 |
 
 ---
 
