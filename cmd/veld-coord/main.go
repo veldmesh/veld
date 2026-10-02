@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -27,6 +29,9 @@ func main() {
 	networkCIDR := flag.String("network-cidr", "10.100.0.0/24", "CIDR for auto-created network")
 	networkName := flag.String("network-name", "default", "name for auto-created network")
 	tokenStr := flag.String("token", "", "auth token to pre-register (format: token)")
+	peerTTL := flag.Duration("peer-ttl", coordserver.DefaultPeerTTL,
+		"peer registration TTL; peers not seen for this long are pruned (0 disables the sweep)")
+	sweepInterval := flag.Duration("sweep-interval", time.Hour, "how often the stale-peer sweep runs")
 	flag.Parse()
 
 	reg, err := coordserver.NewRegistry(*dbPath)
@@ -67,6 +72,10 @@ func main() {
 		coordce.NewNoopHooks(),
 	)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	coordserver.StartPeerSweeper(ctx, reg, *peerTTL, *sweepInterval, log.Printf)
+
 	ln, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
@@ -92,5 +101,6 @@ func main() {
 	<-sig
 
 	log.Println("shutting down...")
+	cancel()
 	grpcSrv.GracefulStop()
 }
