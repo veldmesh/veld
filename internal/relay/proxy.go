@@ -62,7 +62,9 @@ func (p *Proxy) Close() error {
 
 // udpToStream reads datagrams from the dispatcher (via the loopback socket)
 // and forwards each as one framed message over the relay channel.
-// Wire framing inside the channel: [uint16 big-endian length][datagram].
+// Wire framing inside the channel: [uint16 big-endian length][datagram],
+// which accommodates full IPv6 datagrams — far above the tunnel MTU (1420),
+// so framing never truncates a payload.
 func (p *Proxy) udpToStream() {
 	buf := make([]byte, 65535)
 	for {

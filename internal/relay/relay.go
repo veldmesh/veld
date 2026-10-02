@@ -26,6 +26,7 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -55,7 +56,7 @@ var noiseSuite = noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noi
 // failing NAT pair arrive at the same channel without any extra signalling.
 func ChannelID(a, b [32]byte) [ChannelIDSize]byte {
 	lo, hi := a, b
-	if bytes32Compare(a, b) > 0 {
+	if bytes.Compare(a[:], b[:]) > 0 {
 		lo, hi = b, a
 	}
 	h := sha256.New()
@@ -66,18 +67,6 @@ func ChannelID(a, b [32]byte) [ChannelIDSize]byte {
 	var id [ChannelIDSize]byte
 	copy(id[:], sum[:ChannelIDSize])
 	return id
-}
-
-func bytes32Compare(a, b [32]byte) int {
-	for i := 0; i < 32; i++ {
-		if a[i] != b[i] {
-			if a[i] < b[i] {
-				return -1
-			}
-			return 1
-		}
-	}
-	return 0
 }
 
 // Conn is a Noise IK-encrypted message stream to a relay, paired with the

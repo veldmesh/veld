@@ -230,7 +230,14 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 					copy(relayKey[:], relayKeyBytes)
 					var selfID [32]byte
 					copy(selfID[:], localID.Ed25519Public)
-					dataTarget := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(localPort)}
+					// The proxy injects datagrams into the daemon's own data-plane
+					// socket. If the socket binds to a specific interface address,
+					// target that; otherwise loopback reaches a wildcard bind.
+					dataIP := net.IPv4(127, 0, 0, 1)
+					if laddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && len(laddr.IP) > 0 && !laddr.IP.IsUnspecified() {
+						dataIP = laddr.IP
+					}
+					dataTarget := &net.UDPAddr{IP: dataIP, Port: int(localPort)}
 
 					d.natMgr.OnPunchTimeout = func(peerID [32]byte) {
 						dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
