@@ -23,7 +23,7 @@ Unlike Tailscale, the coordination server never sees, routes, or authenticates y
 
 - **Custom Noise IK handshake** — Ed25519 identity keys, X25519 session keys, ChaCha20-Poly1305 encryption, forward secrecy
 - **No kernel modules** — userspace TUN via `wireguard/tun`; no WireGuard daemon
-- **NAT traversal** — UDP hole-punching via ICE; covers ~85–90% of home/office networks
+- **NAT traversal** — UDP hole-punching via ICE; when hole-punching fails (symmetric NATs), falls back to a DERP-style relay over a Noise IK-encrypted channel through a volunteer mesh peer — never the coord server
 - **Three operating modes** — static config (no server), LAN mDNS discovery, full coord server
 - **Name-based routing** — `ping server1.veld` via local DNS stub
 - **Subnet routing** — expose a whole LAN through one Veld node (IoT gateway)
@@ -163,8 +163,10 @@ Contributions to the daemon, CLI, CE coord server, and docs are welcome. Please 
 
 ## License
 
-The **daemon, CLI, and web frontend** (`cmd/`, `internal/`, `web/`) are licensed under the **MIT License**.
+The **daemon, CLI, and web frontend** (`cmd/` — except `cmd/veld-relay` — `internal/`, `web/`) are licensed under the **MIT License**. Note the **relay client** (`internal/relay`, linked into every daemon) stays MIT; the wire protocol is open.
 
 The **coordination server** (`coord/`) is licensed under the **Business Source License 1.1 (BSL-1.1)**. Source code is publicly available. You may self-host it for personal or internal use. You may not offer it as a competing managed network service. The license converts to Apache 2.0 four years after each version's release date.
 
-See [`LICENSE`](LICENSE) and [`coord/LICENSE`](coord/LICENSE) for full terms.
+The **relay server** (`relay/`, `cmd/veld-relay`) is licensed under BSL-1.1 on the same terms: source available, self-host it freely for personal or internal use, but you may not offer it to others as a hosted relay or mesh VPN service. Converts to Apache 2.0 four years after each version's release.
+
+See [`LICENSE`](LICENSE), [`coord/LICENSE`](coord/LICENSE), and [`relay/LICENSE`](relay/LICENSE) for full terms.
