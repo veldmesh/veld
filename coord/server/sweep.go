@@ -15,9 +15,26 @@ import (
 const DefaultPeerTTL = 30 * 24 * time.Hour
 
 // DefaultSweepInterval is how often the stale-peer sweep runs by default.
-// Smaller intervals are useful in tests but spin the registry write path in
-// production — operators should keep this at minutes, not milliseconds.
 const DefaultSweepInterval = time.Hour
+
+// MinSweepInterval is the smallest sweep interval StartPeerSweeper honours:
+// shorter intervals are clamped up to this floor so a misconfigured flag
+// (e.g. --sweep-interval=1ms) cannot spin the registry write path.
+const MinSweepInterval = time.Minute
+
+// normalizeSweepInterval applies the sweeper interval policy: non-positive
+// values fall back to DefaultSweepInterval, and values below MinSweepInterval
+// are raised to the floor.
+func normalizeSweepInterval(d time.Duration) time.Duration {
+	switch {
+	case d <= 0:
+		return DefaultSweepInterval
+	case d < MinSweepInterval:
+		return MinSweepInterval
+	default:
+		return d
+	}
+}
 
 // SweepStalePeers removes all peers whose last-seen timestamp is older than
 // ttl and returns the removed records. Peers that have never sent a heartbeat
@@ -89,34 +106,35 @@ type Sweeper interface {
 // StartPeerSweeper launches a background goroutine that calls
 // s.ExpelStalePeers every interval until ctx is cancelled. A ttl <= 0
 // disables the sweeper entirely (no goroutine is started). interval <= 0
-// falls back to DefaultSweepInterval. Note: intervals below a minute are
-// intended for tests; in production they needlessly spin the registry write
-// path. logf may be nil.
+// falls back to DefaultSweepInterval, and intervals below MinSweepInterval
+// are clamped up to it. logf may be nil.
 func StartPeerSweeper(ctx context.Context, s Sweeper, ttl, interval time.Duration, logf func(format string, args ...any)) {
 	if ttl <= 0 {
 		return
 	}
-	if interval <= 0 {
-		interval = DefaultSweepInterval
-	}
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				removed, err := s.ExpelStalePeers(ctx, ttl)
-				if err != nil {
-					logf("peer sweep error: %v", err)
-				} else if removed > 0 {
-					logf("peer sweep: removed %d stale peer(s) (ttl %s)", removed, ttl)
-				}
+	go sweepLoop(ctx, s, ttl, normalizeSweepInterval(interval), logf)
+}
+
+// sweepLoop is the ticker body of StartPeerSweeper, extracted so tests can
+// drive it with sub-minute intervals that StartPeerSweeper itself refuses.
+// interval must be positive; logf must be non-nil.
+func sweepLoop(ctx context.Context, s Sweeper, ttl, interval time.Duration, logf func(format string, args ...any)) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			removed, err := s.ExpelStalePeers(ctx, ttl)
+			if err != nil {
+				logf("peer sweep error: %v", err)
+			} else if removed > 0 {
+				logf("peer sweep: removed %d stale peer(s) (ttl %s)", removed, ttl)
 			}
 		}
-	}()
+	}
 }
