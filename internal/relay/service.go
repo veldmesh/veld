@@ -38,11 +38,13 @@ type Service struct {
 
 	mu      sync.Mutex
 	waiting map[[channelIDSize]byte]*serverConn
+	active  map[*serverConn]struct{} // paired connections with running splices
 	closed  bool
 	// waitTimeout bounds how long an unpaired connection waits for its
 	// counterpart; a field so tests can shorten it.
 	waitTimeout time.Duration
 	done        chan struct{}
+	wg          sync.WaitGroup // tracks running splice goroutines
 }
 
 // serverConn is one client connection on the relay side.
@@ -61,6 +63,7 @@ func NewService(id *crypto.Identity, ln net.Listener) *Service {
 		id:          id,
 		ln:          ln,
 		waiting:     make(map[[channelIDSize]byte]*serverConn),
+		active:      make(map[*serverConn]struct{}),
 		done:        make(chan struct{}),
 		waitTimeout: waitingTimeout,
 	}
@@ -101,22 +104,36 @@ func (s *Service) Serve(ctx context.Context) error {
 	}
 }
 
-// Close stops the service and all pending connections.
+// Close stops the service, closes all pending and active connections, and
+// waits for all splice goroutines to exit before returning.
 func (s *Service) Close() error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		s.wg.Wait()
 		return nil
 	}
 	s.closed = true
 	close(s.done)
 	waiting := s.waiting
 	s.waiting = make(map[[channelIDSize]byte]*serverConn)
+	active := make([]*serverConn, 0, len(s.active))
+	for sc := range s.active {
+		active = append(active, sc)
+	}
 	s.mu.Unlock()
 	for _, sc := range waiting {
 		_ = sc.raw.Close()
 	}
-	return s.ln.Close()
+	// Closing active connections makes the blocked splice reads fail; the
+	// splices then run their own cleanup and deregister.
+	for _, sc := range active {
+		_ = sc.raw.Close()
+	}
+	err := s.ln.Close()
+	// Join all splice goroutines so none outlive the service.
+	s.wg.Wait()
+	return err
 }
 
 // handleConn performs the Noise IK handshake as responder, reads the remote
@@ -213,12 +230,28 @@ func (s *Service) handleConn(raw net.Conn) {
 		return
 	}
 	delete(s.waiting, sc.channel)
+	s.active[sc] = struct{}{}
+	s.active[other] = struct{}{}
+	s.wg.Add(2)
 	s.mu.Unlock()
 
-	// Pair matched: splice in both directions. When either direction fails,
-	// both connections are closed.
-	go splice(sc, other)
+	// Pair matched: splice in both directions, tracked so Close can join
+	// them. When either direction fails, both connections are closed.
+	go func() {
+		defer s.wg.Done()
+		defer s.forget(sc)
+		splice(sc, other)
+	}()
+	defer s.wg.Done()
+	defer s.forget(other)
 	splice(other, sc)
+}
+
+// forget removes sc from the active set once its splice has exited.
+func (s *Service) forget(sc *serverConn) {
+	s.mu.Lock()
+	delete(s.active, sc)
+	s.mu.Unlock()
 }
 
 // evict removes sc from the waiting map (if it is still the entry for
