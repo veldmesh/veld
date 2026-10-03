@@ -334,3 +334,26 @@ func (r *Registry) NetworkCount(accountID string) (int, error) {
 func nextIPAfterNetwork(prefix netip.Prefix) netip.Addr {
 	return prefix.Addr().Next()
 }
+
+// TouchPeer refreshes a peer's LastSeen timestamp without changing any other
+// field. Used to keep the registration of a currently-connected daemon fresh
+// so the TTL sweep never considers it stale.
+func (r *Registry) TouchPeer(peerID string) error {
+	return r.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketPeers)
+		data := b.Get([]byte(peerID))
+		if data == nil {
+			return fmt.Errorf("peer %q not found", peerID)
+		}
+		var rec peerRecord
+		if err := json.Unmarshal(data, &rec); err != nil {
+			return err
+		}
+		rec.LastSeen = time.Now().Unix()
+		updated, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(peerID), updated)
+	})
+}
