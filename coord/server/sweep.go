@@ -14,16 +14,24 @@ import (
 // when the operator does not configure one: 30 days.
 const DefaultPeerTTL = 30 * 24 * time.Hour
 
+// DefaultSweepInterval is how often the stale-peer sweep runs by default.
+// Smaller intervals are useful in tests but spin the registry write path in
+// production — operators should keep this at minutes, not milliseconds.
+const DefaultSweepInterval = time.Hour
+
 // SweepStalePeers removes all peers whose last-seen timestamp is older than
-// ttl. Peers that have never sent a heartbeat (LastSeen == 0) are aged by
-// their RegisteredAt timestamp instead. Returns the number of peers removed.
-// The on-disk schema is unchanged: this only deletes existing keys.
-func (r *Registry) SweepStalePeers(ttl time.Duration) (int, error) {
+// ttl and returns the removed records. Peers that have never sent a heartbeat
+// (LastSeen == 0) are aged by their RegisteredAt timestamp instead. Peers for
+// which skip returns true (e.g. peers with an active Watch stream) are never
+// removed, so a daemon that is still connected cannot be swept out from under
+// its peers. skip may be nil. The on-disk schema is unchanged: this only
+// deletes existing keys.
+func (r *Registry) SweepStalePeers(ttl time.Duration, skip func(peerID string) bool) ([]peerRecord, error) {
 	if ttl <= 0 {
-		return 0, nil
+		return nil, nil
 	}
 	cutoff := time.Now().Add(-ttl).Unix()
-	removed := 0
+	var removed []peerRecord
 	err := r.db.Update(func(tx *bolt.Tx) error {
 		pb := tx.Bucket(bucketPeers)
 		nb := tx.Bucket(bucketNetworks)
@@ -48,10 +56,13 @@ func (r *Registry) SweepStalePeers(ttl time.Duration) (int, error) {
 		}
 
 		for _, rec := range stale {
+			if skip != nil && skip(rec.ID) {
+				continue // peer is currently connected; not actually stale
+			}
 			if err := pb.Delete([]byte(rec.ID)); err != nil {
 				return err
 			}
-			removed++
+			removed = append(removed, rec)
 			if netData := nb.Get([]byte(rec.NetworkID)); netData != nil {
 				var netRec networkRecord
 				if err := json.Unmarshal(netData, &netRec); err == nil && netRec.MachineCount > 0 {
@@ -69,15 +80,24 @@ func (r *Registry) SweepStalePeers(ttl time.Duration) (int, error) {
 	return removed, err
 }
 
+// Sweeper is anything that can expel stale peers with full leave semantics.
+// *Server implements it.
+type Sweeper interface {
+	ExpelStalePeers(ctx context.Context, ttl time.Duration) (int, error)
+}
+
 // StartPeerSweeper launches a background goroutine that calls
-// SweepStalePeers every interval until ctx is cancelled. A ttl <= 0 disables
-// the sweeper entirely (no goroutine is started). logf may be nil.
-func StartPeerSweeper(ctx context.Context, reg *Registry, ttl, interval time.Duration, logf func(format string, args ...any)) {
+// s.ExpelStalePeers every interval until ctx is cancelled. A ttl <= 0
+// disables the sweeper entirely (no goroutine is started). interval <= 0
+// falls back to DefaultSweepInterval. Note: intervals below a minute are
+// intended for tests; in production they needlessly spin the registry write
+// path. logf may be nil.
+func StartPeerSweeper(ctx context.Context, s Sweeper, ttl, interval time.Duration, logf func(format string, args ...any)) {
 	if ttl <= 0 {
 		return
 	}
 	if interval <= 0 {
-		interval = time.Hour
+		interval = DefaultSweepInterval
 	}
 	if logf == nil {
 		logf = func(string, ...any) {}
@@ -90,7 +110,7 @@ func StartPeerSweeper(ctx context.Context, reg *Registry, ttl, interval time.Dur
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				removed, err := reg.SweepStalePeers(ttl)
+				removed, err := s.ExpelStalePeers(ctx, ttl)
 				if err != nil {
 					logf("peer sweep error: %v", err)
 				} else if removed > 0 {

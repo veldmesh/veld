@@ -118,15 +118,23 @@ The `Coord` service is the daemon-facing gRPC API defined in `proto/veld/coord/v
 
 ## Coord server peer TTL sweep
 
-`veld-coord` runs a background sweep (`coord/server/sweep.go`) that prunes peers whose
+`veld-coord` runs a background sweep (`coord/server/sweep.go`, `Server.ExpelStalePeers`) that prunes peers whose
 registration has lapsed, keeping the bbolt registry consistent with the "blind directory"
 model — entries age out instead of accumulating forever.
 
 - A peer is stale when `now - LastSeen > peer-ttl`. Peers that never sent a heartbeat
   (`LastSeen == 0`) are aged by `RegisteredAt` instead.
+- **Peers with an active `Watch` stream are never swept.** A connected daemon is online by
+  definition; the server tracks connected peers and refreshes their `LastSeen` every minute
+  for the lifetime of the stream, so long-lived connections cannot go stale.
+- Expelled peers get the same treatment as a graceful `Leave`: a `LEAVE` event is published
+  to the network’s watchers, `LifecycleHooks.OnPeerLeft` fires, and a `peer.left` audit
+  entry is written. Remaining peers never keep ghost entries.
 - The sweep only deletes existing keys; the on-disk schema is unchanged and backward compatible.
 - Flags: `--peer-ttl` (default **720h = 30 days**, exported as `server.DefaultPeerTTL`; `0` disables
-  the sweep) and `--sweep-interval` (default **1h**).
+  the sweep) and `--sweep-interval` (default **1h**, `server.DefaultSweepInterval`). Keep the
+  interval in the minutes range — sub-minute intervals churn the registry write path and
+  are meant for tests only.
 
 ---
 
