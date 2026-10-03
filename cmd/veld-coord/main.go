@@ -31,7 +31,7 @@ func main() {
 	peerTTL := flag.Duration("peer-ttl", coordserver.DefaultPeerTTL,
 		"peer registration TTL; peers not seen for this long are pruned (0 disables the sweep)")
 	sweepInterval := flag.Duration("sweep-interval", coordserver.DefaultSweepInterval,
-		"how often the stale-peer sweep runs (keep at minutes or more; sub-minute intervals are for tests)")
+		"how often the stale-peer sweep runs (minimum one minute; shorter values are clamped up)")
 	flag.Parse()
 
 	reg, err := coordserver.NewRegistry(*dbPath)

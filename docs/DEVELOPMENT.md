@@ -132,9 +132,9 @@ model — entries age out instead of accumulating forever.
   entry is written. Remaining peers never keep ghost entries.
 - The sweep only deletes existing keys; the on-disk schema is unchanged and backward compatible.
 - Flags: `--peer-ttl` (default **720h = 30 days**, exported as `server.DefaultPeerTTL`; `0` disables
-  the sweep) and `--sweep-interval` (default **1h**, `server.DefaultSweepInterval`). Keep the
-  interval in the minutes range — sub-minute intervals churn the registry write path and
-  are meant for tests only.
+  the sweep) and `--sweep-interval` (default **1h**, `server.DefaultSweepInterval`). Values below
+  `server.MinSweepInterval` (**1 minute**) are clamped up to it, so a misconfigured flag cannot
+  churn the registry write path.
 
 ---
 

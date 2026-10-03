@@ -366,7 +366,7 @@ func TestServer_ExpelStalePeers_SkipsConnectedPeer(t *testing.T) {
 	}
 }
 
-func TestStartPeerSweeper_RunsPeriodically(t *testing.T) {
+func TestSweepLoop_RunsPeriodically(t *testing.T) {
 	srv, reg, _, _ := newSweepTestServer(t)
 
 	now := time.Now().Unix()
@@ -375,8 +375,9 @@ func TestStartPeerSweeper_RunsPeriodically(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// Interval is intentionally tiny (10ms) so the test does not wait for
-	// the 1h production default; see DefaultSweepInterval docs.
-	StartPeerSweeper(ctx, srv, 24*time.Hour, 10*time.Millisecond, func(string, ...any) {})
+	// the 1h production default. StartPeerSweeper refuses sub-minute
+	// intervals (clamped to MinSweepInterval), so drive the loop directly.
+	go sweepLoop(ctx, srv, 24*time.Hour, 10*time.Millisecond, func(string, ...any) {})
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -400,5 +401,26 @@ func TestStartPeerSweeper_Disabled(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if _, err := reg.GetPeer("p"); err != nil {
 		t.Errorf("peer removed with sweeper disabled: %v", err)
+	}
+}
+
+func TestNormalizeSweepInterval(t *testing.T) {
+	tests := []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{"negative falls back to default", -time.Second, DefaultSweepInterval},
+		{"zero falls back to default", 0, DefaultSweepInterval},
+		{"sub-minute clamped up to floor", 10 * time.Millisecond, MinSweepInterval},
+		{"exactly the floor is kept", MinSweepInterval, MinSweepInterval},
+		{"above the floor is kept", 2 * time.Hour, 2 * time.Hour},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeSweepInterval(tt.in); got != tt.want {
+				t.Errorf("normalizeSweepInterval(%s) = %s, want %s", tt.in, got, tt.want)
+			}
+		})
 	}
 }
