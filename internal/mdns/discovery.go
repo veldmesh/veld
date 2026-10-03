@@ -114,24 +114,61 @@ func (d *Discovery) browseLoop() {
 	}
 }
 
+// browse queries the LAN for Veld peers and hands every discovered entry to
+// onPeer. Entry fields are only read after the query has finished; see
+// collectEntries for why.
 func (d *Discovery) browse() {
 	entries := make(chan *hashmDNS.ServiceEntry, 32)
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-		for e := range entries {
-			d.handleEntry(e)
-		}
-	}()
+	collected := collectEntries(entries)
 
 	_ = hashmDNS.Query(&hashmDNS.QueryParam{
 		Service: serviceType,
 		Timeout: queryTimeout,
 		Entries: entries,
 	})
+
+	// Query has returned, so the library no longer touches the entries;
+	// only now is it safe to read their fields.
 	close(entries)
-	<-done
+	d.handleCollected(<-collected)
+}
+
+// collectEntries starts a goroutine that gathers every entry pointer sent on
+// entries and delivers the gathered slice once entries has been closed and
+// fully drained.
+//
+// hashicorp/mdns keeps mutating a *ServiceEntry after sending it on the
+// query's Entries channel: for the whole duration of the query it writes
+// Host/Port/AddrV4/AddrV6/InfoFields on entries it has already handed out,
+// as further records for the same name arrive. Reading entry fields while
+// Query runs is therefore a data race, so the collector must only collect
+// the pointers. Draining the buffered channel concurrently also keeps the
+// library's non-blocking sends from dropping entries.
+func collectEntries(entries <-chan *hashmDNS.ServiceEntry) <-chan []*hashmDNS.ServiceEntry {
+	collected := make(chan []*hashmDNS.ServiceEntry, 1)
+	go func() {
+		var got []*hashmDNS.ServiceEntry
+		for e := range entries {
+			got = append(got, e)
+		}
+		collected <- got
+	}()
+	return collected
+}
+
+// handleCollected parses entries gathered by collectEntries, after the query
+// that produced them has finished and the library no longer mutates them.
+// hashicorp/mdns can send the same *ServiceEntry pointer more than once, so
+// entries are de-duplicated by pointer: onPeer fires once per distinct peer.
+func (d *Discovery) handleCollected(entries []*hashmDNS.ServiceEntry) {
+	seen := make(map[*hashmDNS.ServiceEntry]struct{}, len(entries))
+	for _, e := range entries {
+		if _, dup := seen[e]; dup {
+			continue
+		}
+		seen[e] = struct{}{}
+		d.handleEntry(e)
+	}
 }
 
 func (d *Discovery) handleEntry(e *hashmDNS.ServiceEntry) {
