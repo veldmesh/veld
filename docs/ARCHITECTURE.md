@@ -147,30 +147,34 @@ server and NAT traversal entirely.
 
 **Relay fallback (DERP-style).** When hole punching times out — e.g. both peers behind
 symmetric NATs — the NAT manager hands off to a relay path instead of giving up
-(`internal/relay/`). The relay is a volunteer mesh peer, reachable over TCP by both
-sides and configured via `coord.relay_addr` + the relay's pinned X25519 key
-(`coord.relay_x25519`). It is *not* the coord server, and no relay traffic ever
-transits the coord server:
+(`internal/relay/`). The relay is a volunteer mesh peer running the `veld-relay`
+command, reachable over TCP by both sides and configured via `coord.relay_addr` + the
+relay's pinned X25519 key (`coord.relay_x25519`). It is *not* the coord server —
+it is an out-of-band mesh peer, not an extension of the directory — and no relay
+traffic ever transits the coord server:
 
-1. Both peers derive the same 16-byte rendezvous channel ID from their Ed25519 peer
-   IDs (order-independent SHA-256), so no extra signalling is needed.
-2. Each peer opens a TCP connection to the relay and completes a **Noise IK
-   handshake** against the relay's pinned static key, carrying the channel ID in
-   message_1's encrypted payload. The relay splices the two connections on a matching
-   channel ID and forwards opaque frames between them.
-3. Each daemon stands up a loopback UDP proxy (`relay.Proxy`) that frames data-plane
+1. Each peer opens a TCP connection to the relay and completes a **Noise IK
+   handshake** against the relay's pinned static key. The encrypted payload of
+   message_1 carries the *remote peer's* X25519 public key; the relay derives the
+   rendezvous channel from the client key it just authenticated plus that payload
+   (order-independent SHA-256), so no extra signalling is needed and a third party
+   who merely knows both peers' public keys cannot join or hijack a pair's
+   channel. The relay splices the two connections of a matched channel and forwards
+   opaque frames between them.
+2. Each daemon stands up a loopback UDP proxy (`relay.Proxy`) that frames data-plane
    datagrams onto the relay channel and injects arriving datagrams back into the local
-   data-plane socket. The proxy's loopback address becomes the peer's endpoint, so the
-   dispatcher and handshake manager treat the relay path exactly like a direct one.
-4. The peers then run the normal peer-to-peer Noise IK data-plane handshake *through*
+   data-plane socket. The proxy accepts datagrams only from the daemon's own socket;
+   its loopback address becomes the peer's endpoint, so the dispatcher and handshake
+   manager treat the relay path exactly like a direct one. The daemon keeps at most
+   one proxy per peer — replaced on a fresh fallback, torn down when the peer leaves.
+3. The peers then run the normal peer-to-peer Noise IK data-plane handshake *through*
    the channel. All payloads are end-to-end session-encrypted (ChaCha20-Poly1305), so
    the relay — like the coord server — is cryptographically blind to traffic content;
-   it observes only channel IDs, volume, and timing.
+   it observes only connection metadata, volume, and timing. Unpaired connections are
+   evicted after a wait timeout, and the handshake itself is time-bounded.
 
 The P2P-first model is unchanged: the relay is used only after hole punching fails,
 and any mesh peer (or a small self-hosted VM) can volunteer as a relay.
-
-relay is an out-of-band mesh peer, not an extension of the directory.*
 
 ### 3.6 Client (`cmd/`, `internal/`, `tray/`)
 
@@ -178,6 +182,7 @@ relay is an out-of-band mesh peer, not an extension of the directory.*
 - **`veld-daemon`** — background service wiring TUN + UDP + peer table + dispatcher +
   handshake manager + (optional) coord client + (optional) NAT manager, over an IPC socket.
 - **`veld-coord`** — the CE coordination server binary (single process, bbolt-backed).
+- **`veld-relay`** — volunteer DERP-style relay binary (§3.5); generates an identity on first run and prints its X25519 public key.
 - **`tray/`** — desktop tray front end.
 - Config lives in `~/.config/veld`, is 0600, and holds the persistent Ed25519 identity.
   The coord server address is configurable, enabling self-hosted deployments.

@@ -5,6 +5,8 @@ package relay
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -66,10 +68,10 @@ func TestChannelID(t *testing.T) {
 	})
 }
 
-// dialPair connects two clients on the same channel and returns both Conns.
+// dialPair connects two clients, each naming the other as its remote peer,
+// and returns both Conns.
 func dialPair(t *testing.T, relayAddr string, relayKey [32]byte, idA, idB *crypto.Identity) (*Conn, *Conn) {
 	t.Helper()
-	channel := ChannelID([32]byte(idA.Ed25519Public), [32]byte(idB.Ed25519Public))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -81,11 +83,11 @@ func dialPair(t *testing.T, relayAddr string, relayKey [32]byte, idA, idB *crypt
 	ch := make(chan res, 2)
 	// Dial both concurrently: the first waits for pairing.
 	go func() {
-		c, err := Dial(ctx, relayAddr, relayKey, idA, channel)
+		c, err := Dial(ctx, relayAddr, relayKey, idA, idB.X25519Public)
 		ch <- res{c, err}
 	}()
 	go func() {
-		c, err := Dial(ctx, relayAddr, relayKey, idB, channel)
+		c, err := Dial(ctx, relayAddr, relayKey, idB, idA.X25519Public)
 		ch <- res{c, err}
 	}()
 
@@ -155,6 +157,146 @@ func TestDialExchange(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("oversized message rejected locally", func(t *testing.T) {
+		if err := cA.WriteMessage(make([]byte, maxMessage+1)); err == nil {
+			t.Error("WriteMessage above maxMessage must fail")
+		}
+		// A max-size message still works.
+		if err := cA.WriteMessage(make([]byte, maxMessage)); err != nil {
+			t.Errorf("WriteMessage at maxMessage: %v", err)
+		}
+		got, err := cB.ReadMessage()
+		if err != nil {
+			t.Fatalf("ReadMessage max-size: %v", err)
+		}
+		if len(got) != maxMessage {
+			t.Errorf("got %d bytes, want %d", len(got), maxMessage)
+		}
+	})
+}
+
+// TestDialImpostorCannotHijack verifies that a third party naming B's key
+// does NOT get paired with A's waiting connection: the channel is derived
+// from the authenticated initiator key, so the impostor lands on a different
+// channel and A's connection does not receive the impostor's frames.
+func TestDialImpostorCannotHijack(t *testing.T) {
+	relayID := mustIdentity(t)
+	addr := startService(t, relayID)
+	idA, idB, idE := mustIdentity(t), mustIdentity(t), mustIdentity(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// A waits for B.
+	cA, err := Dial(ctx, addr, relayID.X25519Public, idA, idB.X25519Public)
+	if err != nil {
+		t.Fatalf("Dial A: %v", err)
+	}
+	t.Cleanup(func() { _ = cA.Close() })
+
+	// Impostor E also names B; it must land on a different channel.
+	cE, err := Dial(ctx, addr, relayID.X25519Public, idE, idB.X25519Public)
+	if err != nil {
+		t.Fatalf("Dial E: %v", err)
+	}
+	t.Cleanup(func() { _ = cE.Close() })
+
+	// E sends a frame; A must not receive it (A is unpaired with E).
+	if err := cE.WriteMessage([]byte("hijack attempt")); err != nil {
+		t.Fatalf("WriteMessage E: %v", err)
+	}
+
+	// Now the real B connects and pairs with A.
+	cB, err := Dial(ctx, addr, relayID.X25519Public, idB, idA.X25519Public)
+	if err != nil {
+		t.Fatalf("Dial B: %v", err)
+	}
+	t.Cleanup(func() { _ = cB.Close() })
+
+	want := []byte("real message for A")
+	if err := cB.WriteMessage(want); err != nil {
+		t.Fatalf("WriteMessage B: %v", err)
+	}
+	got, err := cA.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage A: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("A got %q (hijacked?), want %q", got, want)
+	}
+}
+
+// TestReconnectReplacesWaiting verifies that if A reconnects before B
+// arrives, the relay replaces the stale waiting connection instead of
+// splicing A's two connections to each other, and B still pairs with A.
+func TestReconnectReplacesWaiting(t *testing.T) {
+	relayID := mustIdentity(t)
+	addr := startService(t, relayID)
+	idA, idB := mustIdentity(t), mustIdentity(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cA1, err := Dial(ctx, addr, relayID.X25519Public, idA, idB.X25519Public)
+	if err != nil {
+		t.Fatalf("Dial A1: %v", err)
+	}
+	cA2, err := Dial(ctx, addr, relayID.X25519Public, idA, idB.X25519Public)
+	if err != nil {
+		t.Fatalf("Dial A2: %v", err)
+	}
+
+	// The stale connection must have been closed by the relay.
+	cA1.raw.SetReadDeadline(time.Now().Add(3 * time.Second)) //nolint:errcheck
+	if _, err := cA1.ReadMessage(); err == nil {
+		t.Error("replaced connection A1 must be closed, got no error")
+	}
+
+	// B pairs with the fresh A2.
+	cB, err := Dial(ctx, addr, relayID.X25519Public, idB, idA.X25519Public)
+	if err != nil {
+		t.Fatalf("Dial B: %v", err)
+	}
+	t.Cleanup(func() { _ = cA2.Close(); _ = cB.Close() })
+
+	want := []byte("B reaches the new A")
+	if err := cB.WriteMessage(want); err != nil {
+		t.Fatalf("WriteMessage B: %v", err)
+	}
+	got, err := cA2.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage A2: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("A2 got %q, want %q", got, want)
+	}
+}
+
+// TestUnpairedConnectionEvicted verifies a client that never gets a partner
+// is evicted after the waiting timeout instead of lingering forever.
+func TestUnpairedConnectionEvicted(t *testing.T) {
+	relayID := mustIdentity(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	svc := NewService(relayID, ln)
+	svc.waitTimeout = 200 * time.Millisecond
+	go svc.Serve(context.Background()) //nolint:errcheck
+	t.Cleanup(func() { _ = svc.Close() })
+
+	idA := mustIdentity(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, svc.Addr(), relayID.X25519Public, idA, [32]byte{0x42})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	c.raw.SetReadDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+	if _, err := c.ReadMessage(); !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("expected eviction to close the connection (EOF), got %v", err)
+	}
 }
 
 func TestDialWrongRelayKey(t *testing.T) {
@@ -165,7 +307,7 @@ func TestDialWrongRelayKey(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := Dial(ctx, addr, wrongKey, idA, ChannelID([32]byte{1}, [32]byte{2}))
+	_, err := Dial(ctx, addr, wrongKey, idA, [32]byte{1})
 	if err == nil {
 		t.Fatal("Dial with wrong relay key must fail")
 	}
@@ -176,7 +318,7 @@ func TestDialUnreachable(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	// Port 1 on loopback is never listening.
-	_, err := Dial(ctx, "127.0.0.1:1", [32]byte{9}, idA, ChannelID([32]byte{1}, [32]byte{2}))
+	_, err := Dial(ctx, "127.0.0.1:1", [32]byte{9}, idA, [32]byte{1})
 	if err == nil {
 		t.Fatal("Dial to unreachable relay must fail")
 	}
@@ -247,5 +389,62 @@ func TestProxy(t *testing.T) {
 	}
 	if from.Port != int(proxyA.LocalAddr().Port()) {
 		t.Errorf("connA source = %v, want proxy A port %d", from, proxyA.LocalAddr().Port())
+	}
+}
+
+// TestProxyDropsStraySender verifies the proxy only accepts datagrams from
+// the daemon's data-plane socket, not from arbitrary local processes.
+func TestProxyDropsStraySender(t *testing.T) {
+	relayID := mustIdentity(t)
+	addr := startService(t, relayID)
+	idA, idB := mustIdentity(t), mustIdentity(t)
+
+	cA, cB := dialPair(t, addr, relayID.X25519Public, idA, idB)
+
+	connA, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("connA: %v", err)
+	}
+	t.Cleanup(func() { connA.Close() })
+	connB, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("connB: %v", err)
+	}
+	t.Cleanup(func() { connB.Close() })
+	stranger, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("stranger: %v", err)
+	}
+	t.Cleanup(func() { stranger.Close() })
+
+	proxyA, err := NewProxy(cA, connA.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatalf("NewProxy A: %v", err)
+	}
+	t.Cleanup(func() { proxyA.Close() })
+	proxyB, err := NewProxy(cB, connB.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatalf("NewProxy B: %v", err)
+	}
+	t.Cleanup(func() { proxyB.Close() })
+
+	// A stray local process sends to proxy A first: it must be dropped.
+	if _, err := stranger.WriteToUDP([]byte("intruder"), net.UDPAddrFromAddrPort(proxyA.LocalAddr())); err != nil {
+		t.Fatalf("stranger write: %v", err)
+	}
+	// Then the real daemon socket sends: it must be delivered.
+	msg := []byte("legit datagram")
+	if _, err := connA.WriteToUDP(msg, net.UDPAddrFromAddrPort(proxyA.LocalAddr())); err != nil {
+		t.Fatalf("connA write: %v", err)
+	}
+
+	buf := make([]byte, 2048)
+	connB.SetReadDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+	n, _, err := connB.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("connB read: %v", err)
+	}
+	if !bytes.Equal(buf[:n], msg) {
+		t.Errorf("connB got %q, want %q (stray datagram must be dropped)", buf[:n], msg)
 	}
 }

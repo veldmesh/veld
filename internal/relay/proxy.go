@@ -62,16 +62,32 @@ func (p *Proxy) Close() error {
 
 // udpToStream reads datagrams from the dispatcher (via the loopback socket)
 // and forwards each as one framed message over the relay channel.
+// Only datagrams from the daemon's own data-plane socket are accepted; the
+// loopback socket is not reachable from off-host, but any other local
+// process that guessed the port is ignored rather than relayed.
+//
 // Wire framing inside the channel: [uint16 big-endian length][datagram],
 // which accommodates full IPv6 datagrams — far above the tunnel MTU (1420),
 // so framing never truncates a payload.
 func (p *Proxy) udpToStream() {
 	buf := make([]byte, 65535)
 	for {
-		n, _, err := p.udp.ReadFromUDP(buf)
+		n, src, err := p.udp.ReadFromUDP(buf)
 		if err != nil {
 			_ = p.Close()
 			return
+		}
+		// The daemon's socket sends from its own bound port; when bound to
+		// a non-loopback interface, loopback-destined datagrams can leave
+		// with either the bound address or a loopback source, so match the
+		// target's port and accept the target's address or any loopback
+		// source.
+		fromDaemon := src.Port == p.target.Port && (src.IP.Equal(p.target.IP) || src.IP.IsLoopback())
+		if !fromDaemon {
+			continue
+		}
+		if n+2 > maxMessage {
+			continue // oversized datagram that cannot be framed; MTU is 1420
 		}
 		frame := make([]byte, 2+n)
 		binary.BigEndian.PutUint16(frame[0:2], uint16(n))

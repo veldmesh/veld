@@ -6,19 +6,27 @@
 //
 // The relay is a volunteer mesh peer — never the coord server. Clients connect
 // to it over TCP and open a Noise IK-encrypted channel (X25519 + SHA-256 +
-// ChaCha20-Poly1305) using the relay's pinned static key. Both sides of a
-// failing peer pair derive the same 16-byte channel ID from their peer IDs
-// (ChannelID); the relay splices the two connections that present the same
-// channel ID and forwards opaque frames between them.
+// ChaCha20-Poly1305) using the relay's pinned static key. The handshake's
+// encrypted payload carries the *remote peer's* X25519 public key; the relay
+// derives the rendezvous channel from that key plus the initiator key it just
+// authenticated (ChannelID), and splices the two connections that arrive on
+// the same channel from opposite directions.
+//
+// Because the channel is derived from the authenticated initiator key rather
+// than from a client-supplied channel ID, a third party who merely knows both
+// peers' public keys cannot join or hijack a pair's channel — only
+// connections authenticated as one of the two peers map onto it. (A malicious
+// relay can still refuse service or splice wrongly, but it learns nothing and
+// no honest relay will pair an impostor.)
 //
 // The relay is blind: payloads flowing over a channel are the peers' own
 // data-plane datagrams, which are already end-to-end encrypted by the
 // session layer (peer-to-peer Noise IK + ChaCha20-Poly1305). The relay
-// learns only channel IDs, volumes, and timing.
+// learns only endpoints, volumes, and timing.
 //
 // Wire protocol (client → relay is the Noise IK initiator):
 //
-//	frame 1: Noise IK message_1, payload = 16-byte channel ID
+//	frame 1: Noise IK message_1, payload = 32-byte remote peer X25519 key
 //	frame 2: Noise IK message_2 from the relay, empty payload
 //	thereafter: length-prefixed frames carrying encrypted messages
 //
@@ -42,19 +50,22 @@ import (
 	"github.com/veldmesh/veld/internal/crypto"
 )
 
-// maxMessage is the largest payload carried by a single relay frame.
-// Sized generously above one tunnel MTU (1420) plus session overhead.
-const maxMessage = 1 << 16
+// maxMessage is the largest plaintext payload carried by a single relay
+// frame: the 16-bit length field caps a frame at 65535 bytes and the
+// ChaCha20-Poly1305 tag adds 16 bytes, so payloads above 65519 would not
+// fit on the wire. This is far above the tunnel MTU (1420), so framing
+// never truncates a data-plane datagram.
+const maxMessage = 0xFFFF - 16
 
-// ChannelIDSize is the size of a rendezvous channel ID in bytes.
-const ChannelIDSize = 16
+// channelIDSize is the size of a derived relay channel identifier in bytes.
+const channelIDSize = 16
 
 var noiseSuite = noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
 
-// ChannelID derives the 16-byte rendezvous channel ID for a peer pair.
+// ChannelID derives the 16-byte rendezvous channel ID for a key pair.
 // It is symmetric: ChannelID(a, b) == ChannelID(b, a), so both peers of a
 // failing NAT pair arrive at the same channel without any extra signalling.
-func ChannelID(a, b [32]byte) [ChannelIDSize]byte {
+func ChannelID(a, b [32]byte) [channelIDSize]byte {
 	lo, hi := a, b
 	if bytes.Compare(a[:], b[:]) > 0 {
 		lo, hi = b, a
@@ -64,8 +75,8 @@ func ChannelID(a, b [32]byte) [ChannelIDSize]byte {
 	h.Write(lo[:])
 	h.Write(hi[:])
 	sum := h.Sum(nil)
-	var id [ChannelIDSize]byte
-	copy(id[:], sum[:ChannelIDSize])
+	var id [channelIDSize]byte
+	copy(id[:], sum[:channelIDSize])
 	return id
 }
 
@@ -78,17 +89,18 @@ type Conn struct {
 }
 
 // WriteMessage encrypts b and writes it as one length-prefixed frame.
-// Concurrent calls are serialised.
+// Concurrent calls are serialised: both encryption and the write happen
+// under the write mutex so the cipher state is never raced.
 func (c *Conn) WriteMessage(b []byte) error {
 	if len(b) > maxMessage {
 		return fmt.Errorf("relay: message too large (%d > %d)", len(b), maxMessage)
 	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
 	ct, err := c.send.Encrypt(nil, nil, b)
 	if err != nil {
 		return err
 	}
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
 	return writeFrame(c.raw, ct)
 }
 
@@ -106,9 +118,11 @@ func (c *Conn) Close() error { return c.raw.Close() }
 
 // Dial connects to the relay service at addr ("host:port", TCP), completes a
 // Noise IK handshake against the relay's pinned X25519 static key, and
-// registers channelID. The returned Conn starts delivering messages once the
-// peer with the same channel ID has also connected.
-func Dial(ctx context.Context, addr string, relayX25519 [32]byte, id *crypto.Identity, channelID [ChannelIDSize]byte) (*Conn, error) {
+// requests a channel to remotePeerKey — the X25519 public key of the peer
+// this node is trying to reach. The relay derives the rendezvous channel
+// from the caller's authenticated static key and remotePeerKey; the returned
+// Conn starts delivering messages once that peer has also connected.
+func Dial(ctx context.Context, addr string, relayX25519 [32]byte, id *crypto.Identity, remotePeerKey [32]byte) (*Conn, error) {
 	var d net.Dialer
 	raw, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -135,7 +149,7 @@ func Dial(ctx context.Context, addr string, relayX25519 [32]byte, id *crypto.Ide
 		return nil, err
 	}
 
-	msg1, _, _, err := hs.WriteMessage(nil, channelID[:])
+	msg1, _, _, err := hs.WriteMessage(nil, remotePeerKey[:])
 	if err != nil {
 		_ = raw.Close()
 		return nil, fmt.Errorf("relay handshake msg1: %w", err)
@@ -150,18 +164,18 @@ func Dial(ctx context.Context, addr string, relayX25519 [32]byte, id *crypto.Ide
 		_ = raw.Close()
 		return nil, fmt.Errorf("relay handshake recv: %w", err)
 	}
-	if _, cs1, cs2, err := hs.ReadMessage(nil, msg2); err != nil {
+	_, cs1, cs2, err := hs.ReadMessage(nil, msg2)
+	if err != nil {
 		_ = raw.Close()
 		return nil, fmt.Errorf("relay handshake msg2: %w", err)
-	} else {
-		// Initiator: cs1 = send, cs2 = recv.
-		return &Conn{raw: raw, send: cs1, recv: cs2}, nil
 	}
+	// Initiator: cs1 = send, cs2 = recv.
+	return &Conn{raw: raw, send: cs1, recv: cs2}, nil
 }
 
 // writeFrame writes msg with a 2-byte big-endian length prefix.
 func writeFrame(w io.Writer, msg []byte) error {
-	if len(msg) > 0xFFFF+32 { // ciphertext may exceed maxMessage by tag overhead only
+	if len(msg) > 0xFFFF {
 		return errors.New("relay: frame too large")
 	}
 	var hdr [2]byte
@@ -180,9 +194,6 @@ func readFrame(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	n := binary.BigEndian.Uint16(hdr[:])
-	if int(n) > maxMessage+32 {
-		return nil, errors.New("relay: frame too large")
-	}
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return nil, err

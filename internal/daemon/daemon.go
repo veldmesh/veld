@@ -49,7 +49,7 @@ type Daemon struct {
 	vpnAddr      netip.Addr
 	peerID       string
 	coordAddr    string
-	relayProxies []*relay.Proxy
+	relayProxies map[[32]byte]*relay.Proxy // one relay proxy per peer ID
 }
 
 // New creates a Daemon from pre-constructed components.
@@ -215,52 +215,64 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 			if e, ok := peerTbl.LookupByID(peerID); ok {
 				d.hsMgr.Initiate(e)
 			}
+		}
 
-			// Relay fallback: if hole punching times out (e.g. symmetric NATs),
-			// open a Noise IK-encrypted channel through a volunteer relay peer
-			// and re-point the data plane through a local loopback proxy. The
-			// P2P-first model is unchanged — the relay is only a fallback, and
-			// traffic still never transits the coord server.
-			if cfg.Coord.RelayAddr != "" {
-				relayKeyBytes, err := base64.StdEncoding.DecodeString(cfg.Coord.RelayX25519)
-				if err != nil || len(relayKeyBytes) != 32 {
-					fmt.Printf("warning: invalid coord.relay_x25519, relay fallback disabled\n")
-				} else {
-					var relayKey [32]byte
-					copy(relayKey[:], relayKeyBytes)
-					var selfID [32]byte
-					copy(selfID[:], localID.Ed25519Public)
-					// The proxy injects datagrams into the daemon's own data-plane
-					// socket. If the socket binds to a specific interface address,
-					// target that; otherwise loopback reaches a wildcard bind.
-					dataIP := net.IPv4(127, 0, 0, 1)
-					if laddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && len(laddr.IP) > 0 && !laddr.IP.IsUnspecified() {
-						dataIP = laddr.IP
+		// Relay fallback: if hole punching times out (e.g. symmetric NATs),
+		// open a Noise IK-encrypted channel through a volunteer relay peer
+		// and re-point the data plane through a local loopback proxy. The
+		// P2P-first model is unchanged — the relay is only a fallback, and
+		// traffic still never transits the coord server.
+		if cfg.Coord.RelayAddr != "" {
+			relayKeyBytes, err := base64.StdEncoding.DecodeString(cfg.Coord.RelayX25519)
+			if err != nil || len(relayKeyBytes) != 32 {
+				fmt.Printf("warning: invalid coord.relay_x25519, relay fallback disabled\n")
+			} else {
+				var relayKey [32]byte
+				copy(relayKey[:], relayKeyBytes)
+
+				// The proxy injects datagrams into the daemon's own data-plane
+				// socket. If the socket binds to a specific interface address,
+				// target that; otherwise loopback reaches a wildcard bind.
+				dataIP := net.IPv4(127, 0, 0, 1)
+				if laddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && len(laddr.IP) > 0 && !laddr.IP.IsUnspecified() {
+					dataIP = laddr.IP
+				}
+				dataTarget := &net.UDPAddr{IP: dataIP, Port: int(localPort)}
+
+				d.natMgr.OnPunchTimeout = func(peerID [32]byte) {
+					peerEntry, ok := peerTbl.LookupByID(peerID)
+					if !ok {
+						return
 					}
-					dataTarget := &net.UDPAddr{IP: dataIP, Port: int(localPort)}
+					dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+					defer cancel()
+					rc, err := relay.Dial(dialCtx, cfg.Coord.RelayAddr, relayKey, localID, peerEntry.X25519Pub)
+					if err != nil {
+						fmt.Printf("warning: relay dial for peer %x: %v\n", peerID[:8], err)
+						return
+					}
+					proxy, err := relay.NewProxy(rc, dataTarget)
+					if err != nil {
+						_ = rc.Close()
+						fmt.Printf("warning: relay proxy for peer %x: %v\n", peerID[:8], err)
+						return
+					}
+					// Keep one proxy per peer: a previous fallback (or a
+					// re-punch that timed out again) is replaced and closed.
+					d.mu.Lock()
+					if d.relayProxies == nil {
+						d.relayProxies = make(map[[32]byte]*relay.Proxy)
+					}
+					old := d.relayProxies[peerID]
+					d.relayProxies[peerID] = proxy
+					d.mu.Unlock()
+					if old != nil {
+						_ = old.Close()
+					}
 
-					d.natMgr.OnPunchTimeout = func(peerID [32]byte) {
-						dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-						defer cancel()
-						rc, err := relay.Dial(dialCtx, cfg.Coord.RelayAddr, relayKey, localID, relay.ChannelID(selfID, peerID))
-						if err != nil {
-							fmt.Printf("warning: relay dial for peer %x: %v\n", peerID[:8], err)
-							return
-						}
-						proxy, err := relay.NewProxy(rc, dataTarget)
-						if err != nil {
-							_ = rc.Close()
-							fmt.Printf("warning: relay proxy for peer %x: %v\n", peerID[:8], err)
-							return
-						}
-						d.mu.Lock()
-						d.relayProxies = append(d.relayProxies, proxy)
-						d.mu.Unlock()
-
-						peerTbl.UpdateEndpoint(peerID, proxy.LocalAddr())
-						if e, ok := peerTbl.LookupByID(peerID); ok {
-							d.hsMgr.Initiate(e)
-						}
+					peerTbl.UpdateEndpoint(peerID, proxy.LocalAddr())
+					if e, ok := peerTbl.LookupByID(peerID); ok {
+						d.hsMgr.Initiate(e)
 					}
 				}
 			}
@@ -295,6 +307,14 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 						fmt.Printf("warning: remove route %s: %v\n", pfx, err)
 					}
 				}
+			}
+			// Tear down any relay proxy held for the departing peer.
+			d.mu.Lock()
+			proxy := d.relayProxies[id]
+			delete(d.relayProxies, id)
+			d.mu.Unlock()
+			if proxy != nil {
+				_ = proxy.Close()
 			}
 		}
 

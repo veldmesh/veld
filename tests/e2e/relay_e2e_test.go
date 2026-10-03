@@ -79,10 +79,15 @@ func TestRelayFallback_TwoPeers(t *testing.T) {
 	copy(selfA[:], idA.Ed25519Public)
 	copy(selfB[:], idB.Ed25519Public)
 
+	entryA := &peer.Entry{ID: selfA, X25519Pub: idA.X25519Public}
+	entryA.VPNAddr = netip.MustParseAddr("10.60.0.1")
+	entryB := &peer.Entry{ID: selfB, X25519Pub: idB.X25519Public}
+	entryB.VPNAddr = netip.MustParseAddr("10.60.0.2")
+
 	mgrA.OnPunchTimeout = func(peerID [32]byte) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		rc, err := relay.Dial(ctx, relayAddr, relayKey, idA, relay.ChannelID(selfA, peerID))
+		rc, err := relay.Dial(ctx, relayAddr, relayKey, idA, entryB.X25519Pub)
 		if err != nil {
 			fellBackA <- fallback{err: err}
 			return
@@ -96,7 +101,7 @@ func TestRelayFallback_TwoPeers(t *testing.T) {
 	mgrB.OnPunchTimeout = func(peerID [32]byte) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		rc, err := relay.Dial(ctx, relayAddr, relayKey, idB, relay.ChannelID(selfB, peerID))
+		rc, err := relay.Dial(ctx, relayAddr, relayKey, idB, entryA.X25519Pub)
 		if err != nil {
 			fellBackB <- fallback{err: err}
 			return
@@ -107,11 +112,6 @@ func TestRelayFallback_TwoPeers(t *testing.T) {
 		}
 		fellBackB <- fallback{proxy: p, err: err}
 	}
-
-	entryA := &peer.Entry{ID: selfA, X25519Pub: idA.X25519Public}
-	entryA.VPNAddr = netip.MustParseAddr("10.60.0.1")
-	entryB := &peer.Entry{ID: selfB, X25519Pub: idB.X25519Public}
-	entryB.VPNAddr = netip.MustParseAddr("10.60.0.2")
 
 	// Exchange NAT signals directly, as the coord server would relay them.
 	peerIDofA := hex.EncodeToString(idA.Ed25519Public[:32])
