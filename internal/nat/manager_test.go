@@ -246,3 +246,61 @@ func TestNATManager_DuplicateStart(t *testing.T) {
 		t.Errorf("got extra discovery events from duplicate Start: %d extra", len(discovered))
 	}
 }
+
+// TestNATManager_PunchTimeoutFallback verifies that when hole punching fails
+// to confirm any endpoint (simulating symmetric NATs — probes go nowhere),
+// the manager fires OnPunchTimeout on both sides instead of
+// OnEndpointDiscovered, giving the daemon a chance to fall back to a relay.
+func TestNATManager_PunchTimeoutFallback(t *testing.T) {
+	idA := makeIdentity(t)
+	idB := makeIdentity(t)
+
+	connA, portA := makeUDPConn(t)
+	connB, portB := makeUDPConn(t)
+
+	mgrA := nat.New(connA, portA, "", idA)
+	mgrB := nat.New(connB, portB, "", idB)
+
+	// No probe pumpers: probes vanish, as they would across symmetric NATs.
+	timedOutA := make(chan [32]byte, 1)
+	timedOutB := make(chan [32]byte, 1)
+	mgrA.OnPunchTimeout = func(id [32]byte) { timedOutA <- id }
+	mgrB.OnPunchTimeout = func(id [32]byte) { timedOutB <- id }
+
+	discovered := make(chan netip.AddrPort, 2)
+	mgrA.OnEndpointDiscovered = func(_ [32]byte, ep netip.AddrPort) { discovered <- ep }
+	mgrB.OnEndpointDiscovered = func(_ [32]byte, ep netip.AddrPort) { discovered <- ep }
+
+	entryA := &peer.Entry{ID: [32]byte(idA.Ed25519Public[:32]), X25519Pub: idA.X25519Public}
+	entryA.VPNAddr = netip.MustParseAddr("10.0.0.1")
+	entryB := &peer.Entry{ID: [32]byte(idB.Ed25519Public[:32]), X25519Pub: idB.X25519Public}
+	entryB.VPNAddr = netip.MustParseAddr("10.0.0.2")
+
+	peerIDofA := hex.EncodeToString(idA.Ed25519Public[:32])
+	peerIDofB := hex.EncodeToString(idB.Ed25519Public[:32])
+	sendAtoB := func(payload []byte) error { mgrB.DeliverSignal(peerIDofA, payload); return nil }
+	sendBtoA := func(payload []byte) error { mgrA.DeliverSignal(peerIDofB, payload); return nil }
+
+	ctx := context.Background()
+	mgrA.Start(ctx, entryB, sendAtoB)
+	mgrB.Start(ctx, entryA, sendBtoA)
+
+	// Probing must time out (probeTimeout is 10s) and fire the fallback hook.
+	deadline := time.After(15 * time.Second)
+	for i := 0; i < 2; i++ {
+		select {
+		case id := <-timedOutA:
+			if id != entryB.ID {
+				t.Errorf("A timed out on wrong peer: %x", id[:8])
+			}
+		case id := <-timedOutB:
+			if id != entryA.ID {
+				t.Errorf("B timed out on wrong peer: %x", id[:8])
+			}
+		case ep := <-discovered:
+			t.Fatalf("endpoint %v discovered, but probing should have failed", ep)
+		case <-deadline:
+			t.Fatal("OnPunchTimeout did not fire for both peers")
+		}
+	}
+}

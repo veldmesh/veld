@@ -13,6 +13,9 @@
 //     packets (via the shared data-plane conn) to every remote candidate.
 //  6. When a probe is received, a reply is sent. When a reply is received,
 //     OnEndpointDiscovered is called with the validated remote AddrPort.
+//     If probing times out without a confirmed endpoint (e.g. symmetric NAT
+//     on both sides), OnPunchTimeout is called so the daemon can fall back
+//     to a relay path (see internal/relay).
 //  7. The daemon wires OnEndpointDiscovered → peer table update → handshake.
 package nat
 
@@ -51,11 +54,17 @@ type Manager struct {
 	// Noise handshake. Called at most once per Start invocation.
 	OnEndpointDiscovered func(peerID [32]byte, ep netip.AddrPort)
 
-	mu      sync.Mutex
+	// OnPunchTimeout is called when hole punching for a peer times out
+	// without a confirmed endpoint (e.g. both sides are behind symmetric
+	// NATs). The caller should fall back to a relay path. Called at most
+	// once per Start invocation.
+	OnPunchTimeout func(peerID [32]byte)
+
+	mu       sync.Mutex
 	sessions map[[32]byte]*natSession
 	// pending holds encrypted signal payloads that arrived before the session
 	// for that peer was created. Keyed by sender peer ID.
-	pending  map[[32]byte][]byte
+	pending map[[32]byte][]byte
 }
 
 type natSession struct {
@@ -63,8 +72,8 @@ type natSession struct {
 	peerX25519 [32]byte
 	sendFn     func([]byte) error
 
-	probeNonce [8]byte        // random nonce identifies our probes
-	signalIn   chan []byte     // receives decrypted peer signal payloads
+	probeNonce [8]byte             // random nonce identifies our probes
+	signalIn   chan []byte         // receives decrypted peer signal payloads
 	result     chan netip.AddrPort // receives the winning endpoint
 
 	cancel context.CancelFunc
@@ -289,6 +298,10 @@ func (m *Manager) negotiate(ctx context.Context, sess *natSession) {
 	// Wait for a successful reply (delivered by HandleProbe).
 	select {
 	case <-probeCtx.Done():
+		// Hole punching failed — hand off to the relay fallback path.
+		if m.OnPunchTimeout != nil {
+			m.OnPunchTimeout(sess.peerID)
+		}
 		return
 	case ep := <-sess.result:
 		if m.OnEndpointDiscovered != nil {
