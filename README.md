@@ -163,8 +163,10 @@ Contributions to the daemon, CLI, CE coord server, and docs are welcome. Please 
 
 ## License
 
-The **daemon, CLI, and web frontend** (`cmd/`, `internal/`, `web/`) are licensed under the **MIT License**.
+The **daemon, CLI, and web frontend** (`cmd/` — except `cmd/veld-relay` — `internal/`, `web/`) are licensed under the **MIT License**. Note the **relay client** (`internal/relay`, linked into every daemon) stays MIT; the wire protocol is open.
 
 The **coordination server** (`coord/`) is licensed under the **Business Source License 1.1 (BSL-1.1)**. Source code is publicly available. You may self-host it for personal or internal use. You may not offer it as a competing managed network service. The license converts to Apache 2.0 four years after each version's release date.
 
-See [`LICENSE`](LICENSE) and [`coord/LICENSE`](coord/LICENSE) for full terms.
+The **relay server** (`relay/`, `cmd/veld-relay`) is licensed under BSL-1.1 on the same terms: source available, self-host it freely for personal or internal use, but you may not offer it to others as a hosted relay or mesh VPN service. Converts to Apache 2.0 four years after each version's release.
+
+See [`LICENSE`](LICENSE), [`coord/LICENSE`](coord/LICENSE), and [`relay/LICENSE`](relay/LICENSE) for full terms.

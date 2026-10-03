@@ -31,6 +31,9 @@
 //	thereafter: length-prefixed frames carrying encrypted messages
 //
 // Every frame on the wire is [uint16 big-endian length][ciphertext].
+//
+// This package holds the MIT-licensed relay client (Dial/Conn/Proxy) and the
+// wire protocol. The relay server lives in the top-level relay package.
 package relay
 
 import (
@@ -57,15 +60,18 @@ import (
 // never truncates a data-plane datagram.
 const maxMessage = 0xFFFF - 16
 
-// channelIDSize is the size of a derived relay channel identifier in bytes.
-const channelIDSize = 16
+// ChannelIDSize is the size of a derived relay channel identifier in bytes.
+const ChannelIDSize = 16
 
-var noiseSuite = noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
+// NoiseSuite is the Noise cipher suite used by the relay channel protocol
+// (X25519 + ChaCha20-Poly1305 + SHA-256). It is exported so the relay server
+// (top-level relay package) speaks exactly the same protocol.
+var NoiseSuite = noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
 
 // ChannelID derives the 16-byte rendezvous channel ID for a key pair.
 // It is symmetric: ChannelID(a, b) == ChannelID(b, a), so both peers of a
 // failing NAT pair arrive at the same channel without any extra signalling.
-func ChannelID(a, b [32]byte) [channelIDSize]byte {
+func ChannelID(a, b [32]byte) [ChannelIDSize]byte {
 	lo, hi := a, b
 	if bytes.Compare(a[:], b[:]) > 0 {
 		lo, hi = b, a
@@ -75,8 +81,8 @@ func ChannelID(a, b [32]byte) [channelIDSize]byte {
 	h.Write(lo[:])
 	h.Write(hi[:])
 	sum := h.Sum(nil)
-	var id [channelIDSize]byte
-	copy(id[:], sum[:channelIDSize])
+	var id [ChannelIDSize]byte
+	copy(id[:], sum[:ChannelIDSize])
 	return id
 }
 
@@ -101,12 +107,12 @@ func (c *Conn) WriteMessage(b []byte) error {
 	if err != nil {
 		return err
 	}
-	return writeFrame(c.raw, ct)
+	return WriteFrame(c.raw, ct)
 }
 
 // ReadMessage reads and decrypts the next frame from the relay.
 func (c *Conn) ReadMessage() ([]byte, error) {
-	frame, err := readFrame(c.raw)
+	frame, err := ReadFrame(c.raw)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +141,7 @@ func Dial(ctx context.Context, addr string, relayX25519 [32]byte, id *crypto.Ide
 	}
 
 	hs, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite: noiseSuite,
+		CipherSuite: NoiseSuite,
 		Pattern:     noise.HandshakeIK,
 		Initiator:   true,
 		StaticKeypair: noise.DHKey{
@@ -154,12 +160,12 @@ func Dial(ctx context.Context, addr string, relayX25519 [32]byte, id *crypto.Ide
 		_ = raw.Close()
 		return nil, fmt.Errorf("relay handshake msg1: %w", err)
 	}
-	if err := writeFrame(raw, msg1); err != nil {
+	if err := WriteFrame(raw, msg1); err != nil {
 		_ = raw.Close()
 		return nil, fmt.Errorf("relay handshake send: %w", err)
 	}
 
-	msg2, err := readFrame(raw)
+	msg2, err := ReadFrame(raw)
 	if err != nil {
 		_ = raw.Close()
 		return nil, fmt.Errorf("relay handshake recv: %w", err)
@@ -173,8 +179,8 @@ func Dial(ctx context.Context, addr string, relayX25519 [32]byte, id *crypto.Ide
 	return &Conn{raw: raw, send: cs1, recv: cs2}, nil
 }
 
-// writeFrame writes msg with a 2-byte big-endian length prefix.
-func writeFrame(w io.Writer, msg []byte) error {
+// WriteFrame writes msg with a 2-byte big-endian length prefix.
+func WriteFrame(w io.Writer, msg []byte) error {
 	if len(msg) > 0xFFFF {
 		return errors.New("relay: frame too large")
 	}
@@ -187,8 +193,8 @@ func writeFrame(w io.Writer, msg []byte) error {
 	return err
 }
 
-// readFrame reads one length-prefixed frame.
-func readFrame(r io.Reader) ([]byte, error) {
+// ReadFrame reads one length-prefixed frame.
+func ReadFrame(r io.Reader) ([]byte, error) {
 	var hdr [2]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err

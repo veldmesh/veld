@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Veld Authors.
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BUSL-1.1
 
 // veld-relay runs a DERP-style relay service on a volunteer mesh peer. It
 // accepts Noise IK-encrypted client connections and splices the two ends of
@@ -26,7 +26,7 @@ import (
 	"syscall"
 
 	"github.com/veldmesh/veld/internal/config"
-	"github.com/veldmesh/veld/internal/relay"
+	relaysrv "github.com/veldmesh/veld/relay"
 )
 
 func main() {
@@ -50,7 +50,7 @@ func main() {
 	fmt.Printf("relay X25519 public key (set as coord.relay_x25519 on peers): %s\n",
 		base64.StdEncoding.EncodeToString(id.X25519Public[:]))
 
-	svc := relay.NewService(id, ln)
+	svc := relaysrv.NewService(id, ln)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

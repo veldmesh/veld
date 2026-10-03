@@ -146,8 +146,8 @@ server and NAT traversal entirely.
 
 
 **Relay fallback (DERP-style).** When hole punching times out — e.g. both peers behind
-symmetric NATs — the NAT manager hands off to a relay path instead of giving up
-(`internal/relay/`). The relay is a volunteer mesh peer running the `veld-relay`
+symmetric NATs — the NAT manager hands off to a relay path instead of giving up (client in `internal/relay/`, server in the top-level `relay/` package).
+The relay is a volunteer mesh peer running the `veld-relay`
 command, reachable over TCP by both sides and configured via `coord.relay_addr` + the
 relay's pinned X25519 key (`coord.relay_x25519`). It is *not* the coord server —
 it is an out-of-band mesh peer, not an extension of the directory — and no relay
@@ -172,6 +172,8 @@ traffic ever transits the coord server:
    the relay — like the coord server — is cryptographically blind to traffic content;
    it observes only connection metadata, volume, and timing. Unpaired connections are
    evicted after a wait timeout, and the handshake itself is time-bounded.
+
+The relay server (`relay/`, `cmd/veld-relay`) is licensed under BSL-1.1 like the coord server; the relay client (`internal/relay/`), linked into every daemon, remains MIT.
 
 The P2P-first model is unchanged: the relay is used only after hole punching fails,
 and any mesh peer (or a small self-hosted VM) can volunteer as a relay.

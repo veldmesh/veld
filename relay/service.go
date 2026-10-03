@@ -1,6 +1,19 @@
 // Copyright (c) 2026 Veld Authors.
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BUSL-1.1
 
+// Package relay implements the Veld relay server: a DERP-style relay that
+// volunteer mesh peers (or a small self-hosted VM) run with the veld-relay
+// command for peers that cannot establish a direct UDP path via NAT hole
+// punching (e.g. symmetric NATs). The relay client and the wire protocol
+// live in internal/relay.
+//
+// The server accepts Noise IK-encrypted client connections over TCP,
+// pairs the two ends of a peer pair — each client sends the remote peer's
+// X25519 key in the handshake payload, and the relay derives the channel
+// from the authenticated initiator key plus that payload — and splices
+// matched connections. Traffic never transits the coord server, and the
+// relay itself is blind: channel payloads are the peers' data-plane
+// datagrams, already end-to-end encrypted by the session layer.
 package relay
 
 import (
@@ -15,6 +28,7 @@ import (
 	"github.com/flynn/noise"
 
 	"github.com/veldmesh/veld/internal/crypto"
+	relayc "github.com/veldmesh/veld/internal/relay"
 )
 
 // handshakeTimeout bounds the Noise IK handshake (reading message_1). Without
@@ -37,7 +51,7 @@ type Service struct {
 	ln net.Listener
 
 	mu      sync.Mutex
-	waiting map[[channelIDSize]byte]*serverConn
+	waiting map[[relayc.ChannelIDSize]byte]*serverConn
 	active  map[*serverConn]struct{} // paired connections with running splices
 	closed  bool
 	// waitTimeout bounds how long an unpaired connection waits for its
@@ -51,7 +65,7 @@ type Service struct {
 type serverConn struct {
 	raw        net.Conn
 	send, recv *noise.CipherState
-	channel    [channelIDSize]byte
+	channel    [relayc.ChannelIDSize]byte
 	clientKey  [32]byte // authenticated X25519 static key of this client
 	wmu        sync.Mutex
 }
@@ -62,7 +76,7 @@ func NewService(id *crypto.Identity, ln net.Listener) *Service {
 	return &Service{
 		id:          id,
 		ln:          ln,
-		waiting:     make(map[[channelIDSize]byte]*serverConn),
+		waiting:     make(map[[relayc.ChannelIDSize]byte]*serverConn),
 		active:      make(map[*serverConn]struct{}),
 		done:        make(chan struct{}),
 		waitTimeout: waitingTimeout,
@@ -116,7 +130,7 @@ func (s *Service) Close() error {
 	s.closed = true
 	close(s.done)
 	waiting := s.waiting
-	s.waiting = make(map[[channelIDSize]byte]*serverConn)
+	s.waiting = make(map[[relayc.ChannelIDSize]byte]*serverConn)
 	active := make([]*serverConn, 0, len(s.active))
 	for sc := range s.active {
 		active = append(active, sc)
@@ -142,7 +156,7 @@ func (s *Service) Close() error {
 // connection.
 func (s *Service) handleConn(raw net.Conn) {
 	hs, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite: noiseSuite,
+		CipherSuite: relayc.NoiseSuite,
 		Pattern:     noise.HandshakeIK,
 		Initiator:   false,
 		StaticKeypair: noise.DHKey{
@@ -157,7 +171,7 @@ func (s *Service) handleConn(raw net.Conn) {
 
 	// Bound the handshake so half-open connections cannot pile up.
 	_ = raw.SetDeadline(time.Now().Add(handshakeTimeout))
-	msg1, err := readFrame(raw)
+	msg1, err := relayc.ReadFrame(raw)
 	if err != nil {
 		_ = raw.Close()
 		return
@@ -186,7 +200,7 @@ func (s *Service) handleConn(raw net.Conn) {
 		_ = raw.Close()
 		return
 	}
-	if err := writeFrame(raw, msg2); err != nil {
+	if err := relayc.WriteFrame(raw, msg2); err != nil {
 		_ = raw.Close()
 		return
 	}
@@ -197,7 +211,7 @@ func (s *Service) handleConn(raw net.Conn) {
 		raw:       raw,
 		recv:      cs1,
 		send:      cs2,
-		channel:   ChannelID(clientKey, remoteKey),
+		channel:   relayc.ChannelID(clientKey, remoteKey),
 		clientKey: clientKey,
 	}
 
@@ -256,7 +270,7 @@ func (s *Service) forget(sc *serverConn) {
 
 // evict removes sc from the waiting map (if it is still the entry for
 // channel) and closes it.
-func (s *Service) evict(channel [channelIDSize]byte, sc *serverConn) {
+func (s *Service) evict(channel [relayc.ChannelIDSize]byte, sc *serverConn) {
 	s.mu.Lock()
 	if s.waiting[channel] != sc {
 		s.mu.Unlock()
@@ -279,7 +293,7 @@ func splice(dst, src *serverConn) {
 		_ = dst.raw.Close()
 	}
 	for {
-		frame, err := readFrame(src.raw)
+		frame, err := relayc.ReadFrame(src.raw)
 		if err != nil {
 			fail(err)
 			return
@@ -295,7 +309,7 @@ func splice(dst, src *serverConn) {
 			return
 		}
 		dst.wmu.Lock()
-		err = writeFrame(dst.raw, ct)
+		err = relayc.WriteFrame(dst.raw, ct)
 		dst.wmu.Unlock()
 		if err != nil {
 			fail(err)

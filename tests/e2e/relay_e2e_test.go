@@ -15,6 +15,7 @@ import (
 	"github.com/veldmesh/veld/internal/nat"
 	"github.com/veldmesh/veld/internal/peer"
 	"github.com/veldmesh/veld/internal/relay"
+	relaysrv "github.com/veldmesh/veld/relay"
 )
 
 // TestRelayFallback_TwoPeers is an end-to-end test of the relay fallback path:
@@ -37,7 +38,7 @@ func TestRelayFallback_TwoPeers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("relay listen: %v", err)
 	}
-	relaySvc := relay.NewService(relayID, relayLn)
+	relaySvc := relaysrv.NewService(relayID, relayLn)
 	go relaySvc.Serve(context.Background()) //nolint:errcheck
 	t.Cleanup(func() { relaySvc.Close() })
 	relayAddr := relaySvc.Addr()
