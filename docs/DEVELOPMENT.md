@@ -122,6 +122,8 @@ Every component has two layers of tests. Both are required — do not skip eithe
 
 CI and releases always build with the latest Go 1.26.x patch (`go-version: '1.26.x'`, `check-latest: true` in the workflows); bump the minor (1.27.x) deliberately, not as a side effect of a dependency bump.
 
+CI runs the race detector and `govulncheck` on every pull request: the `race` job runs `go test -race ./...` on Ubuntu (plain `go test ./...` runs on macOS and Windows, where the race detector needs a cgo toolchain), and the `govulncheck` job scans for known vulnerabilities the code actually reaches. To run the same checks locally: `go test -race ./...` for the race detector, and `go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...` for the vulnerability scan.
+
 ### Layer 1 — Unit tests (`internal/<pkg>/*_test.go`)
 
 Each package has its own `_test.go` files that test functions and methods in isolation.
