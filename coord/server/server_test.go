@@ -631,3 +631,72 @@ func TestServer_Register_Idempotent(t *testing.T) {
 		t.Errorf("PeerId changed on idempotent register: first %s, second %s", resp1.PeerId, resp2.PeerId)
 	}
 }
+
+// A client registers first and opens Watch afterwards. A peer that is already
+// watching sees the JOIN in between and signals immediately; that signal must
+// reach the newcomer once its Watch opens (it used to be dropped, so NAT
+// traversal succeeded on one side only — flaky TestNATTraversal_TwoPeersViaCoord).
+func TestServer_SignalSentBeforeRecipientWatches_IsDelivered(t *testing.T) {
+	srv, reg := testServer(t)
+	defer reg.Close()
+
+	register := func(name string) string {
+		resp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
+			NetworkId:     "test-net",
+			Token:         "test-token",
+			Name:          name,
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("ed25519-" + name)),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x25519-" + name)),
+		})
+		if err != nil {
+			t.Fatalf("Register %s: %v", name, err)
+		}
+		return resp.PeerId
+	}
+	idA := register("node-a")
+	idB := register("node-b")
+
+	// B signals A before A has opened its Watch stream.
+	if _, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token: "test-token", FromPeerId: idB, ToPeerId: idA, Payload: []byte("candidates-from-b"),
+	}); err != nil {
+		t.Fatalf("SendSignal: %v", err)
+	}
+
+	stream := newFakeWatchStream()
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.Watch(&coordv1.WatchRequest{NetworkId: "test-net", Token: "test-token", PeerId: idA}, stream)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	stream.cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Watch goroutine did not finish")
+	}
+
+	for _, ev := range stream.events {
+		if ev.Type == coordv1.EventType_SIGNAL && ev.Signal != nil &&
+			ev.Signal.FromPeerId == idB && string(ev.Signal.Payload) == "candidates-from-b" {
+			return
+		}
+	}
+	t.Fatalf("signal sent before Watch was not delivered; events: %v", stream.events)
+}
+
+func TestServer_SignalToUnknownPeer_IsNotHeld(t *testing.T) {
+	srv, reg := testServer(t)
+	defer reg.Close()
+
+	if _, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token: "test-token", FromPeerId: "x", ToPeerId: "no-such-peer", Payload: []byte("p"),
+	}); err != nil {
+		t.Fatalf("SendSignal: %v", err)
+	}
+	srv.bus.mu.RLock()
+	defer srv.bus.mu.RUnlock()
+	if len(srv.bus.pending) != 0 {
+		t.Fatalf("signal for an unregistered peer was held: %v", srv.bus.pending)
+	}
+}

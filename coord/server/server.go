@@ -350,7 +350,10 @@ func (s *Server) SendSignal(ctx context.Context, req *coordv1.SendSignalRequest)
 	if _, err := s.accounts.Resolve(ctx, req.Token); err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "invalid token")
 	}
-	s.bus.SendSignal(req.FromPeerId, req.ToPeerId, req.Payload)
+	// Hold the signal briefly if the recipient is registered but has not opened
+	// its Watch stream yet (it registers first, then watches).
+	_, err := s.registry.GetPeer(req.ToPeerId)
+	s.bus.SendSignal(req.FromPeerId, req.ToPeerId, req.Payload, err == nil)
 	return &coordv1.SendSignalResponse{}, nil
 }
 
@@ -379,6 +382,7 @@ func (s *Server) Leave(ctx context.Context, req *coordv1.LeaveRequest) (*coordv1
 		At:        time.Now(),
 	})
 
+	s.bus.DropPendingSignals(removed.ID)
 	s.bus.Publish(removed.NetworkID, &coordv1.PeerEvent{
 		Type: coordv1.EventType_LEAVE,
 		Peer: &coordv1.Peer{Id: removed.ID, Name: removed.Name},
