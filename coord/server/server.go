@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"net/netip"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -15,6 +16,11 @@ import (
 	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
 	coordcore "github.com/veldmesh/veld/coord/core"
 )
+
+// watchLastSeenRefresh is how often an active Watch stream refreshes the
+// peer's LastSeen in the registry, so a long-lived connected daemon is never
+// considered stale by the TTL sweep.
+const watchLastSeenRefresh = time.Minute
 
 // Server implements coordv1.CoordServer.
 type Server struct {
@@ -26,6 +32,11 @@ type Server struct {
 	audit    coordcore.AuditLogger
 	subnet   coordcore.SubnetPolicy
 	hooks    coordcore.LifecycleHooks
+
+	// connected tracks peers with an active Watch stream (peer ID → open
+	// stream count). The TTL sweep never removes a connected peer.
+	connectedMu sync.Mutex
+	connected   map[string]int
 }
 
 // New wires all components together. The registry must already be opened.
@@ -39,14 +50,91 @@ func New(
 	hooks coordcore.LifecycleHooks,
 ) *Server {
 	return &Server{
-		registry: registry,
-		bus:      bus,
-		enforcer: enforcer,
-		accounts: accounts,
-		audit:    audit,
-		subnet:   subnet,
-		hooks:    hooks,
+		registry:  registry,
+		bus:       bus,
+		enforcer:  enforcer,
+		accounts:  accounts,
+		audit:     audit,
+		subnet:    subnet,
+		hooks:     hooks,
+		connected: make(map[string]int),
 	}
+}
+
+// markConnected records an active Watch stream for peerID.
+func (s *Server) markConnected(peerID string) {
+	s.connectedMu.Lock()
+	defer s.connectedMu.Unlock()
+	s.connected[peerID]++
+}
+
+// markDisconnected records the end of a Watch stream for peerID.
+func (s *Server) markDisconnected(peerID string) {
+	s.connectedMu.Lock()
+	defer s.connectedMu.Unlock()
+	if n := s.connected[peerID]; n <= 1 {
+		delete(s.connected, peerID)
+	} else {
+		s.connected[peerID] = n - 1
+	}
+}
+
+// IsConnected reports whether peerID currently has an active Watch stream.
+func (s *Server) IsConnected(peerID string) bool {
+	s.connectedMu.Lock()
+	defer s.connectedMu.Unlock()
+	return s.connected[peerID] > 0
+}
+
+// keepLastSeenFresh touches the peer's LastSeen now and every
+// watchLastSeenRefresh until ctx is done, so a connected daemon is never
+// swept as stale even if it stays online longer than the peer TTL.
+func (s *Server) keepLastSeenFresh(ctx context.Context, peerID string) {
+	go func() {
+		_ = s.registry.TouchPeer(peerID)
+		ticker := time.NewTicker(watchLastSeenRefresh)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = s.registry.TouchPeer(peerID)
+			}
+		}
+	}()
+}
+
+// ExpelStalePeers removes peers whose registration lapsed beyond ttl and
+// applies the same side effects as a graceful Leave: lifecycle hooks, an
+// audit entry, and a LEAVE event to the network's watchers. Peers with an
+// active Watch stream are skipped. Implements Sweeper.
+func (s *Server) ExpelStalePeers(ctx context.Context, ttl time.Duration) (int, error) {
+	removed, err := s.registry.SweepStalePeers(ttl, s.IsConnected)
+	if err != nil {
+		return 0, err
+	}
+	for _, rec := range removed {
+		vpnAddr, _ := netip.ParseAddr(rec.VPNAddr)
+		net, accountID, _ := s.registry.GetNetwork(rec.NetworkID)
+		peer := coordcore.Peer{ID: rec.ID, Name: rec.Name, VPNAddr: vpnAddr, NetworkID: rec.NetworkID}
+		s.hooks.OnPeerLeft(ctx, peer, net)
+
+		_ = s.audit.Log(ctx, coordcore.AuditEvent{
+			Kind:      coordcore.AuditPeerLeft,
+			AccountID: accountID,
+			NetworkID: rec.NetworkID,
+			PeerID:    rec.ID,
+			Detail:    "registration expired (TTL sweep)",
+			At:        time.Now(),
+		})
+
+		s.bus.Publish(rec.NetworkID, &coordv1.PeerEvent{
+			Type: coordv1.EventType_LEAVE,
+			Peer: &coordv1.Peer{Id: rec.ID, Name: rec.Name},
+		})
+	}
+	return len(removed), nil
 }
 
 // Register assigns a VPN IP and records the peer.
@@ -177,6 +265,14 @@ func (s *Server) Watch(req *coordv1.WatchRequest, stream coordv1.Coord_WatchServ
 	ctx := stream.Context()
 	if _, err := s.accounts.Resolve(ctx, req.Token); err != nil {
 		return status.Errorf(codes.Unauthenticated, "invalid token")
+	}
+
+	// A peer with an active Watch stream is online: track it so the TTL
+	// sweep skips it, and keep its LastSeen fresh for the whole connection.
+	if req.PeerId != "" {
+		s.markConnected(req.PeerId)
+		defer s.markDisconnected(req.PeerId)
+		s.keepLastSeenFresh(ctx, req.PeerId)
 	}
 
 	// Subscribe before snapshotting so we cannot miss a JOIN that arrives
