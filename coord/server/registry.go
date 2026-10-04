@@ -66,6 +66,10 @@ const lastSeenGranularity = int64(time.Hour / time.Second)
 // roundToHour rounds a unix timestamp in seconds down to the hour. Zero
 // (never seen) is preserved: the sweep treats it as "no heartbeat" and
 // falls back to RegisteredAt.
+// Callers should pass the raw, unrounded timestamp (e.g. time.Now().Unix());
+// the function is idempotent, so an already hour-rounded value — as can
+// happen on re-registration — passes through unchanged at the cost of one
+// redundant modulo.
 func roundToHour(secs int64) int64 {
 	if secs <= 0 {
 		return secs
@@ -130,7 +134,13 @@ func blankPersistedEndpoints(tx *bolt.Tx) error {
 	return nil
 }
 
-// setEndpoint records a peer's advertised endpoint in memory only.
+// setEndpoint records a peer's advertised endpoint in memory only. It has
+// no failure path — the map is created in NewRegistry and every access
+// holds endpointsMu, so the plain assignment cannot panic — which is why
+// callers commit their bbolt write first and call this only on success:
+// a failed write never touches the map, and a committed write cannot be
+// followed by a failure here, so the persisted records and the in-memory
+// map cannot diverge.
 func (r *Registry) setEndpoint(peerID, endpoint string) {
 	r.endpointsMu.Lock()
 	defer r.endpointsMu.Unlock()
@@ -234,6 +244,8 @@ var ErrMachineLimit = fmt.Errorf("machine limit reached")
 // mutable fields (name, last_seen) and returns the existing IP without
 // incrementing the machine count. This allows daemons to reconnect cleanly.
 // The peer's endpoint is kept in memory only — it is never persisted.
+// Pass p.LastSeen as the raw, unrounded unix timestamp; it is rounded down
+// to the hour before being persisted.
 func (r *Registry) RegisterPeer(p peerRecord, networkID string, maxMachines int) (netip.Addr, error) {
 	endpoint := p.Endpoint
 	p.Endpoint = "" // endpoints are in-memory only; never persist

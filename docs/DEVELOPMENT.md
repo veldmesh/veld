@@ -148,6 +148,9 @@ keeps them in a mutex-guarded in-memory map keyed by peer ID:
 - Never written to bbolt: persisted peer records hold only the peer ID, network ID, name,
   VPN address, public keys, subnet routes, and a last-seen timestamp rounded down to the
   hour — coarse enough for the TTL sweep without retaining precise activity times.
+  A zero last-seen is preserved as-is: it is the "never sent a heartbeat"
+  sentinel, which the sweep ages by the peer's `RegisteredAt` timestamp
+  instead.
 
 After a coord restart the map starts empty; endpoints are re-learned as daemons re-register.
 Daemons already re-register whenever they (re)connect to the coord server, so no extra
