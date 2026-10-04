@@ -120,6 +120,8 @@ The `Coord` service is the daemon-facing gRPC API defined in `proto/veld/coord/v
 
 Every component has two layers of tests. Both are required — do not skip either.
 
+CI and releases always build with the latest Go 1.26.x patch (`go-version: '1.26.x'`, `check-latest: true` in the workflows); bump the minor (1.27.x) deliberately, not as a side effect of a dependency bump.
+
 ### Layer 1 — Unit tests (`internal/<pkg>/*_test.go`)
 
 Each package has its own `_test.go` files that test functions and methods in isolation.
