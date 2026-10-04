@@ -2,7 +2,7 @@
 
 A decentralized peer-to-peer mesh VPN. Connect your devices privately, anywhere, without trusting a middleman.
 
-Unlike Tailscale, the coordination server never sees, routes, or authenticates your traffic. After an initial handshake, all communication goes directly between your machines — encrypted end-to-end. The coordination server is a thin public-key directory you can self-host or use as a managed service.
+Traffic flows directly between your devices. When direct connection isn't possible, it routes through a relay peer that cannot read it — the coordination server never carries traffic. The coordination server is a thin public-key directory you can self-host or use as a managed service.
 
 ---
 
@@ -10,8 +10,8 @@ Unlike Tailscale, the coordination server never sees, routes, or authenticates y
 
 | | Tailscale | Veld |
 |---|---|---|
-| Traffic routing | Via relay if direct fails | Always P2P; relay is a volunteer mesh peer |
-| Coord server sees traffic | Yes (DERP relay) | Never |
+| Traffic routing | Via relay if direct fails | Direct P2P for ~85% of NATs. Relay via a mesh peer for the rest — relay path is a known gap (not yet implemented). |
+| Coord server sees traffic | Yes (DERP relay) | Coord server never sees, routes, or authenticates traffic. It holds only public keys and endpoints. |
 | Open source | Client only | Daemon + CE coord server (BSL) |
 | Pricing model | Per user | Per network |
 | Runs without a server | No | Yes (static config or LAN mDNS) |
@@ -23,7 +23,7 @@ Unlike Tailscale, the coordination server never sees, routes, or authenticates y
 
 - **Custom Noise IK handshake** — Ed25519 identity keys, X25519 session keys, ChaCha20-Poly1305 encryption, forward secrecy
 - **No kernel modules** — userspace TUN via `wireguard/tun`; no WireGuard daemon
-- **NAT traversal** — UDP hole-punching via ICE; when hole-punching fails (symmetric NATs), falls back to a DERP-style relay over a Noise IK-encrypted channel through a volunteer mesh peer — never the coord server
+- **NAT traversal** — UDP hole-punching via ICE for ~85% of NATs. Where direct connection fails (symmetric NAT behind symmetric NAT), traffic *will* relay through a chosen mesh peer over a Noise IK-encrypted channel — never the coordination server. The relaying peer sees only encrypted packet sizes/timing, not content. **Relay implementation is in progress.**
 - **Three operating modes** — static config (no server), LAN mDNS discovery, full coord server
 - **Name-based routing** — `ping server1.veld` via local DNS stub
 - **Subnet routing** — expose a whole LAN through one Veld node (IoT gateway)
