@@ -220,3 +220,57 @@ func TestDifferentPeerNotSkipped(t *testing.T) {
 		t.Error("onPeer must be called for a peer that is not ourselves")
 	}
 }
+
+// TestCollectThenParse_DeduplicatesByPointer exercises the collect-then-parse
+// browse path. hashicorp/mdns can push the same *ServiceEntry pointer onto the
+// entries channel more than once (it re-sends an entry whenever further
+// responses for the same instance name arrive mid-query), so onPeer must fire
+// exactly once per distinct peer.
+func TestCollectThenParse_DeduplicatesByPointer(t *testing.T) {
+	selfID, err := crypto.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerA, err := crypto.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerB, err := crypto.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var self [32]byte
+	copy(self[:], selfID.Ed25519Public)
+
+	calls := make(map[[32]byte]int)
+	d := &Discovery{
+		selfID: self,
+		onPeer: func(e *peer.Entry, _ netip.AddrPort) {
+			calls[e.ID]++
+		},
+	}
+
+	entryA := makeServiceEntry(peerA, "peer-a", "10.0.0.1", net.ParseIP("192.168.1.10"), 51820)
+	entryB := makeServiceEntry(peerB, "peer-b", "10.0.0.2", net.ParseIP("192.168.1.11"), 51820)
+
+	// Feed the collector the way hashicorp/mdns does while a query is
+	// running: a buffered channel that may carry the same pointer twice.
+	entries := make(chan *hashmDNS.ServiceEntry, 32)
+	collected := collectEntries(entries)
+	entries <- entryA
+	entries <- entryA // duplicate pointer
+	entries <- entryB
+	close(entries)
+
+	d.handleCollected(<-collected)
+
+	if len(calls) != 2 {
+		t.Fatalf("onPeer called for %d distinct peers, want 2", len(calls))
+	}
+	for id, n := range calls {
+		if n != 1 {
+			t.Errorf("onPeer called %d times for peer %x, want exactly once", n, id)
+		}
+	}
+}
