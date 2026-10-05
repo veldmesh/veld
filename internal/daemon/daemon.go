@@ -206,7 +206,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 			localPort = uint16(laddr.Port)
 		}
 
-		d.natMgr = nat.New(conn, localPort, cfg.Coord.STUNServer, localID)
+		d.natMgr = nat.New(conn, localPort, cfg.Coord.STUNServer, localID, peerTbl)
 		d.disp.OnNATProbePacket = d.natMgr.HandleProbe
 
 		// When NAT discovers a path, update the peer table and kick handshake.
