@@ -7,7 +7,9 @@
 //  1. When a peer is discovered via coord (OnPeerAdded), call Manager.Start.
 //  2. The manager gathers local candidates (host IPs + optional STUN).
 //  3. Candidates are JSON-marshalled, encrypted for the peer's X25519 key,
-//     and sent via coord SendSignal — the coord server cannot read them.
+//     signed with our Ed25519 identity key, and sent via coord SendSignal —
+//     the coord server cannot read them, and the recipient authenticates
+//     the sender end to end against the coord-registered key.
 //  4. The peer does the same concurrently.
 //  5. Upon receiving the peer's signal, each side sends UDP TypeNATProbe
 //     packets (via the shared data-plane conn) to every remote candidate.
@@ -21,6 +23,7 @@ package nat
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -48,6 +51,7 @@ type Manager struct {
 	localPort  uint16
 	stunServer string // empty → skip STUN, host candidates only
 	identity   *crypto.Identity
+	peerTbl    *peer.Table // coord-synced peer table; authenticates signal senders
 
 	// OnEndpointDiscovered is called when a reachable endpoint is confirmed
 	// for a peer. The caller should update the peer table and initiate a
@@ -62,8 +66,9 @@ type Manager struct {
 
 	mu       sync.Mutex
 	sessions map[[32]byte]*natSession
-	// pending holds encrypted signal payloads that arrived before the session
-	// for that peer was created. Keyed by sender peer ID.
+	// pending holds sealed signal envelopes that arrived before the session
+	// for that peer was created. Keyed by sender peer ID; each is
+	// authenticated against the peer table when Start is called.
 	pending map[[32]byte][]byte
 }
 
@@ -88,19 +93,23 @@ type natSignalMsg struct {
 // New creates a Manager. conn is the shared data-plane UDP connection.
 // localPort must match the port that conn is listening on.
 // stunServer is a "host:port" STUN server address; empty string disables STUN.
-func New(conn net.PacketConn, localPort uint16, stunServer string, identity *crypto.Identity) *Manager {
+// peerTbl is the coord-synced peer table; a signal is only accepted if its
+// sender is registered there and the signal carries that peer's valid
+// Ed25519 signature.
+func New(conn net.PacketConn, localPort uint16, stunServer string, identity *crypto.Identity, peerTbl *peer.Table) *Manager {
 	return &Manager{
 		conn:       conn,
 		localPort:  localPort,
 		stunServer: stunServer,
 		identity:   identity,
+		peerTbl:    peerTbl,
 		sessions:   make(map[[32]byte]*natSession),
 		pending:    make(map[[32]byte][]byte),
 	}
 }
 
 // Start begins NAT negotiation for entry.
-// sendFn must call coord SendSignal with the provided encrypted payload,
+// sendFn must call coord SendSignal with the provided sealed payload,
 // addressed to entry's peer ID.
 // Returns immediately; negotiation runs in the background.
 // Calling Start for a peer that already has an active session is a no-op.
@@ -128,14 +137,14 @@ func (m *Manager) Start(ctx context.Context, e *peer.Entry, sendFn func([]byte) 
 
 	// Drain any signal that arrived before this session was created.
 	var buffered []byte
-	if enc, ok := m.pending[e.ID]; ok {
-		buffered = enc
+	if env, ok := m.pending[e.ID]; ok {
+		buffered = env
 		delete(m.pending, e.ID)
 	}
 	m.mu.Unlock()
 
 	if buffered != nil {
-		if plain, err := decryptSignal(buffered, m.identity.X25519Private); err == nil {
+		if plain, ok := m.authenticateSignal(e.ID, buffered); ok {
 			select {
 			case sess.signalIn <- plain:
 			default:
@@ -147,10 +156,13 @@ func (m *Manager) Start(ctx context.Context, e *peer.Entry, sendFn func([]byte) 
 }
 
 // DeliverSignal is called by the coord client's OnSignal callback.
-// It decrypts the payload and routes it to the matching peer session.
-// If no session exists yet for this peer, the encrypted payload is pre-buffered
-// and delivered when Start is called for that peer.
-func (m *Manager) DeliverSignal(fromPeerID string, encPayload []byte) {
+// It authenticates the sender end to end — the envelope must carry a valid
+// Ed25519 signature by the sender's coord-registered identity key within
+// the replay window — and routes the decrypted payload to the matching peer
+// session. If no session exists yet for the sender, the sealed envelope is
+// held and authenticated when Start is called for that peer. Unauthenticated
+// signals are dropped silently.
+func (m *Manager) DeliverSignal(fromPeerID string, envelope []byte) {
 	id, ok := hexToNatID(fromPeerID)
 	if !ok {
 		return
@@ -159,21 +171,50 @@ func (m *Manager) DeliverSignal(fromPeerID string, encPayload []byte) {
 	m.mu.Lock()
 	sess, hasSess := m.sessions[id]
 	if !hasSess {
-		// Pre-buffer: session will pick this up when Start is called.
-		m.pending[id] = encPayload
+		// No session yet: hold the sealed envelope. Start will authenticate
+		// it against the peer table entry it was given.
+		m.pending[id] = envelope
 		m.mu.Unlock()
 		return
 	}
 	m.mu.Unlock()
 
-	plain, err := decryptSignal(encPayload, m.identity.X25519Private)
+	if plain, ok := m.authenticateSignal(id, envelope); ok {
+		select {
+		case sess.signalIn <- plain:
+		default:
+		}
+	}
+}
+
+// authenticateSignal verifies a sealed signal envelope from senderID and
+// returns the decrypted payload. The sender must be present in the peer
+// table (i.e. registered with coord for this network), the claimed sender
+// must match the peer's registered Ed25519 key, and the signature and
+// timestamp must be valid. Returns ok=false otherwise; invalid signals are
+// dropped silently — no error responses, no per-connection details.
+func (m *Manager) authenticateSignal(senderID [32]byte, envelope []byte) ([]byte, bool) {
+	entry, known := m.peerTbl.LookupByID(senderID)
+	if !known {
+		return nil, false
+	}
+	enc, err := openSignal(envelope, senderID, m.localPeerID(), ed25519.PublicKey(entry.ID[:]), time.Now().Unix())
 	if err != nil {
-		return
+		return nil, false
 	}
-	select {
-	case sess.signalIn <- plain:
-	default:
+	plain, err := decryptSignal(enc, m.identity.X25519Private)
+	if err != nil {
+		return nil, false
 	}
+	return plain, true
+}
+
+// localPeerID is our peer ID as registered with coord: the raw Ed25519
+// public key.
+func (m *Manager) localPeerID() [32]byte {
+	var id [32]byte
+	copy(id[:], m.identity.Ed25519Public)
+	return id
 }
 
 // HandleProbe is called by the dispatcher's OnNATProbePacket callback.
@@ -241,7 +282,10 @@ func (m *Manager) negotiate(ctx context.Context, sess *natSession) {
 	if err != nil {
 		return
 	}
-	if err := sess.sendFn(enc); err != nil {
+	// Sign the encrypted signal so the recipient can verify it really
+	// comes from us before probing anything we advertised.
+	sealed := sealSignal(enc, m.localPeerID(), sess.peerID, m.identity.Ed25519Private, time.Now().Unix())
+	if err := sess.sendFn(sealed); err != nil {
 		return
 	}
 

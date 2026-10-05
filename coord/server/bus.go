@@ -8,6 +8,11 @@ import (
 	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
 )
 
+// heldSignalsMax caps how many signals are held per recipient while the
+// recipient has no open Watch stream. When the cap is exceeded the oldest
+// held signal is dropped, so a fresh signal never evicts a newer one.
+const heldSignalsMax = 64
+
 // signalMsg is an opaque signal (ICE candidate etc.) from one peer to another.
 type signalMsg struct {
 	FromPeerID string
@@ -17,11 +22,14 @@ type signalMsg struct {
 
 // Bus is an in-memory fanout bus for PeerEvents and peer-to-peer signals.
 // Each Watch subscriber gets its own channel; signals are delivered directly
-// to the target peer's subscriber(s).
+// to the target peer's subscriber(s), or held until the recipient opens a
+// Watch stream (signals that arrive while the recipient is offline would
+// otherwise be lost).
 type Bus struct {
 	mu          sync.RWMutex
 	subscribers map[string][]chan *coordv1.PeerEvent // key: networkID
 	signals     map[string][]chan signalMsg           // key: peerID (recipient)
+	heldSignals map[string][]signalMsg               // key: peerID (recipient, offline)
 }
 
 // NewBus creates an empty Bus.
@@ -29,6 +37,7 @@ func NewBus() *Bus {
 	return &Bus{
 		subscribers: make(map[string][]chan *coordv1.PeerEvent),
 		signals:     make(map[string][]chan signalMsg),
+		heldSignals: make(map[string][]signalMsg),
 	}
 }
 
@@ -71,11 +80,25 @@ func (b *Bus) Publish(networkID string, ev *coordv1.PeerEvent) {
 }
 
 // SubscribeSignals returns a channel that receives signals addressed to peerID.
+// Any signals held while the peer was offline are delivered on the new
+// channel before anything else.
 func (b *Bus) SubscribeSignals(peerID string) <-chan signalMsg {
-	ch := make(chan signalMsg, 64)
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	ch := make(chan signalMsg, 64)
 	b.signals[peerID] = append(b.signals[peerID], ch)
-	b.mu.Unlock()
+
+	// Flush signals held while the peer had no open Watch stream.
+	outer:
+	for _, msg := range b.heldSignals[peerID] {
+		select {
+		case ch <- msg:
+		default:
+			// Buffer full: the rest would block the Watch stream; drop them.
+			break outer
+		}
+	}
+	delete(b.heldSignals, peerID)
 	return ch
 }
 
@@ -94,16 +117,33 @@ func (b *Bus) UnsubscribeSignals(peerID string, ch <-chan signalMsg) {
 }
 
 // SendSignal delivers a signal to all subscribers for toPeerID.
-// Non-blocking: drops if channel full.
+// If the recipient currently has no open Watch stream, the signal is held
+// (up to heldSignalsMax, oldest dropped) and delivered when the recipient
+// next subscribes. Non-blocking: drops if a subscriber channel is full.
 func (b *Bus) SendSignal(from, to string, payload []byte) {
 	msg := signalMsg{FromPeerID: from, ToPeerID: to, Payload: payload}
-	b.mu.RLock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	sigs := b.signals[to]
-	b.mu.RUnlock()
+	if len(sigs) == 0 {
+		held := append(b.heldSignals[to], msg)
+		if len(held) > heldSignalsMax {
+			held = held[1:]
+		}
+		b.heldSignals[to] = held
+		return
+	}
 	for _, ch := range sigs {
 		select {
 		case ch <- msg:
 		default:
 		}
 	}
+}
+
+// DiscardHeldSignals drops any signals held for peerID (e.g. after Leave).
+func (b *Bus) DiscardHeldSignals(peerID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.heldSignals, peerID)
 }

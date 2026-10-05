@@ -141,3 +141,71 @@ func TestBus_SignalUnsubscribe(t *testing.T) {
 		t.Fatal("timeout waiting for channel close")
 	}
 }
+
+func TestBus_SignalHeldUntilSubscriber(t *testing.T) {
+	bus := NewBus()
+
+	// No subscriber yet: the signal must be held, not dropped.
+	bus.SendSignal("peer2", "peer1", []byte("held"))
+
+	ch := bus.SubscribeSignals("peer1")
+	defer bus.UnsubscribeSignals("peer1", ch)
+
+	select {
+	case msg := <-ch:
+		if msg.FromPeerID != "peer2" || msg.ToPeerID != "peer1" {
+			t.Errorf("signal routing wrong: from=%s, to=%s", msg.FromPeerID, msg.ToPeerID)
+		}
+		if string(msg.Payload) != "held" {
+			t.Errorf("signal payload mismatch: got %s, want held", msg.Payload)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("held signal not delivered to new subscriber")
+	}
+}
+
+func TestBus_HeldSignalsCapDropsOldest(t *testing.T) {
+	bus := NewBus()
+
+	for i := 0; i < heldSignalsMax+8; i++ {
+		bus.SendSignal("peer2", "peer1", []byte{byte(i)})
+	}
+
+	ch := bus.SubscribeSignals("peer1")
+	defer bus.UnsubscribeSignals("peer1", ch)
+
+	// The oldest 8 must have been dropped; the rest arrive in order.
+	for i := 0; i < heldSignalsMax; i++ {
+		select {
+		case msg := <-ch:
+			if want := byte(i + 8); msg.Payload[0] != want {
+				t.Fatalf("held signal %d: got payload %d, want %d", i, msg.Payload[0], want)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("timeout waiting for held signal %d", i)
+		}
+	}
+
+	// Nothing beyond the cap.
+	select {
+	case msg := <-ch:
+		t.Fatalf("unexpected extra signal: %+v", msg)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestBus_DiscardHeldSignals(t *testing.T) {
+	bus := NewBus()
+
+	bus.SendSignal("peer2", "peer1", []byte("stale"))
+	bus.DiscardHeldSignals("peer1")
+
+	ch := bus.SubscribeSignals("peer1")
+	defer bus.UnsubscribeSignals("peer1", ch)
+
+	select {
+	case msg := <-ch:
+		t.Fatalf("expected no signal after discard, got %+v", msg)
+	case <-time.After(100 * time.Millisecond):
+	}
+}

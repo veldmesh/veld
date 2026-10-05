@@ -25,12 +25,23 @@ import (
 type fakeWatchStream struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	mu     sync.Mutex
 	events []*coordv1.PeerEvent
 }
 
 func (f *fakeWatchStream) Send(ev *coordv1.PeerEvent) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.events = append(f.events, ev)
 	return nil
+}
+
+// snapshot returns a copy of the events received so far. Safe to call while
+// the Watch goroutine is still running.
+func (f *fakeWatchStream) snapshot() []*coordv1.PeerEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*coordv1.PeerEvent(nil), f.events...)
 }
 
 func (f *fakeWatchStream) Context() context.Context {
@@ -39,9 +50,9 @@ func (f *fakeWatchStream) Context() context.Context {
 
 func (f *fakeWatchStream) SetHeader(metadata.MD) error      { return nil }
 func (f *fakeWatchStream) SendHeader(metadata.MD) error     { return nil }
-func (f *fakeWatchStream) SetTrailer(metadata.MD)           {}
-func (f *fakeWatchStream) SendMsg(m interface{}) error      { return nil }
-func (f *fakeWatchStream) RecvMsg(m interface{}) error      { return nil }
+func (f *fakeWatchStream) SetTrailer(metadata.MD)            {}
+func (f *fakeWatchStream) SendMsg(m interface{}) error       { return nil }
+func (f *fakeWatchStream) RecvMsg(m interface{}) error       { return nil }
 
 func newFakeWatchStream() *fakeWatchStream {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -66,13 +77,44 @@ func testServer(t *testing.T) (*Server, *Registry) {
 	bus := NewBus()
 	enforcer := ce.NewFreeEnforcer()
 	accounts := ce.NewTokenAccountStore(map[string]coordcore.Account{
-		"test-token": {ID: "acc1", Tier: coordcore.TierFree},
+		"test-token":  {ID: "acc1", Tier: coordcore.TierFree},
+		"other-token": {ID: "acc2", Tier: coordcore.TierFree},
 	})
 	audit := ce.NewNoopAuditLogger()
 	subnet := ce.NewRejectSubnetPolicy()
 	hooks := ce.NewNoopHooks()
 
 	return New(reg, bus, enforcer, accounts, audit, subnet, hooks), reg
+}
+
+// registerTestPeer registers a peer named name with key material derived
+// from keySeed in networkID and returns its assigned peer ID.
+func registerTestPeer(t *testing.T, srv *Server, networkID, name, keySeed string) string {
+	t.Helper()
+	ed25519Pub := base64.StdEncoding.EncodeToString([]byte(keySeed))
+	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519-" + keySeed))
+	resp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
+		NetworkId:     networkID,
+		Token:         "test-token",
+		Name:          name,
+		Ed25519Public: ed25519Pub,
+		X25519Public:  x25519Pub,
+	})
+	if err != nil {
+		t.Fatalf("Register %s: %v", name, err)
+	}
+	return resp.PeerId
+}
+
+// expectGRPCCode asserts err carries the expected gRPC status code.
+func expectGRPCCode(t *testing.T, err error, want codes.Code) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected %s error, got nil", want)
+	}
+	if got := status.Code(err); got != want {
+		t.Fatalf("expected %s error, got %s (%v)", want, got, err)
+	}
 }
 
 func TestServer_Register_OK(t *testing.T) {
@@ -320,73 +362,55 @@ func TestServer_SendSignal_OK(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	// Signals are scoped to registered peers, so register two first.
-	var ids [2]string
-	for i := 0; i < 2; i++ {
-		ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey" + string(rune('0'+i))))
-		x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey" + string(rune('0'+i))))
+	p1 := registerTestPeer(t, srv, "test-net", "peer1", "ed-peer-1")
+	p2 := registerTestPeer(t, srv, "test-net", "peer2", "ed-peer-2")
 
-		resp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
-			NetworkId:     "test-net",
-			Token:         "test-token",
-			Name:          "peer" + string(rune('1'+i)),
-			Ed25519Public: ed25519Pub,
-			X25519Public:  x25519Pub,
-		})
-		if err != nil {
-			t.Fatalf("Register peer %d: %v", i, err)
-		}
-		ids[i] = resp.PeerId
-	}
-
-	// Watch as the target peer so the delivered signal is observable.
+	// The recipient holds a Watch stream open; the signal must arrive on it.
 	stream := newFakeWatchStream()
 	done := make(chan error, 1)
 	go func() {
 		done <- srv.Watch(&coordv1.WatchRequest{
 			NetworkId: "test-net",
 			Token:     "test-token",
-			PeerId:    ids[1],
+			PeerId:    p2,
 		}, stream)
+	}()
+	defer func() {
+		stream.cancel()
+		<-done
 	}()
 	time.Sleep(50 * time.Millisecond)
 
-	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+	req := &coordv1.SendSignalRequest{
 		Token:      "test-token",
-		FromPeerId: ids[0],
-		ToPeerId:   ids[1],
+		FromPeerId: p1,
+		ToPeerId:   p2,
 		Payload:    []byte("test signal"),
-	})
-	if err != nil {
-		stream.cancel()
+	}
+
+	if _, err := srv.SendSignal(context.Background(), req); err != nil {
 		t.Fatalf("SendSignal: %v", err)
 	}
 
-	// Let the signal flow through the bus before closing the stream.
-	time.Sleep(100 * time.Millisecond)
-	stream.cancel()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Watch error: %v", err)
+	// Wait for the signal to reach the recipient's stream.
+	deadline := time.After(1 * time.Second)
+	for {
+		for _, ev := range stream.snapshot() {
+			if ev.Type == coordv1.EventType_SIGNAL && ev.Signal != nil {
+				if ev.Signal.FromPeerId != p1 {
+					t.Errorf("signal from peer: got %s, want %s", ev.Signal.FromPeerId, p1)
+				}
+				if string(ev.Signal.Payload) != "test signal" {
+					t.Errorf("signal payload: got %q, want %q", ev.Signal.Payload, "test signal")
+				}
+				return
+			}
 		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("Watch goroutine did not finish")
-	}
-
-	var got *coordv1.SignalEvent
-	for _, ev := range stream.events {
-		if ev.Type == coordv1.EventType_SIGNAL && ev.Signal != nil {
-			got = ev.Signal
-			break
+		select {
+		case <-deadline:
+			t.Fatalf("timeout: no SIGNAL event for recipient; events: %v", stream.events)
+		case <-time.After(10 * time.Millisecond):
 		}
-	}
-	if got == nil {
-		t.Fatalf("signal not delivered to target peer; events: %+v", stream.events)
-	}
-	if got.FromPeerId != ids[0] || string(got.Payload) != "test signal" {
-		t.Errorf("delivered signal: got %+v, want from %s payload %q", got, ids[0], "test signal")
 	}
 }
 
@@ -404,6 +428,130 @@ func TestServer_SendSignal_InvalidToken(t *testing.T) {
 	_, err := srv.SendSignal(context.Background(), req)
 	if err == nil {
 		t.Fatal("SendSignal should fail with invalid token")
+	}
+}
+
+func TestServer_SendSignal_UnknownSender(t *testing.T) {
+	srv, reg := testServer(t)
+	defer reg.Close()
+
+	p2 := registerTestPeer(t, srv, "test-net", "peer2", "ed-peer-2")
+
+	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token:      "test-token",
+		FromPeerId: "not-a-registered-peer",
+		ToPeerId:   p2,
+		Payload:    []byte("test signal"),
+	})
+	expectGRPCCode(t, err, codes.NotFound)
+}
+
+func TestServer_SendSignal_UnknownRecipient(t *testing.T) {
+	srv, reg := testServer(t)
+	defer reg.Close()
+
+	p1 := registerTestPeer(t, srv, "test-net", "peer1", "ed-peer-1")
+
+	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token:      "test-token",
+		FromPeerId: p1,
+		ToPeerId:   "not-a-registered-peer",
+		Payload:    []byte("test signal"),
+	})
+	expectGRPCCode(t, err, codes.NotFound)
+}
+
+func TestServer_SendSignal_CrossNetwork(t *testing.T) {
+	srv, reg := testServer(t)
+	defer reg.Close()
+
+	// A second network, owned by the same account.
+	cidr2 := netip.MustParsePrefix("10.98.0.0/24")
+	if err := reg.CreateNetwork(coordcore.Network{ID: "test-net-2", CIDR: cidr2, Name: "Network 2"}, "acc1"); err != nil {
+		t.Fatalf("CreateNetwork: %v", err)
+	}
+
+	p1 := registerTestPeer(t, srv, "test-net", "peer1", "ed-peer-1")
+	p2 := registerTestPeer(t, srv, "test-net-2", "peer2", "ed-peer-2")
+
+	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token:      "test-token",
+		FromPeerId: p1,
+		ToPeerId:   p2,
+		Payload:    []byte("test signal"),
+	})
+	expectGRPCCode(t, err, codes.NotFound)
+}
+
+func TestServer_SendSignal_OtherAccountToken(t *testing.T) {
+	srv, reg := testServer(t)
+	defer reg.Close()
+
+	// Both peers are registered in test-net, which belongs to acc1.
+	p1 := registerTestPeer(t, srv, "test-net", "peer1", "ed-peer-1")
+	p2 := registerTestPeer(t, srv, "test-net", "peer2", "ed-peer-2")
+
+	// other-token resolves to acc2, which does not own test-net.
+	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token:      "other-token",
+		FromPeerId: p1,
+		ToPeerId:   p2,
+		Payload:    []byte("test signal"),
+	})
+	expectGRPCCode(t, err, codes.NotFound)
+}
+
+func TestServer_SendSignal_HeldUntilRecipientWatches(t *testing.T) {
+	srv, reg := testServer(t)
+	defer reg.Close()
+
+	p1 := registerTestPeer(t, srv, "test-net", "peer1", "ed-peer-1")
+	p2 := registerTestPeer(t, srv, "test-net", "peer2", "ed-peer-2")
+
+	// Send while the recipient has no Watch stream open — the server must
+	// hold the signal instead of dropping it.
+	if _, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token:      "test-token",
+		FromPeerId: p1,
+		ToPeerId:   p2,
+		Payload:    []byte("held signal"),
+	}); err != nil {
+		t.Fatalf("SendSignal: %v", err)
+	}
+
+	// Now the recipient opens Watch; the held signal must be delivered.
+	stream := newFakeWatchStream()
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.Watch(&coordv1.WatchRequest{
+			NetworkId: "test-net",
+			Token:     "test-token",
+			PeerId:    p2,
+		}, stream)
+	}()
+	defer func() {
+		stream.cancel()
+		<-done
+	}()
+
+	deadline := time.After(1 * time.Second)
+	for {
+		for _, ev := range stream.snapshot() {
+			if ev.Type == coordv1.EventType_SIGNAL && ev.Signal != nil {
+				if ev.Signal.FromPeerId != p1 {
+					t.Errorf("signal from peer: got %s, want %s", ev.Signal.FromPeerId, p1)
+				}
+				if string(ev.Signal.Payload) != "held signal" {
+					t.Errorf("signal payload: got %q, want %q", ev.Signal.Payload, "held signal")
+				}
+				return
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timeout: held signal not delivered after Watch opened; events: %v", stream.events)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 

@@ -3,14 +3,54 @@
 package nat
 
 import (
+	"bytes"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"io"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
+)
+
+// NAT signal wire format, version 1:
+//
+//	[1]byte   version (signalVersion)
+//	[8]byte   unix timestamp, big-endian seconds
+//	[64]byte  Ed25519 signature by the sender's identity key
+//	[N]byte   encrypted blob: [32 ephemeral X25519 pubkey][12 nonce][ciphertext+16 tag]
+//
+// The signature covers the domain-separated message:
+//
+//	"veld-nat-signal-v1" || fromPeerID (32) || toPeerID (32) || timestamp (8) || encrypted blob
+//
+// where the peer IDs are the raw Ed25519 public keys exactly as registered
+// with coord. The recipient verifies the signature against the sender's
+// Ed25519 public key from its peer table, so a signal is only accepted if it
+// really comes from a peer of the same network. Signals in any earlier,
+// unsigned format (which start directly with the ephemeral key) are
+// rejected — pre-1.0, no compatibility.
+const (
+	// signalVersion is the wire version byte of authenticated NAT signals.
+	signalVersion = 1
+
+	// signalDomain prefixes the signed message, keeping NAT signal
+	// signatures distinct from every other Ed25519 use in the protocol.
+	signalDomain = "veld-nat-signal-v1"
+
+	// signalMaxAgeSec is how old a signal may be before it is rejected.
+	signalMaxAgeSec = 60
+
+	// signalMaxSkewSec is how far in the future a signal timestamp may be
+	// before it is rejected.
+	signalMaxSkewSec = 60
+
+	// signalHeaderLen is the fixed part before the encrypted blob:
+	// version byte + timestamp + signature.
+	signalHeaderLen = 1 + 8 + ed25519.SignatureSize
 )
 
 // encryptSignal encrypts payload for the recipient's X25519 public key.
@@ -87,6 +127,69 @@ func decryptSignal(data []byte, recipientX25519Private [32]byte) ([]byte, error)
 		return nil, errors.New("signal authentication failed")
 	}
 	return plain, nil
+}
+
+// signalSignedMessage builds the domain-separated message covered by the
+// sender's Ed25519 signature.
+func signalSignedMessage(from, to [32]byte, ts int64, encrypted []byte) []byte {
+	msg := make([]byte, 0, len(signalDomain)+64+8+len(encrypted))
+	msg = append(msg, signalDomain...)
+	msg = append(msg, from[:]...)
+	msg = append(msg, to[:]...)
+	var tsB [8]byte
+	binary.BigEndian.PutUint64(tsB[:], uint64(ts))
+	msg = append(msg, tsB[:]...)
+	msg = append(msg, encrypted...)
+	return msg
+}
+
+// sealSignal authenticates an encrypted signal blob with the sender's
+// Ed25519 identity key and returns the version-1 envelope.
+func sealSignal(encrypted []byte, from, to [32]byte, signer ed25519.PrivateKey, ts int64) []byte {
+	msg := signalSignedMessage(from, to, ts, encrypted)
+	sig := ed25519.Sign(signer, msg)
+
+	out := make([]byte, signalHeaderLen+len(encrypted))
+	out[0] = signalVersion
+	binary.BigEndian.PutUint64(out[1:9], uint64(ts))
+	copy(out[9:signalHeaderLen], sig)
+	copy(out[signalHeaderLen:], encrypted)
+	return out
+}
+
+// openSignal validates a sealed signal envelope: it must carry the explicit
+// wire version, a timestamp within the replay window, and a valid signature
+// by the sender's registered Ed25519 key, which must match the claimed
+// sender. Returns the encrypted blob on success.
+func openSignal(envelope []byte, from, to [32]byte, senderKey ed25519.PublicKey, nowSec int64) ([]byte, error) {
+	if len(envelope) < signalHeaderLen+32+12+16 {
+		return nil, errors.New("signal envelope too short")
+	}
+	if envelope[0] != signalVersion {
+		return nil, errors.New("unsupported signal version")
+	}
+	if len(senderKey) != ed25519.PublicKeySize {
+		return nil, errors.New("invalid sender key")
+	}
+	// The claimed sender must be exactly the peer the key was registered for.
+	if !bytes.Equal(senderKey, from[:]) {
+		return nil, errors.New("sender key does not match claimed peer")
+	}
+
+	ts := int64(binary.BigEndian.Uint64(envelope[1:9]))
+	if age := nowSec - ts; age > signalMaxAgeSec {
+		return nil, errors.New("signal expired")
+	}
+	if skew := ts - nowSec; skew > signalMaxSkewSec {
+		return nil, errors.New("signal timestamp too far in the future")
+	}
+
+	sig := envelope[9 : 9+ed25519.SignatureSize]
+	encrypted := envelope[signalHeaderLen:]
+	if !ed25519.Verify(senderKey, signalSignedMessage(from, to, ts, encrypted), sig) {
+		return nil, errors.New("invalid signal signature")
+	}
+	return encrypted, nil
 }
 
 // EncryptSignalFor is the exported wrapper for encryptSignal, used in tests.
