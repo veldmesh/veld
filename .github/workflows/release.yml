@@ -47,9 +47,15 @@ jobs:
         run: |
           PLATFORM="${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.goarm && format('_v{0}', matrix.goarm) || '' }}"
           EXT="${{ matrix.goos == 'windows' && '.exe' || '' }}"
-          echo "platform=$PLATFORM" >> "$GITHUB_OUTPUT"
-          echo "ext=$EXT"           >> "$GITHUB_OUTPUT"
-          echo "outdir=dist/$PLATFORM" >> "$GITHUB_OUTPUT"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            ARCHIVE_EXT="zip"
+          else
+            ARCHIVE_EXT="tar.gz"
+          fi
+          echo "platform=$PLATFORM"     >> "$GITHUB_OUTPUT"
+          echo "ext=$EXT"               >> "$GITHUB_OUTPUT"
+          echo "archive_ext=$ARCHIVE_EXT" >> "$GITHUB_OUTPUT"
+          echo "outdir=dist/$PLATFORM"   >> "$GITHUB_OUTPUT"
 
       - name: Build binaries
         env:
@@ -67,6 +73,24 @@ jobs:
             -o "$OUTDIR/veld-coord$EXT" ./cmd/veld-coord
           go build -trimpath -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
             -o "$OUTDIR/veld$EXT" ./cmd/veld
+
+      # veld-daemon creates its TUN adapter through Wintun, whose signed DLL
+      # is loaded from next to the executable — it is not installed
+      # system-wide, so it must ship inside the Windows release archive. The
+      # prebuilt DLL is redistributable under Wintun's Prebuilt Binaries License,
+      # whose text ships alongside it as wintun-LICENSE.txt. The upstream release is
+      # pinned and its SHA-256 verified so a tampered or rotated build fails
+      # the job. Do not commit the DLL itself to the repo.
+      - name: Download Wintun (windows/amd64)
+        if: matrix.goos == 'windows' && matrix.goarch == 'amd64'
+        run: |
+          OUTDIR="${{ steps.vars.outputs.outdir }}"
+          WINTUN_VERSION="0.14.1"
+          WINTUN_SHA256="07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+          curl -fsSL -o wintun.zip "https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip"
+          echo "${WINTUN_SHA256}  wintun.zip" | sha256sum --check
+          unzip -j -o wintun.zip wintun/bin/amd64/wintun.dll -d "$OUTDIR"
+          unzip -p wintun.zip wintun/LICENSE.txt > "$OUTDIR/wintun-LICENSE.txt"
 
       - name: Generate SBOM (Syft)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
@@ -87,6 +111,12 @@ jobs:
               --bundle "$OUTDIR/${bin}${EXT}.bundle" \
               "$OUTDIR/${bin}${EXT}"
           done
+          # Wintun's DLL ships in the Windows archive; sign it like the binaries.
+          if [ -f "$OUTDIR/wintun.dll" ]; then
+            cosign sign-blob --yes \
+              --bundle "$OUTDIR/wintun.dll.bundle" \
+              "$OUTDIR/wintun.dll"
+          fi
           cosign sign-blob --yes \
             --bundle "$OUTDIR/sbom.spdx.json.bundle" \
             "$OUTDIR/sbom.spdx.json"
@@ -94,20 +124,28 @@ jobs:
       - name: Create release archive
         # Binaries are placed at the archive root (no subdirectory) so package
         # managers and manual installs can extract directly into a bin/ directory.
+        # Windows ships as .zip and additionally bundles wintun.dll (with its
+        # license) so the daemon can create its TUN adapter out of the box.
         run: |
           PLATFORM="${{ steps.vars.outputs.platform }}"
           OUTDIR="${{ steps.vars.outputs.outdir }}"
           EXT="${{ steps.vars.outputs.ext }}"
-          tar -czf "veld-${{ github.ref_name }}-${PLATFORM}.tar.gz" \
-            -C "$OUTDIR" \
-            "veld${EXT}" "veld-daemon${EXT}" "veld-coord${EXT}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            (cd "$OUTDIR" && zip -q "../veld-${{ github.ref_name }}-${PLATFORM}.zip" \
+              "veld${EXT}" "veld-daemon${EXT}" "veld-coord${EXT}" \
+              wintun.dll wintun-LICENSE.txt)
+          else
+            tar -czf "veld-${{ github.ref_name }}-${PLATFORM}.tar.gz" \
+              -C "$OUTDIR" \
+              "veld${EXT}" "veld-daemon${EXT}" "veld-coord${EXT}"
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: release-${{ steps.vars.outputs.platform }}
           path: |
-            veld-${{ github.ref_name }}-${{ steps.vars.outputs.platform }}.tar.gz
+            veld-${{ github.ref_name }}-${{ steps.vars.outputs.platform }}.${{ steps.vars.outputs.archive_ext }}
             ${{ steps.vars.outputs.outdir }}/sbom.spdx.json
             ${{ steps.vars.outputs.outdir }}/*.bundle
           retention-days: 1
@@ -132,7 +170,7 @@ jobs:
         id: checksums
         run: |
           cd release-assets
-          sha256sum veld-*.tar.gz > checksums.txt
+          sha256sum veld-*.tar.gz veld-*.zip > checksums.txt
           echo "file=release-assets/checksums.txt" >> "$GITHUB_OUTPUT"
 
       - name: Create Release
@@ -140,6 +178,7 @@ jobs:
         with:
           files: |
             release-assets/veld-*.tar.gz
+            release-assets/veld-*.zip
             release-assets/checksums.txt
             release-assets/*.bundle
             release-assets/*.spdx.json

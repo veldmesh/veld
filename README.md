@@ -80,6 +80,14 @@ ping 10.0.0.2   # or: ping machine-b.veld
 
 ---
 
+## Installing on Windows
+
+Download `veld-<version>-windows_amd64.zip` from the [releases page](https://github.com/veldmesh/veld/releases) and extract it. The zip bundles `wintun.dll` — the signed Wintun driver library `veld-daemon` loads to create its TUN adapter — along with its license (`wintun-LICENSE.txt`). Keep `wintun.dll` in the same directory as `veld-daemon.exe`.
+
+Run `veld-daemon` from an elevated terminal (Run as administrator): creating the adapter requires Administrator. If `wintun.dll` is missing, `veld-daemon` exits with an error pointing to https://www.wintun.net/ — download it or re-extract the release zip.
+
+---
+
 ## Architecture overview
 
 ```
