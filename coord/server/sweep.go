@@ -42,7 +42,7 @@ func normalizeSweepInterval(d time.Duration) time.Duration {
 // which skip returns true (e.g. peers with an active Watch stream) are never
 // removed, so a daemon that is still connected cannot be swept out from under
 // its peers. skip may be nil. The on-disk schema is unchanged: this only
-// deletes existing keys.
+// deletes existing keys. Swept peers' in-memory endpoints are dropped too.
 func (r *Registry) SweepStalePeers(ttl time.Duration, skip func(peerID string) bool) ([]peerRecord, error) {
 	if ttl <= 0 {
 		return nil, nil
@@ -94,7 +94,13 @@ func (r *Registry) SweepStalePeers(ttl time.Duration, skip func(peerID string) b
 		}
 		return nil
 	})
-	return removed, err
+	if err != nil {
+		return nil, err
+	}
+	for _, rec := range removed {
+		r.dropEndpoint(rec.ID)
+	}
+	return removed, nil
 }
 
 // Sweeper is anything that can expel stale peers with full leave semantics.

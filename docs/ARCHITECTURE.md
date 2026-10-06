@@ -71,7 +71,10 @@ Veld runs in three operating modes:
 
 - **Role:** public-key directory plus a NAT-traversal signal channel. Nothing else.
 - **Store:** bbolt single-file DB (`coord/server/registry.go`) mapping
-  `peer ID → public key (Ed25519 + cross-signed X25519) + last-seen endpoint + VPN address`.
+  `peer ID → public key (Ed25519 + cross-signed X25519) + VPN address + name`, plus a
+  coarse last-seen timestamp rounded to the hour. Machines' public endpoints (`ip:port`)
+  are kept in memory only and never written to disk; after a restart they are re-learned
+  when daemons re-register (they re-register on every reconnect).
 - **API:** gRPC service `Coord` (`proto/veld/coord/v1/coord.proto`), defined by five RPCs:
   `Register`, `ListPeers`, `Watch` (server-streaming), `SendSignal`, `Leave`.
 - **Network isolation:** `ListPeers`/`Watch` are scoped by `network_id`. Peers in network

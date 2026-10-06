@@ -136,6 +136,29 @@ model — entries age out instead of accumulating forever.
   `server.MinSweepInterval` (**1 minute**) are clamped up to it, so a misconfigured flag cannot
   churn the registry write path.
 
+## Coord server endpoint storage
+
+Peer endpoints (public `ip:port`) are the only registry data the coord server needs to
+serve to other peers, and they do not need to outlive the process. `coord/server/registry.go`
+keeps them in a mutex-guarded in-memory map keyed by peer ID:
+
+- Filled on `Register` (including idempotent re-registrations) and `UpdateEndpoint`.
+- Served wherever peers learn about each other: `ListPeers` results and `Watch` snapshot events.
+- Dropped when a peer leaves (`Leave`) or is removed by the TTL sweep.
+- Never written to bbolt: persisted peer records hold only the peer ID, network ID, name,
+  VPN address, public keys, subnet routes, and a last-seen timestamp rounded down to the
+  hour — coarse enough for the TTL sweep without retaining precise activity times.
+  A zero last-seen is preserved as-is: it is the "never sent a heartbeat"
+  sentinel, which the sweep ages by the peer's `RegisteredAt` timestamp
+  instead.
+
+After a coord restart the map starts empty; endpoints are re-learned as daemons re-register.
+Daemons already re-register whenever they (re)connect to the coord server, so no extra
+protocol or operator action is needed.
+
+A one-time, idempotent startup migration in `NewRegistry` blanks the `endpoint` field of
+records persisted by older builds, so upgrading never leaves historical endpoints on disk.
+
 ---
 
 ## Testing approach
