@@ -42,6 +42,17 @@ const (
 	probeSendInterval = 100 * time.Millisecond
 	probeFlag         = uint32(0) // outgoing probe
 	replyFlag         = uint32(1) // probe reply
+
+	// pendingMax caps how many distinct senders may have a sealed signal
+	// envelope held at once (before the sender's session exists). Peer IDs
+	// are public, so a member of the network could otherwise grow the hold
+	// map without bound by signalling from IDs that never resolve to a
+	// session. When the map is full, signals from new senders are dropped
+	// silently — already-held envelopes are never evicted by newer ones.
+	// A legitimate punch backlog is single-digit (at most one envelope per
+	// sender), so this is orders of magnitude above any real need while
+	// bounding held memory to pendingMax × signalMaxLen.
+	pendingMax = 256
 )
 
 // Manager handles NAT hole-punch negotiation for all active peer pairs.
@@ -68,7 +79,10 @@ type Manager struct {
 	sessions map[[32]byte]*natSession
 	// pending holds sealed signal envelopes that arrived before the session
 	// for that peer was created. Keyed by sender peer ID; each is
-	// authenticated against the peer table when Start is called.
+	// authenticated against the peer table when Start is called. Bounded:
+	// at most pendingMax senders, each envelope at most signalMaxLen bytes
+	// and pre-filtered by holdableSignal, so abusive input cannot grow it
+	// without limit.
 	pending map[[32]byte][]byte
 }
 
@@ -160,8 +174,10 @@ func (m *Manager) Start(ctx context.Context, e *peer.Entry, sendFn func([]byte) 
 // Ed25519 signature by the sender's coord-registered identity key within
 // the replay window — and routes the decrypted payload to the matching peer
 // session. If no session exists yet for the sender, the sealed envelope is
-// held and authenticated when Start is called for that peer. Unauthenticated
-// signals are dropped silently.
+// held and authenticated when Start is called for that peer; the hold is
+// bounded (holdableSignal pre-filter, at most pendingMax senders, each
+// envelope at most signalMaxLen bytes) so it cannot be used for memory
+// exhaustion. Unauthenticated or unholdable signals are dropped silently.
 func (m *Manager) DeliverSignal(fromPeerID string, envelope []byte) {
 	id, ok := hexToNatID(fromPeerID)
 	if !ok {
@@ -171,8 +187,14 @@ func (m *Manager) DeliverSignal(fromPeerID string, envelope []byte) {
 	m.mu.Lock()
 	sess, hasSess := m.sessions[id]
 	if !hasSess {
-		// No session yet: hold the sealed envelope. Start will authenticate
-		// it against the peer table entry it was given.
+		// No session yet: hold the sealed envelope, unless it could never
+		// authenticate or the hold map is already at capacity. Start will
+		// authenticate it against the peer table entry it was given.
+		_, exists := m.pending[id]
+		if !holdableSignal(envelope, time.Now().Unix()) || (!exists && len(m.pending) >= pendingMax) {
+			m.mu.Unlock()
+			return
+		}
 		m.pending[id] = envelope
 		m.mu.Unlock()
 		return

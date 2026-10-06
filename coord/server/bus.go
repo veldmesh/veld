@@ -11,6 +11,18 @@ import (
 // heldSignalsMax caps how many signals are held per recipient while the
 // recipient has no open Watch stream. When the cap is exceeded the oldest
 // held signal is dropped, so a fresh signal never evicts a newer one.
+//
+// Rationale for 64: a held signal is only useful while fresh — clients
+// reject signals timestamped more than 60 s in the past — so a long queue
+// is pure memory waste on a network-facing path, while 64 covers a whole
+// network's peers each signalling one offline recipient during a reconnect
+// burst. The value matches the other bounded buffers in the signalling
+// pipeline (the 64-buffered subscriber channels and the daemon's 64-entry
+// session hold queue) so every stage degrades the same way under load.
+// Peers that miss held signals re-run NAT negotiation when the recipient
+// returns, so nothing is lost for good. Not tunable per-network: no
+// legitimate deployment needs more, and the knob would need registry
+// schema for a value nothing else reads.
 const heldSignalsMax = 64
 
 // signalMsg is an opaque signal (ICE candidate etc.) from one peer to another.

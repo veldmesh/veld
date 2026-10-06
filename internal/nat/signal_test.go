@@ -422,3 +422,123 @@ func TestManager_DeliverSignal_DropsPendingFromUnknownSender(t *testing.T) {
 		t.Fatalf("held signal from unknown sender was accepted: %d bytes: % x", n, buf[:n])
 	}
 }
+
+// TestOpenSignal_RejectsOversizedEnvelope verifies that envelopes larger
+// than signalMaxLen are rejected before any signature verification work.
+func TestOpenSignal_RejectsOversizedEnvelope(t *testing.T) {
+	idA := mustIdentity(t)
+	idB := mustIdentity(t)
+	now := time.Now().Unix()
+
+	// A correctly signed envelope whose payload pushes it over the cap.
+	envelope := buildEnvelope(t, make([]byte, signalMaxLen), idA, idB, idB.X25519Public, idA.Ed25519Private, now)
+	if len(envelope) <= signalMaxLen {
+		t.Fatalf("fixture should exceed the cap: len=%d cap=%d", len(envelope), signalMaxLen)
+	}
+	if _, err := openSignal(envelope, idOf(idA.Ed25519Public), idOf(idB.Ed25519Public), idA.Ed25519Public, now); err == nil {
+		t.Fatal("openSignal accepted an oversized envelope")
+	}
+}
+
+// newHoldManager builds a recipient manager with no sessions and an empty
+// peer table, for exercising the bounded hold of undelivered signals.
+// Returns the recipient's identity for building envelopes addressed to it.
+func newHoldManager(t *testing.T) (*Manager, *crypto.Identity) {
+	t.Helper()
+	idB := mustIdentity(t)
+	connB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket: %v", err)
+	}
+	t.Cleanup(func() { connB.Close() })
+	portB := connB.LocalAddr().(*net.UDPAddr).Port
+	return New(connB, uint16(portB), "" /*no STUN*/, idB, peer.New()), idB
+}
+
+// pendingHeld reports how many sealed envelopes are currently held.
+func pendingHeld(mgr *Manager) int {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	return len(mgr.pending)
+}
+
+// TestManager_PendingHoldIsBounded verifies that the map of held (not yet
+// authenticated, session-less) signals stays capped when more distinct
+// senders than the cap deliver signals, and that already-held envelopes
+// are never evicted by later ones (drop-new policy).
+func TestManager_PendingHoldIsBounded(t *testing.T) {
+	mgr, idB := newHoldManager(t)
+	now := time.Now().Unix()
+
+	var first [32]byte
+	for i := 0; i < pendingMax+32; i++ {
+		sender := mustIdentity(t)
+		envelope := buildEnvelope(t, []byte("junk"), sender, idB, idB.X25519Public, sender.Ed25519Private, now)
+		if i == 0 {
+			first = idOf(sender.Ed25519Public)
+		}
+		mgr.DeliverSignal(hex.EncodeToString(sender.Ed25519Public), envelope)
+	}
+
+	if held := pendingHeld(mgr); held != pendingMax {
+		t.Errorf("pending map not bounded: held %d, want %d", held, pendingMax)
+	}
+
+	mgr.mu.Lock()
+	_, firstHeld := mgr.pending[first]
+	mgr.mu.Unlock()
+	if !firstHeld {
+		t.Error("a held envelope was evicted by later signals: drop-new policy violated")
+	}
+}
+
+// TestManager_PendingHoldDropsGarbage verifies the cheap pre-filter that
+// keeps envelopes which could never authenticate from being buffered at
+// all: stale or far-future timestamps, wrong version bytes, and oversized
+// envelopes are dropped before entering the pending map.
+func TestManager_PendingHoldDropsGarbage(t *testing.T) {
+	idA := mustIdentity(t) // claimed sender
+	now := time.Now().Unix()
+
+	cases := []struct {
+		name     string
+		envelope func(t *testing.T, idB *crypto.Identity) []byte
+	}{
+		{
+			name: "stale timestamp",
+			envelope: func(t *testing.T, idB *crypto.Identity) []byte {
+				return buildEnvelope(t, []byte("old"), idA, idB, idB.X25519Public, idA.Ed25519Private, now-signalMaxAgeSec-1)
+			},
+		},
+		{
+			name: "future timestamp",
+			envelope: func(t *testing.T, idB *crypto.Identity) []byte {
+				return buildEnvelope(t, []byte("future"), idA, idB, idB.X25519Public, idA.Ed25519Private, now+signalMaxSkewSec+1)
+			},
+		},
+		{
+			name: "wrong version",
+			envelope: func(t *testing.T, idB *crypto.Identity) []byte {
+				envelope := buildEnvelope(t, []byte("v?"), idA, idB, idB.X25519Public, idA.Ed25519Private, now)
+				envelope[0] = signalVersion + 1
+				return envelope
+			},
+		},
+		{
+			name: "oversized",
+			envelope: func(t *testing.T, idB *crypto.Identity) []byte {
+				return buildEnvelope(t, make([]byte, signalMaxLen), idA, idB, idB.X25519Public, idA.Ed25519Private, now)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, idB := newHoldManager(t)
+			mgr.DeliverSignal(hex.EncodeToString(idA.Ed25519Public), tc.envelope(t, idB))
+			if held := pendingHeld(mgr); held != 0 {
+				t.Errorf("garbage envelope was held: %d entries", held)
+			}
+		})
+	}
+}

@@ -59,12 +59,11 @@ func pumpProbes(conn net.PacketConn, mgr *nat.Manager) {
 	}
 }
 
-// entryFor builds a peer.Entry stub for the given identity. Only ID and
-// X25519Pub are used by the manager; VPNAddr is set so Upsert works.
-func entryFor(id *crypto.Identity, vpn string) *peer.Entry {
-	e := &peer.Entry{ID: [32]byte(id.Ed25519Public[:32]), X25519Pub: id.X25519Public}
-	e.VPNAddr = netip.MustParseAddr(vpn)
-	return e
+// entryFor builds a peer.Entry stub for the given identity at VPN address
+// vpn. Only ID and X25519Pub are used by the manager; VPNAddr is set so
+// Upsert works.
+func entryFor(id *crypto.Identity, vpn netip.Addr) *peer.Entry {
+	return &peer.Entry{ID: [32]byte(id.Ed25519Public[:32]), X25519Pub: id.X25519Public, VPNAddr: vpn}
 }
 
 // TestNATManager_TwoPeersDiscover verifies that two Manager instances running
@@ -104,8 +103,8 @@ func TestNATManager_TwoPeersDiscover(t *testing.T) {
 	go pumpProbes(connB, mgrB)
 
 	// Build peer.Entry stubs and register each peer in the other's table.
-	entryA := entryFor(idA, "10.0.0.1")
-	entryB := entryFor(idB, "10.0.0.2")
+	entryA := entryFor(idA, netip.MustParseAddr("10.0.0.1"))
+	entryB := entryFor(idB, netip.MustParseAddr("10.0.0.2"))
 	tblA.Upsert(entryB)
 	tblB.Upsert(entryA)
 
@@ -172,9 +171,6 @@ func TestNATManager_SignalEncryption(t *testing.T) {
 	connA, portA := makeUDPConn(t)
 	mgrA := nat.New(connA, portA, "", idA, peer.New())
 
-	entryB := &peer.Entry{ID: [32]byte(idB.Ed25519Public[:32]), X25519Pub: idB.X25519Public}
-	entryB.VPNAddr = netip.MustParseAddr("10.0.0.2")
-
 	var captured []byte
 	_ = mgrA // silence unused warning; we test signal encryption directly
 
@@ -201,8 +197,6 @@ func TestNATManager_SignalEncryption(t *testing.T) {
 	if err == nil {
 		t.Error("Eve decrypted a signal not addressed to her")
 	}
-
-	_ = entryB
 }
 
 // TestNATManager_DuplicateStart verifies that calling Start twice for the
@@ -230,8 +224,8 @@ func TestNATManager_DuplicateStart(t *testing.T) {
 	}
 
 	peerIDofA := hex.EncodeToString(idA.Ed25519Public[:32])
-	entryA := entryFor(idA, "10.0.0.1")
-	entryB := entryFor(idB, "10.0.0.2")
+	entryA := entryFor(idA, netip.MustParseAddr("10.0.0.1"))
+	entryB := entryFor(idB, netip.MustParseAddr("10.0.0.2"))
 	tblA.Upsert(entryB)
 	tblB.Upsert(entryA)
 
@@ -286,8 +280,8 @@ func TestNATManager_PunchTimeoutFallback(t *testing.T) {
 	mgrA.OnEndpointDiscovered = func(_ [32]byte, ep netip.AddrPort) { discovered <- ep }
 	mgrB.OnEndpointDiscovered = func(_ [32]byte, ep netip.AddrPort) { discovered <- ep }
 
-	entryA := entryFor(idA, "10.0.0.1")
-	entryB := entryFor(idB, "10.0.0.2")
+	entryA := entryFor(idA, netip.MustParseAddr("10.0.0.1"))
+	entryB := entryFor(idB, netip.MustParseAddr("10.0.0.2"))
 	tblA.Upsert(entryB)
 	tblB.Upsert(entryA)
 
