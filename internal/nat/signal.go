@@ -41,16 +41,46 @@ const (
 	// signatures distinct from every other Ed25519 use in the protocol.
 	signalDomain = "veld-nat-signal-v1"
 
-	// signalMaxAgeSec is how old a signal may be before it is rejected.
-	signalMaxAgeSec = 60
+	// ed25519SignatureSize and ed25519PublicKeySize are the signature and
+	// public key sizes the wire format above is pinned to. They are
+	// defined locally instead of referencing crypto/ed25519's values so
+	// the wire format stays explicit and can never silently shift if the
+	// stdlib constants ever change.
+	ed25519SignatureSize = 64
+	ed25519PublicKeySize = 32
 
-	// signalMaxSkewSec is how far in the future a signal timestamp may be
-	// before it is rejected.
+	// signalMaxAgeSec is how old a signal may be before it is rejected,
+	// and signalMaxSkewSec how far in the future its timestamp may be.
+	// Together they form the anti-replay window. The window is a fixed
+	// protocol constant, deliberately NOT configurable: sender and
+	// recipient must agree on it, and widening it per deployment would
+	// weaken the replay bound the signature timestamp provides.
+	//
+	// DEPLOYMENT CONSTRAINT: peers must keep their clocks synchronized
+	// (NTP or equivalent) to well within this window. Hosts whose clocks
+	// drift more than ~60 s apart (unsynced embedded devices/VMs) have
+	// their signals rejected, so hole punching fails and connections
+	// fall back to the relay path. This adds no new requirement: the
+	// Noise handshake already rejects peers whose clocks are more than
+	// ±30 s apart (crypto.VerifyPeerSig), so any deployment that can run
+	// Veld at all already satisfies the signal window.
+	signalMaxAgeSec  = 60
 	signalMaxSkewSec = 60
 
 	// signalHeaderLen is the fixed part before the encrypted blob:
 	// version byte + timestamp + signature.
-	signalHeaderLen = 1 + 8 + ed25519.SignatureSize
+	signalHeaderLen = 1 + 8 + ed25519SignatureSize
+
+	// signalMinLen is the smallest well-formed envelope: header plus the
+	// 32-byte ephemeral X25519 key, 12-byte nonce and 16-byte AEAD tag.
+	signalMinLen = signalHeaderLen + 32 + 12 + 16
+
+	// signalMaxLen bounds how large an accepted envelope may be. A real
+	// signal is a small JSON candidate list (well under 2 KiB); anything
+	// larger is abusive. This caps the memory a single in-flight or held
+	// signal can consume — held buffers bound the entry count, this
+	// bounds each entry.
+	signalMaxLen = 16 << 10
 )
 
 // encryptSignal encrypts payload for the recipient's X25519 public key.
@@ -162,13 +192,16 @@ func sealSignal(encrypted []byte, from, to [32]byte, signer ed25519.PrivateKey, 
 // by the sender's registered Ed25519 key, which must match the claimed
 // sender. Returns the encrypted blob on success.
 func openSignal(envelope []byte, from, to [32]byte, senderKey ed25519.PublicKey, nowSec int64) ([]byte, error) {
-	if len(envelope) < signalHeaderLen+32+12+16 {
+	if len(envelope) < signalMinLen {
 		return nil, errors.New("signal envelope too short")
+	}
+	if len(envelope) > signalMaxLen {
+		return nil, errors.New("signal envelope too large")
 	}
 	if envelope[0] != signalVersion {
 		return nil, errors.New("unsupported signal version")
 	}
-	if len(senderKey) != ed25519.PublicKeySize {
+	if len(senderKey) != ed25519PublicKeySize {
 		return nil, errors.New("invalid sender key")
 	}
 	// The claimed sender must be exactly the peer the key was registered for.
@@ -184,12 +217,30 @@ func openSignal(envelope []byte, from, to [32]byte, senderKey ed25519.PublicKey,
 		return nil, errors.New("signal timestamp too far in the future")
 	}
 
-	sig := envelope[9 : 9+ed25519.SignatureSize]
+	sig := envelope[9 : 9+ed25519SignatureSize]
 	encrypted := envelope[signalHeaderLen:]
 	if !ed25519.Verify(senderKey, signalSignedMessage(from, to, ts, encrypted), sig) {
 		return nil, errors.New("invalid signal signature")
 	}
 	return encrypted, nil
+}
+
+// holdableSignal reports whether a sealed envelope is worth buffering for
+// later authentication, which happens when Start consumes it once the
+// sender's session exists. It is a cheap pre-filter on the parts of the
+// header that need no sender key — size, version byte, and replay window —
+// so garbage (replays, old-format bytes, oversized blobs) is never held.
+// Everything it rejects would also fail openSignal later; it only prunes
+// early to keep the bounded hold buffer free of dead weight.
+func holdableSignal(envelope []byte, nowSec int64) bool {
+	if len(envelope) < signalMinLen || len(envelope) > signalMaxLen {
+		return false
+	}
+	if envelope[0] != signalVersion {
+		return false
+	}
+	ts := int64(binary.BigEndian.Uint64(envelope[1:9]))
+	return ts >= nowSec-signalMaxAgeSec && ts <= nowSec+signalMaxSkewSec
 }
 
 // EncryptSignalFor is the exported wrapper for encryptSignal, used in tests.
