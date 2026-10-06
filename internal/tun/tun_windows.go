@@ -20,10 +20,15 @@ type windowsTUN struct {
 	mtu  int
 }
 
+// wintunDownloadURL is the official Wintun download page — the same place
+// the release workflow fetches the DLL from (see the Download Wintun step in
+// .github/workflows/release.yml). If the URL ever moves, update both.
+const wintunDownloadURL = "https://www.wintun.net/"
+
 // wintunMissingHint points at the fix for the most common Windows failure:
 // Wintun's DLL is not installed system-wide and must sit next to the daemon
 // binary, otherwise adapter creation fails with an opaque LoadLibraryEx error.
-const wintunMissingHint = "wintun.dll not found next to veld-daemon.exe — download it from https://www.wintun.net/ or use the release zip"
+const wintunMissingHint = "wintun.dll not found next to veld-daemon.exe — download it from " + wintunDownloadURL + " or use the release zip"
 
 // tunCreateError wraps a Windows adapter-creation failure with the interface
 // name and wintunMissingHint so the error is actionable. err is wrapped with

@@ -9,6 +9,14 @@ permissions:
   contents: write    # create GitHub Release and upload assets
   id-token: write    # Sigstore keyless OIDC signing
 
+# Single source of truth for the Wintun release shipped inside the Windows
+# archive. The Download Wintun step reads both values from here — a version
+# bump is a two-line change in one place (update version and SHA-256 together;
+# the SHA is of the zip at https://www.wintun.net/builds/wintun-<version>.zip).
+env:
+  WINTUN_VERSION: '0.14.1'
+  WINTUN_SHA256: '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
+
 jobs:
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm && format('/v{0}', matrix.goarm) || '' }}
@@ -78,16 +86,16 @@ jobs:
       # is loaded from next to the executable — it is not installed
       # system-wide, so it must ship inside the Windows release archive. The
       # prebuilt DLL is redistributable under Wintun's Prebuilt Binaries License,
-      # whose text ships alongside it as wintun-LICENSE.txt. The upstream release is
-      # pinned and its SHA-256 verified so a tampered or rotated build fails
-      # the job. Do not commit the DLL itself to the repo.
+      # whose text ships alongside it as wintun-LICENSE.txt. The upstream release
+      # is pinned via WINTUN_VERSION/WINTUN_SHA256 (top-level env) and its
+      # SHA-256 verified so a tampered or rotated build fails the job. Do not
+      # commit the DLL itself to the repo.
       - name: Download Wintun (windows/amd64)
         if: matrix.goos == 'windows' && matrix.goarch == 'amd64'
         run: |
           OUTDIR="${{ steps.vars.outputs.outdir }}"
-          WINTUN_VERSION="0.14.1"
-          WINTUN_SHA256="07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
-          curl -fsSL -o wintun.zip "https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip"
+          curl -fsSL --retry 3 --retry-delay 5 --max-time 60 \
+            -o wintun.zip "https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip"
           echo "${WINTUN_SHA256}  wintun.zip" | sha256sum --check
           unzip -j -o wintun.zip wintun/bin/amd64/wintun.dll -d "$OUTDIR"
           unzip -p wintun.zip wintun/LICENSE.txt > "$OUTDIR/wintun-LICENSE.txt"
