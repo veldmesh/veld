@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"net/netip"
 	"sync"
 	"time"
@@ -59,6 +60,46 @@ func New(
 		hooks:     hooks,
 		connected: make(map[string]int),
 	}
+}
+
+// errNetworkNotFound and errPeerNotFound are the errors every per-account
+// authorization check fails with: codes.NotFound, the same error a
+// nonexistent network or peer produces, so a caller cannot tell "owned by
+// another account" apart from "does not exist".
+var (
+	errNetworkNotFound = status.Error(codes.NotFound, "network not found")
+	errPeerNotFound    = status.Error(codes.NotFound, "peer not found")
+)
+
+// authorizeNetwork returns nil when networkID names an existing network
+// owned by accountID. It is the single per-account gate every RPC that
+// names a network must pass, so a request can only read or change state
+// inside networks owned by the token's account.
+func (s *Server) authorizeNetwork(networkID, accountID string) error {
+	_, owner, err := s.registry.GetNetwork(networkID)
+	if err != nil || owner != accountID {
+		return errNetworkNotFound
+	}
+	return nil
+}
+
+// authorizePeer returns the record of peerID when that peer is registered
+// in a network owned by accountID — and, when networkID is non-empty, in
+// that network in particular. It is the single per-account gate every RPC
+// that names a peer must pass, so a request can only name peers registered
+// in networks owned by the token's account.
+func (s *Server) authorizePeer(peerID, networkID, accountID string) (peerRecord, error) {
+	rec, err := s.registry.GetPeer(peerID)
+	if err != nil {
+		return peerRecord{}, errPeerNotFound
+	}
+	if networkID != "" && rec.NetworkID != networkID {
+		return peerRecord{}, errPeerNotFound
+	}
+	if err := s.authorizeNetwork(rec.NetworkID, accountID); err != nil {
+		return peerRecord{}, errPeerNotFound
+	}
+	return rec, nil
 }
 
 // markConnected records an active Watch stream for peerID.
@@ -145,6 +186,10 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 		return nil, status.Errorf(codes.Unauthenticated, "invalid token")
 	}
 
+	if err := s.authorizeNetwork(req.NetworkId, acc.ID); err != nil {
+		return nil, err
+	}
+
 	// Ask the enforcer for the limit (-1 = unlimited) so we can enforce it
 	// atomically inside the registry write transaction.
 	machineLimit := s.enforcer.MachineLimitFor(ctx, req.NetworkId)
@@ -182,6 +227,9 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 
 	vpnAddr, err := s.registry.RegisterPeer(rec, req.NetworkId, machineLimit)
 	if err != nil {
+		if errors.Is(err, ErrPeerIDTaken) || errors.Is(err, ErrPeerKeyMismatch) {
+			return nil, status.Errorf(codes.AlreadyExists, "%v", err)
+		}
 		if err == ErrMachineLimit {
 			_ = s.audit.Log(ctx, coordcore.AuditEvent{
 				Kind:      coordcore.AuditRegistrationRejected,
@@ -235,8 +283,12 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 
 // ListPeers returns all peers in the network.
 func (s *Server) ListPeers(ctx context.Context, req *coordv1.ListPeersRequest) (*coordv1.ListPeersResponse, error) {
-	if _, err := s.accounts.Resolve(ctx, req.Token); err != nil {
+	acc, err := s.accounts.Resolve(ctx, req.Token)
+	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "invalid token")
+	}
+	if err := s.authorizeNetwork(req.NetworkId, acc.ID); err != nil {
+		return nil, err
 	}
 
 	peers, err := s.registry.ListPeers(req.NetworkId)
@@ -263,8 +315,19 @@ func (s *Server) ListPeers(ctx context.Context, req *coordv1.ListPeersRequest) (
 // If req.PeerId is set, signals addressed to that peer are also delivered.
 func (s *Server) Watch(req *coordv1.WatchRequest, stream coordv1.Coord_WatchServer) error {
 	ctx := stream.Context()
-	if _, err := s.accounts.Resolve(ctx, req.Token); err != nil {
+	acc, err := s.accounts.Resolve(ctx, req.Token)
+	if err != nil {
 		return status.Errorf(codes.Unauthenticated, "invalid token")
+	}
+
+	if err := s.authorizeNetwork(req.NetworkId, acc.ID); err != nil {
+		return err
+	}
+	if req.PeerId != "" {
+		// A Watch may only name a peer registered in the requested network.
+		if _, err := s.authorizePeer(req.PeerId, req.NetworkId, acc.ID); err != nil {
+			return err
+		}
 	}
 
 	// A peer with an active Watch stream is online: track it so the TTL
@@ -347,8 +410,22 @@ func (s *Server) Watch(req *coordv1.WatchRequest, stream coordv1.Coord_WatchServ
 
 // SendSignal relays an opaque signal from one peer to another.
 func (s *Server) SendSignal(ctx context.Context, req *coordv1.SendSignalRequest) (*coordv1.SendSignalResponse, error) {
-	if _, err := s.accounts.Resolve(ctx, req.Token); err != nil {
+	acc, err := s.accounts.Resolve(ctx, req.Token)
+	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "invalid token")
+	}
+	// The caller may only signal as a peer in a network owned by its
+	// account, and only to a peer in the same network.
+	from, err := s.authorizePeer(req.FromPeerId, "", acc.ID)
+	if err != nil {
+		return nil, err
+	}
+	to, err := s.authorizePeer(req.ToPeerId, "", acc.ID)
+	if err != nil {
+		return nil, err
+	}
+	if from.NetworkID != to.NetworkID {
+		return nil, errPeerNotFound
 	}
 	s.bus.SendSignal(req.FromPeerId, req.ToPeerId, req.Payload)
 	return &coordv1.SendSignalResponse{}, nil
@@ -359,6 +436,10 @@ func (s *Server) Leave(ctx context.Context, req *coordv1.LeaveRequest) (*coordv1
 	acc, err := s.accounts.Resolve(ctx, req.Token)
 	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "invalid token")
+	}
+
+	if _, err := s.authorizePeer(req.PeerId, "", acc.ID); err != nil {
+		return nil, err
 	}
 
 	removed, err := s.registry.RemovePeer(req.PeerId)

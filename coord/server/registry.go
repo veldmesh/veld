@@ -238,11 +238,28 @@ func (r *Registry) NetworkMachineCount(networkID string) (int, error) {
 // ErrMachineLimit is returned by RegisterPeer when the network is at capacity.
 var ErrMachineLimit = fmt.Errorf("machine limit reached")
 
+// ErrPeerIDTaken is returned by RegisterPeer when the peer ID (the Ed25519
+// public key) is already registered in a different network: peer IDs live
+// in one global namespace, so an existing registration is never moved to
+// another network or overwritten.
+var ErrPeerIDTaken = fmt.Errorf("peer id already registered in another network")
+
+// ErrPeerKeyMismatch is returned by RegisterPeer when a same-network
+// re-registration presents a different X25519 public key than the one
+// stored for the peer. Re-registering daemons keep their identity; key
+// rotation needs a signed flow, so the stored key is never overwritten.
+var ErrPeerKeyMismatch = fmt.Errorf("peer x25519 public key mismatch")
+
 // RegisterPeer adds a peer to the registry and returns its assigned VPN address.
 // maxMachines is checked atomically inside the write transaction; pass 0 for unlimited.
 // Idempotent: if the peer is already registered in the same network, updates
 // mutable fields (name, last_seen) and returns the existing IP without
 // incrementing the machine count. This allows daemons to reconnect cleanly.
+// The peer ID (the Ed25519 public key) is globally unique: an ID already
+// registered in another network is rejected with ErrPeerIDTaken, and a
+// same-network re-registration presenting a different X25519 key than the
+// stored one is rejected with ErrPeerKeyMismatch. Both rejections change
+// nothing — no record, endpoint, machine count or JOIN event.
 // The peer's endpoint is kept in memory only — it is never persisted.
 // Pass p.LastSeen as the raw, unrounded unix timestamp; it is rounded down
 // to the hour before being persisted.
@@ -253,22 +270,37 @@ func (r *Registry) RegisterPeer(p peerRecord, networkID string, maxMachines int)
 	err := r.db.Update(func(tx *bolt.Tx) error {
 		pb := tx.Bucket(bucketPeers)
 
-		// Idempotent re-registration: peer exists in the same network → reuse IP.
+		// The peer ID is globally unique. If it already exists, only a
+		// same-network re-registration presenting the same X25519 key is
+		// accepted; anything else is rejected without touching the stored
+		// record.
 		if existing := pb.Get([]byte(p.ID)); existing != nil {
 			var rec peerRecord
-			if err := json.Unmarshal(existing, &rec); err == nil && rec.NetworkID == networkID {
-				addr, err := netip.ParseAddr(rec.VPNAddr)
-				if err == nil {
-					rec.LastSeen = roundToHour(p.LastSeen)
-					rec.Name = p.Name
-					rec.SubnetRoutes = p.SubnetRoutes
-					if updated, err := json.Marshal(rec); err == nil {
-						_ = pb.Put([]byte(p.ID), updated)
-					}
-					assigned = addr
-					return nil
-				}
+			if err := json.Unmarshal(existing, &rec); err != nil {
+				return fmt.Errorf("peer %q exists but its record is unreadable: %w", p.ID, err)
 			}
+			if rec.NetworkID != networkID {
+				return ErrPeerIDTaken
+			}
+			if rec.X25519Public != p.X25519Public {
+				return ErrPeerKeyMismatch
+			}
+			addr, err := netip.ParseAddr(rec.VPNAddr)
+			if err != nil {
+				return fmt.Errorf("peer %q has unreadable vpn_addr %q: %w", p.ID, rec.VPNAddr, err)
+			}
+			rec.LastSeen = roundToHour(p.LastSeen)
+			rec.Name = p.Name
+			rec.SubnetRoutes = p.SubnetRoutes
+			updated, err := json.Marshal(rec)
+			if err != nil {
+				return err
+			}
+			if err := pb.Put([]byte(p.ID), updated); err != nil {
+				return err
+			}
+			assigned = addr
+			return nil
 		}
 
 		// New peer: check limit, assign next IP, increment machine count — all atomic.
