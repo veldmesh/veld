@@ -4,7 +4,6 @@ package e2e_test
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"net"
 	"os"
@@ -19,6 +18,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
+	"github.com/veldmesh/veld/internal/crypto"
 )
 
 // moduleRoot returns the core/ directory (where go.mod lives).
@@ -168,14 +168,12 @@ func TestBinary_Coord_StartStop(t *testing.T) {
 	ctx := context.Background()
 
 	// Register peer A
-	regA, err := client.Register(ctx, &coordv1.RegisterRequest{
-		NetworkId:     binaryNetworkID,
-		Token:         "testtoken",
-		Name:          "peer-a",
-		Ed25519Public: base64.StdEncoding.EncodeToString(make([]byte, 32)),
-		X25519Public:  base64.StdEncoding.EncodeToString(make([]byte, 32)),
-		Endpoint:      "10.0.0.1:51820",
-	})
+	idA, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate peer-a identity: %v", err)
+	}
+	regA, err := client.Register(ctx,
+		signedRegisterReq(t, idA, binaryNetworkID, "testtoken", "peer-a", "10.0.0.1:51820", nil))
 	if err != nil {
 		t.Fatalf("Register peer-a: %v", err)
 	}
@@ -184,14 +182,12 @@ func TestBinary_Coord_StartStop(t *testing.T) {
 	}
 
 	// Register peer B
-	regB, err := client.Register(ctx, &coordv1.RegisterRequest{
-		NetworkId:     binaryNetworkID,
-		Token:         "testtoken",
-		Name:          "peer-b",
-		Ed25519Public: base64.StdEncoding.EncodeToString(append(make([]byte, 31), 0x01)),
-		X25519Public:  base64.StdEncoding.EncodeToString(append(make([]byte, 31), 0x01)),
-		Endpoint:      "10.0.0.2:51820",
-	})
+	idB, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate peer-b identity: %v", err)
+	}
+	regB, err := client.Register(ctx,
+		signedRegisterReq(t, idB, binaryNetworkID, "testtoken", "peer-b", "10.0.0.2:51820", nil))
 	if err != nil {
 		t.Fatalf("Register peer-b: %v", err)
 	}

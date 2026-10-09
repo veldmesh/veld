@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -16,6 +17,7 @@ import (
 
 	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
 	coordcore "github.com/veldmesh/veld/coord/core"
+	"github.com/veldmesh/veld/internal/crypto"
 )
 
 // watchLastSeenRefresh is how often an active Watch stream refreshes the
@@ -199,7 +201,27 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid ed25519_public")
 	}
+	if len(ed25519Bytes) != ed25519.PublicKeySize {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid ed25519_public")
+	}
 	peerID := hex.EncodeToString(ed25519Bytes)
+
+	// Proof of key possession: only the holder of the private key
+	// matching ed25519_public may register (or update) the peer whose
+	// ID is that key. The signature covers every field that names or
+	// addresses the peer plus a fresh timestamp, and this check runs
+	// before any registry write, so a rejected registration changes
+	// nothing.
+	if err := crypto.VerifyRegisterSignature(ed25519.PublicKey(ed25519Bytes), req.Signature, crypto.RegisterClaims{
+		NetworkID:     req.NetworkId,
+		Ed25519Public: req.Ed25519Public,
+		X25519Public:  req.X25519Public,
+		Endpoint:      req.Endpoint,
+		SubnetRoutes:  req.SubnetRoutes,
+		TimestampUnix: req.TimestampUnix,
+	}, time.Now().Unix()); err != nil {
+		return nil, status.Errorf(codes.Unauthenticated, "%v", err)
+	}
 
 	// Validate and policy-check each advertised subnet route.
 	var parsedRoutes []netip.Prefix

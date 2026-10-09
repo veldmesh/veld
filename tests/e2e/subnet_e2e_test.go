@@ -4,7 +4,6 @@ package e2e_test
 
 import (
 	"context"
-	"encoding/base64"
 	"net"
 	"net/netip"
 	"testing"
@@ -19,6 +18,7 @@ import (
 	coordcore "github.com/veldmesh/veld/coord/core"
 	coordce "github.com/veldmesh/veld/coord/ce"
 	coordserver "github.com/veldmesh/veld/coord/server"
+	"github.com/veldmesh/veld/internal/crypto"
 )
 
 // startSubnetCoordServer starts an in-process coord server and returns the
@@ -78,14 +78,12 @@ func TestSubnet_CE_Rejects(t *testing.T) {
 	defer teardown()
 
 	ctx := context.Background()
-	_, err := client.Register(ctx, &coordv1.RegisterRequest{
-		NetworkId:     "subnet-net",
-		Token:         "tok",
-		Name:          "router",
-		Ed25519Public: base64.StdEncoding.EncodeToString(make([]byte, 32)),
-		X25519Public:  base64.StdEncoding.EncodeToString(make([]byte, 32)),
-		SubnetRoutes:  []string{"192.168.1.0/24"},
-	})
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	_, err = client.Register(ctx,
+		signedRegisterReq(t, id, "subnet-net", "tok", "router", "", []string{"192.168.1.0/24"}))
 	if err == nil {
 		t.Fatal("expected error when advertising subnet routes on CE; got nil")
 	}
@@ -102,13 +100,12 @@ func TestSubnet_NoRoutes_Succeeds(t *testing.T) {
 	defer teardown()
 
 	ctx := context.Background()
-	resp, err := client.Register(ctx, &coordv1.RegisterRequest{
-		NetworkId:     "subnet-net",
-		Token:         "tok",
-		Name:          "peer",
-		Ed25519Public: base64.StdEncoding.EncodeToString(make([]byte, 32)),
-		X25519Public:  base64.StdEncoding.EncodeToString(make([]byte, 32)),
-	})
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	resp, err := client.Register(ctx,
+		signedRegisterReq(t, id, "subnet-net", "tok", "peer", "", nil))
 	if err != nil {
 		t.Fatalf("Register without subnet routes: %v", err)
 	}
@@ -124,14 +121,12 @@ func TestSubnet_InvalidCIDR(t *testing.T) {
 	defer teardown()
 
 	ctx := context.Background()
-	_, err := client.Register(ctx, &coordv1.RegisterRequest{
-		NetworkId:     "subnet-net",
-		Token:         "tok",
-		Name:          "bad",
-		Ed25519Public: base64.StdEncoding.EncodeToString(make([]byte, 32)),
-		X25519Public:  base64.StdEncoding.EncodeToString(make([]byte, 32)),
-		SubnetRoutes:  []string{"not-a-cidr"},
-	})
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	_, err = client.Register(ctx,
+		signedRegisterReq(t, id, "subnet-net", "tok", "bad", "", []string{"not-a-cidr"}))
 	if err == nil {
 		t.Fatal("expected error for malformed CIDR; got nil")
 	}
@@ -150,14 +145,12 @@ func TestSubnet_ListPeers_IncludesRoutes(t *testing.T) {
 	ctx := context.Background()
 
 	// Register a peer without subnet routes.
-	_, err := client.Register(ctx, &coordv1.RegisterRequest{
-		NetworkId:     "subnet-net",
-		Token:         "tok",
-		Name:          "p1",
-		Ed25519Public: base64.StdEncoding.EncodeToString(make([]byte, 32)),
-		X25519Public:  base64.StdEncoding.EncodeToString(make([]byte, 32)),
-	})
+	id, err := crypto.Generate()
 	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	if _, err := client.Register(ctx,
+		signedRegisterReq(t, id, "subnet-net", "tok", "p1", "", nil)); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -195,14 +188,13 @@ func TestSubnet_Watch_JOIN_CarriesRoutes(t *testing.T) {
 	}
 
 	// Register a peer (triggers a JOIN event on the watch stream).
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
 	go func() {
-		client.Register(ctx, &coordv1.RegisterRequest{ //nolint:errcheck
-			NetworkId:     "subnet-net",
-			Token:         "tok",
-			Name:          "watcher-peer",
-			Ed25519Public: base64.StdEncoding.EncodeToString(make([]byte, 32)),
-			X25519Public:  base64.StdEncoding.EncodeToString(make([]byte, 32)),
-		})
+		client.Register(ctx, //nolint:errcheck
+			signedRegisterReq(t, id, "subnet-net", "tok", "watcher-peer", "", nil))
 	}()
 
 	ev, err := watchStream.Recv()
