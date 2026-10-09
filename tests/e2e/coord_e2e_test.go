@@ -17,7 +17,34 @@ import (
 	coordcore "github.com/veldmesh/veld/coord/core"
 	"github.com/veldmesh/veld/coord/ce"
 	"github.com/veldmesh/veld/coord/server"
+	"github.com/veldmesh/veld/internal/crypto"
 )
+
+// signedRegisterReq builds a RegisterRequest presenting id's public keys
+// and signs it as proof of key possession, exactly like a real daemon does
+// — the coord server rejects an unsigned Register.
+func signedRegisterReq(t *testing.T, id *crypto.Identity, networkID, token, name, endpoint string, routes []string) *coordv1.RegisterRequest {
+	t.Helper()
+	req := &coordv1.RegisterRequest{
+		NetworkId:     networkID,
+		Token:         token,
+		Name:          name,
+		Ed25519Public: base64.StdEncoding.EncodeToString(id.Ed25519Public),
+		X25519Public:  base64.StdEncoding.EncodeToString(id.X25519Public[:]),
+		Endpoint:      endpoint,
+		SubnetRoutes:  routes,
+	}
+	req.TimestampUnix = time.Now().Unix()
+	req.Signature = crypto.SignRegister(id.Ed25519Private, crypto.RegisterClaims{
+		NetworkID:     req.NetworkId,
+		Ed25519Public: req.Ed25519Public,
+		X25519Public:  req.X25519Public,
+		Endpoint:      req.Endpoint,
+		SubnetRoutes:  req.SubnetRoutes,
+		TimestampUnix: req.TimestampUnix,
+	})
+	return req
+}
 
 func TestCoord_E2E(t *testing.T) {
 	// Start gRPC server on random port
@@ -73,37 +100,23 @@ func TestCoord_E2E(t *testing.T) {
 	client := coordv1.NewCoordClient(conn)
 
 	// Register first peer
-	ed25519Pub1 := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey1234567890"))
-	x25519Pub1 := base64.StdEncoding.EncodeToString([]byte("x25519pubkey12345678901"))
-
-	regReq1 := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub1,
-		X25519Public:  x25519Pub1,
-		Endpoint:      "192.168.1.1:51820",
+	idA, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate peer1 identity: %v", err)
 	}
-
-	regResp1, err := client.Register(context.Background(), regReq1)
+	regResp1, err := client.Register(context.Background(),
+		signedRegisterReq(t, idA, "test-net", "test-token", "peer1", "192.168.1.1:51820", nil))
 	if err != nil {
 		t.Fatalf("Register peer1: %v", err)
 	}
 
 	// Register second peer
-	ed25519Pub2 := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey2234567890"))
-	x25519Pub2 := base64.StdEncoding.EncodeToString([]byte("x25519pubkey22345678901"))
-
-	regReq2 := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer2",
-		Ed25519Public: ed25519Pub2,
-		X25519Public:  x25519Pub2,
-		Endpoint:      "192.168.1.2:51820",
+	idB, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate peer2 identity: %v", err)
 	}
-
-	regResp2, err := client.Register(context.Background(), regReq2)
+	regResp2, err := client.Register(context.Background(),
+		signedRegisterReq(t, idB, "test-net", "test-token", "peer2", "192.168.1.2:51820", nil))
 	if err != nil {
 		t.Fatalf("Register peer2: %v", err)
 	}
@@ -234,18 +247,12 @@ func TestCoord_E2E_Watch(t *testing.T) {
 	}
 
 	// Register a peer (should trigger JOIN event in Watch)
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey1234567890"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey12345678901"))
-
-	regReq := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
 	}
-
-	regResp, err := client.Register(context.Background(), regReq)
+	regResp, err := client.Register(context.Background(),
+		signedRegisterReq(t, id, "test-net", "test-token", "peer1", "", nil))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}

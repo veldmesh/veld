@@ -3,12 +3,17 @@
 package e2e_test
 
 import (
+	"context"
+	"encoding/base64"
 	"net"
 	"net/netip"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	coordce "github.com/veldmesh/veld/coord/ce"
 	coordcore "github.com/veldmesh/veld/coord/core"
@@ -262,4 +267,75 @@ func TestCoordClient_LeaveRemovesPeer(t *testing.T) {
 
 	cA.Stop()
 	cA.Wait()
+}
+
+// TestCoordClient_RegistersSigned proves end to end that the real coord
+// client — the same one internal/daemon wires to the machine's Ed25519
+// identity — registers with a valid proof of key possession: its
+// registration succeeds against a coord server that rejects unsigned
+// registrations, while an otherwise identical unsigned raw Register on the
+// same server is rejected with codes.Unauthenticated.
+func TestCoordClient_RegistersSigned(t *testing.T) {
+	cidr := netip.MustParsePrefix("10.52.0.0/24")
+	serverAddr, stopServer := startCoordServer(t, "e2e-signed", cidr)
+	defer stopServer()
+
+	// The real client registers and receives a VPN address: since the
+	// server requires a valid signature, success itself proves the client
+	// signed with the machine's Ed25519 key.
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	c := coord.New(coord.Config{
+		ServerAddr:  serverAddr,
+		NetworkID:   "e2e-signed",
+		Token:       "e2e-token",
+		Identity:    id,
+		LocalName:   "signed-node",
+		PeerTable:   peer.New(),
+		TLSInsecure: true,
+	})
+	c.Start()
+	defer func() { c.Stop(); c.Wait() }()
+
+	if !pollUntil(5*time.Second, func() bool { return c.VPNAddr().IsValid() }) {
+		t.Fatal("timeout: client did not register against the signature-enforcing coord server")
+	}
+
+	// An unsigned raw Register is rejected by the same server.
+	conn, err := grpc.NewClient(serverAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer conn.Close()
+	raw := coordv1.NewCoordClient(conn)
+
+	other, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("Generate other identity: %v", err)
+	}
+	_, err = raw.Register(context.Background(), &coordv1.RegisterRequest{
+		NetworkId:     "e2e-signed",
+		Token:         "e2e-token",
+		Name:          "unsigned-node",
+		Ed25519Public: base64.StdEncoding.EncodeToString(other.Ed25519Public),
+		X25519Public:  base64.StdEncoding.EncodeToString(other.X25519Public[:]),
+	})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("unsigned Register: got %v, want code %s", err, codes.Unauthenticated)
+	}
+
+	// The registry still holds exactly the signed client's peer.
+	list, err := raw.ListPeers(context.Background(), &coordv1.ListPeersRequest{
+		NetworkId: "e2e-signed",
+		Token:     "e2e-token",
+	})
+	if err != nil {
+		t.Fatalf("ListPeers: %v", err)
+	}
+	if len(list.Peers) != 1 || list.Peers[0].Name != "signed-node" {
+		t.Fatalf("ListPeers: got %+v, want only the signed client", list.Peers)
+	}
 }

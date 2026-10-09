@@ -134,14 +134,7 @@ func TestClient_SeedsPeerTable(t *testing.T) {
 	rawClient := coordv1.NewCoordClient(grpcConn)
 
 	idB, _ := crypto.Generate()
-	_, err = rawClient.Register(context.Background(), &coordv1.RegisterRequest{
-		NetworkId:     "net-test",
-		Token:         "tok",
-		Name:          "peer-B",
-		Ed25519Public: base64.StdEncoding.EncodeToString(idB.Ed25519Public),
-		X25519Public:  base64.StdEncoding.EncodeToString(idB.X25519Public[:]),
-		Endpoint:      "1.2.3.4:51820",
-	})
+	_, err = rawClient.Register(context.Background(), signedRegisterReq(t, idB, "net-test", "tok", "peer-B", "1.2.3.4:51820"))
 	if err != nil {
 		t.Fatalf("Register B: %v", err)
 	}
@@ -209,14 +202,7 @@ func TestClient_WatchJoin_UpdatesPeerTable(t *testing.T) {
 	rawClient := coordv1.NewCoordClient(grpcConn)
 
 	idB, _ := crypto.Generate()
-	_, err = rawClient.Register(context.Background(), &coordv1.RegisterRequest{
-		NetworkId:     "net-test",
-		Token:         "tok",
-		Name:          "peer-B",
-		Ed25519Public: base64.StdEncoding.EncodeToString(idB.Ed25519Public),
-		X25519Public:  base64.StdEncoding.EncodeToString(idB.X25519Public[:]),
-		Endpoint:      "5.5.5.5:51820",
-	})
+	_, err = rawClient.Register(context.Background(), signedRegisterReq(t, idB, "net-test", "tok", "peer-B", "5.5.5.5:51820"))
 	if err != nil {
 		t.Fatalf("Register B: %v", err)
 	}
@@ -247,13 +233,7 @@ func TestClient_WatchLeave_RemovesPeerFromTable(t *testing.T) {
 
 	// Register peer B directly.
 	idB, _ := crypto.Generate()
-	regResp, err := rawClient.Register(context.Background(), &coordv1.RegisterRequest{
-		NetworkId:     "net-test",
-		Token:         "tok",
-		Name:          "peer-B",
-		Ed25519Public: base64.StdEncoding.EncodeToString(idB.Ed25519Public),
-		X25519Public:  base64.StdEncoding.EncodeToString(idB.X25519Public[:]),
-	})
+	regResp, err := rawClient.Register(context.Background(), signedRegisterReq(t, idB, "net-test", "tok", "peer-B", ""))
 	if err != nil {
 		t.Fatalf("Register B: %v", err)
 	}
@@ -464,4 +444,29 @@ func TestClient_Idempotent_Reregistration(t *testing.T) {
 
 	c1.Stop(); c1.Wait()
 	c2.Stop(); c2.Wait()
+}
+
+// signedRegisterReq builds a RegisterRequest presenting id's public keys
+// and signs it as proof of key possession, exactly like the coord client
+// does for the local daemon.
+func signedRegisterReq(t *testing.T, id *crypto.Identity, networkID, token, name, endpoint string) *coordv1.RegisterRequest {
+	t.Helper()
+	req := &coordv1.RegisterRequest{
+		NetworkId:     networkID,
+		Token:         token,
+		Name:          name,
+		Ed25519Public: base64.StdEncoding.EncodeToString(id.Ed25519Public),
+		X25519Public:  base64.StdEncoding.EncodeToString(id.X25519Public[:]),
+		Endpoint:      endpoint,
+	}
+	req.TimestampUnix = time.Now().Unix()
+	req.Signature = crypto.SignRegister(id.Ed25519Private, crypto.RegisterClaims{
+		NetworkID:     req.NetworkId,
+		Ed25519Public: req.Ed25519Public,
+		X25519Public:  req.X25519Public,
+		Endpoint:      req.Endpoint,
+		SubnetRoutes:  req.SubnetRoutes,
+		TimestampUnix: req.TimestampUnix,
+	})
+	return req
 }

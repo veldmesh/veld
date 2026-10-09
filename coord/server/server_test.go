@@ -19,6 +19,7 @@ import (
 	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
 	coordcore "github.com/veldmesh/veld/coord/core"
 	"github.com/veldmesh/veld/coord/ce"
+	"github.com/veldmesh/veld/internal/crypto"
 )
 
 // fakeWatchStream implements coordv1.Coord_WatchServer for testing.
@@ -75,21 +76,69 @@ func testServer(t *testing.T) (*Server, *Registry) {
 	return New(reg, bus, enforcer, accounts, audit, subnet, hooks), reg
 }
 
+// --- Register proof of key possession test helpers ---
+
+// newRegisterIdentity generates a fresh identity for a peer registration.
+func newRegisterIdentity(t *testing.T) *crypto.Identity {
+	t.Helper()
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	return id
+}
+
+// registerClaimsFor builds the signed-message claims matching req.
+func registerClaimsFor(req *coordv1.RegisterRequest) crypto.RegisterClaims {
+	return crypto.RegisterClaims{
+		NetworkID:     req.NetworkId,
+		Ed25519Public: req.Ed25519Public,
+		X25519Public:  req.X25519Public,
+		Endpoint:      req.Endpoint,
+		SubnetRoutes:  req.SubnetRoutes,
+		TimestampUnix: req.TimestampUnix,
+	}
+}
+
+// signRegisterReq stamps and signs req in place with the identity's Ed25519
+// private key, exactly like the coord client does.
+func signRegisterReq(t *testing.T, id *crypto.Identity, req *coordv1.RegisterRequest) {
+	t.Helper()
+	req.TimestampUnix = time.Now().Unix()
+	req.Signature = crypto.SignRegister(id.Ed25519Private, registerClaimsFor(req))
+}
+
+// newRegisterRequest builds an unsigned RegisterRequest presenting id's
+// public keys.
+func newRegisterRequest(id *crypto.Identity, networkID, token, name, endpoint string, routes []string) *coordv1.RegisterRequest {
+	return &coordv1.RegisterRequest{
+		NetworkId:     networkID,
+		Token:         token,
+		Name:          name,
+		Ed25519Public: base64.StdEncoding.EncodeToString(id.Ed25519Public),
+		X25519Public:  base64.StdEncoding.EncodeToString(id.X25519Public[:]),
+		Endpoint:      endpoint,
+		SubnetRoutes:  routes,
+	}
+}
+
+// mustRegister registers req through the RPC and fails the test on error.
+func mustRegister(t *testing.T, srv *Server, req *coordv1.RegisterRequest) *coordv1.RegisterResponse {
+	t.Helper()
+	resp, err := srv.Register(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Register %s: %v", req.Name, err)
+	}
+	return resp
+}
+
 func TestServer_Register_OK(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey123"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey123"))
-
-	req := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-		Endpoint:      "192.168.1.1:51820",
-	}
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, "test-net", "test-token", "peer1", "192.168.1.1:51820", nil)
+	signRegisterReq(t, id, req)
 
 	resp, err := srv.Register(context.Background(), req)
 	if err != nil {
@@ -110,22 +159,20 @@ func TestServer_Register_OK(t *testing.T) {
 	if resp.NetworkId != "test-net" {
 		t.Errorf("NetworkId mismatch: got %s, want test-net", resp.NetworkId)
 	}
+
+	// The peer ID is the presented Ed25519 public key.
+	if resp.PeerId != hex.EncodeToString(id.Ed25519Public) {
+		t.Errorf("PeerId mismatch: got %s, want %s", resp.PeerId, hex.EncodeToString(id.Ed25519Public))
+	}
 }
 
 func TestServer_Register_InvalidToken(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey123"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey123"))
-
-	req := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "bad-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-	}
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, "test-net", "bad-token", "peer1", "", nil)
+	signRegisterReq(t, id, req)
 
 	_, err := srv.Register(context.Background(), req)
 	if err == nil {
@@ -137,16 +184,9 @@ func TestServer_Register_NetworkNotFound(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey123"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey123"))
-
-	req := &coordv1.RegisterRequest{
-		NetworkId:     "nonexistent-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-	}
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, "nonexistent-net", "test-token", "peer1", "", nil)
+	signRegisterReq(t, id, req)
 
 	_, err := srv.Register(context.Background(), req)
 	if err == nil {
@@ -160,16 +200,9 @@ func TestServer_Register_MachineLimit(t *testing.T) {
 
 	// Register 5 peers (free limit is 5)
 	for i := 0; i < 5; i++ {
-		ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey" + string(rune('0'+i))))
-		x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey" + string(rune('0'+i))))
-
-		req := &coordv1.RegisterRequest{
-			NetworkId:     "test-net",
-			Token:         "test-token",
-			Name:          "peer" + string(rune('1'+i)),
-			Ed25519Public: ed25519Pub,
-			X25519Public:  x25519Pub,
-		}
+		id := newRegisterIdentity(t)
+		req := newRegisterRequest(id, "test-net", "test-token", fmt.Sprintf("peer%d", i+1), "", nil)
+		signRegisterReq(t, id, req)
 
 		if _, err := srv.Register(context.Background(), req); err != nil {
 			t.Fatalf("Register peer %d: %v", i+1, err)
@@ -177,16 +210,9 @@ func TestServer_Register_MachineLimit(t *testing.T) {
 	}
 
 	// 6th registration should fail
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey5"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey5"))
-
-	req := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer6",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-	}
+	sixth := newRegisterIdentity(t)
+	req := newRegisterRequest(sixth, "test-net", "test-token", "peer6", "", nil)
+	signRegisterReq(t, sixth, req)
 
 	_, err := srv.Register(context.Background(), req)
 	if err == nil {
@@ -200,16 +226,9 @@ func TestServer_ListPeers_OK(t *testing.T) {
 
 	// Register 2 peers
 	for i := 0; i < 2; i++ {
-		ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey" + string(rune('0'+i))))
-		x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey" + string(rune('0'+i))))
-
-		req := &coordv1.RegisterRequest{
-			NetworkId:     "test-net",
-			Token:         "test-token",
-			Name:          "peer" + string(rune('1'+i)),
-			Ed25519Public: ed25519Pub,
-			X25519Public:  x25519Pub,
-		}
+		id := newRegisterIdentity(t)
+		req := newRegisterRequest(id, "test-net", "test-token", fmt.Sprintf("peer%d", i+1), "", nil)
+		signRegisterReq(t, id, req)
 
 		if _, err := srv.Register(context.Background(), req); err != nil {
 			t.Fatalf("Register: %v", err)
@@ -231,9 +250,15 @@ func TestServer_ListPeers_OK(t *testing.T) {
 		t.Errorf("ListPeers: got %d peers, want 2", len(resp.Peers))
 	}
 
-	for i, peer := range resp.Peers {
-		if peer.Name != "peer"+string(rune('1'+i)) {
-			t.Errorf("Peer %d name: got %s, want peer%d", i, peer.Name, 1+i)
+	// Peer IDs are Ed25519 keys, so bucket order is not registration
+	// order: assert the exact set of names instead.
+	names := make(map[string]bool, len(resp.Peers))
+	for _, peer := range resp.Peers {
+		names[peer.Name] = true
+	}
+	for _, want := range []string{"peer1", "peer2"} {
+		if !names[want] {
+			t.Errorf("ListPeers: missing peer %s, got %v", want, names)
 		}
 	}
 }
@@ -258,16 +283,9 @@ func TestServer_Leave_OK(t *testing.T) {
 	defer reg.Close()
 
 	// Register a peer
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey123"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey123"))
-
-	regReq := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-	}
+	id := newRegisterIdentity(t)
+	regReq := newRegisterRequest(id, "test-net", "test-token", "peer1", "", nil)
+	signRegisterReq(t, id, regReq)
 
 	regResp, err := srv.Register(context.Background(), regReq)
 	if err != nil {
@@ -323,18 +341,13 @@ func TestServer_SendSignal_OK(t *testing.T) {
 	// Signals are scoped to registered peers, so register two first.
 	var ids [2]string
 	for i := 0; i < 2; i++ {
-		ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey" + string(rune('0'+i))))
-		x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey" + string(rune('0'+i))))
+		id := newRegisterIdentity(t)
+		req := newRegisterRequest(id, "test-net", "test-token", fmt.Sprintf("peer%d", i+1), "", nil)
+		signRegisterReq(t, id, req)
 
-		resp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
-			NetworkId:     "test-net",
-			Token:         "test-token",
-			Name:          "peer" + string(rune('1'+i)),
-			Ed25519Public: ed25519Pub,
-			X25519Public:  x25519Pub,
-		})
+		resp, err := srv.Register(context.Background(), req)
 		if err != nil {
-			t.Fatalf("Register peer %d: %v", i, err)
+			t.Fatalf("Register peer %d: %v", i+1, err)
 		}
 		ids[i] = resp.PeerId
 	}
@@ -428,16 +441,9 @@ func TestServer_Watch_ReceivesJoinEvent(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Register a peer (this should trigger a JOIN event)
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey123"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey123"))
-
-	regReq := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-	}
+	id := newRegisterIdentity(t)
+	regReq := newRegisterRequest(id, "test-net", "test-token", "peer1", "", nil)
+	signRegisterReq(t, id, regReq)
 
 	_, err := srv.Register(context.Background(), regReq)
 	if err != nil {
@@ -476,16 +482,11 @@ func TestServer_Watch_ReceivesLeaveEvent(t *testing.T) {
 	defer reg.Close()
 
 	// Register a peer first.
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey123"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey123"))
+	id := newRegisterIdentity(t)
+	regReq := newRegisterRequest(id, "test-net", "test-token", "peer1", "", nil)
+	signRegisterReq(t, id, regReq)
 
-	regResp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-	})
+	regResp, err := srv.Register(context.Background(), regReq)
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -543,18 +544,12 @@ func TestServer_Watch_ReceivesEndpointUpdate(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey123"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey123"))
+	id := newRegisterIdentity(t)
 
 	// First registration.
-	regResp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-		Endpoint:      "1.2.3.4:51820",
-	})
+	firstReq := newRegisterRequest(id, "test-net", "test-token", "peer1", "1.2.3.4:51820", nil)
+	signRegisterReq(t, id, firstReq)
+	regResp, err := srv.Register(context.Background(), firstReq)
 	if err != nil {
 		t.Fatalf("first Register: %v", err)
 	}
@@ -572,14 +567,9 @@ func TestServer_Watch_ReceivesEndpointUpdate(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Re-register with a different endpoint.
-	_, err = srv.Register(context.Background(), &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-		Endpoint:      "9.8.7.6:51820",
-	})
+	secondReq := newRegisterRequest(id, "test-net", "test-token", "peer1", "9.8.7.6:51820", nil)
+	signRegisterReq(t, id, secondReq)
+	_, err = srv.Register(context.Background(), secondReq)
 	if err != nil {
 		t.Fatalf("second Register: %v", err)
 	}
@@ -625,15 +615,14 @@ func TestServer_Register_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ed25519Pub := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("ed25519pubkey%02d", i)))
-			x25519Pub := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("x25519pubkey%02d", i)))
-			_, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
-				NetworkId:     "test-net",
-				Token:         "test-token",
-				Name:          fmt.Sprintf("peer%d", i),
-				Ed25519Public: ed25519Pub,
-				X25519Public:  x25519Pub,
-			})
+			id, err := crypto.Generate()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			req := newRegisterRequest(id, "test-net", "test-token", fmt.Sprintf("peer%d", i), "", nil)
+			signRegisterReq(t, id, req)
+			_, err = srv.Register(context.Background(), req)
 			errCh <- err
 		}()
 	}
@@ -663,16 +652,9 @@ func TestServer_Register_Idempotent(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkeyXX"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkeyXX"))
-
-	req := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "idempotent-peer",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-	}
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, "test-net", "test-token", "idempotent-peer", "", nil)
+	signRegisterReq(t, id, req)
 
 	resp1, err := srv.Register(context.Background(), req)
 	if err != nil {
@@ -692,12 +674,6 @@ func TestServer_Register_Idempotent(t *testing.T) {
 	}
 }
 
-// scopedKeyB64 base64-encodes test key material, the wire form the coord
-// API uses for public keys.
-func scopedKeyB64(material string) string {
-	return base64.StdEncoding.EncodeToString([]byte(material))
-}
-
 // scopedFixture is a Server wired for per-account scoping tests: account A
 // ("acc-a", token "token-a") owns netA and netA2, account B ("acc-b", token
 // "token-b") owns netB, and seed peers are registered in each network.
@@ -713,6 +689,11 @@ type scopedFixture struct {
 	peerA2 string // peer in netA  (account A)
 	peerA3 string // peer in netA2 (account A)
 	peerB1 string // peer in netB  (account B)
+	idA1   *crypto.Identity // identity behind peerA1
+
+	// newPeerID carries the peer ID registered by the most recent call
+	// row so its check can assert on it.
+	newPeerID string
 
 	// watched holds the events collected by the most recent watch helper
 	// call so a table row's check can assert on them.
@@ -756,29 +737,26 @@ func newScopedFixture(t *testing.T) *scopedFixture {
 		tokenA: "token-a",
 		tokenB: "token-b",
 	}
-	f.peerA1 = scopedRegister(t, f, f.netA, f.tokenA, "peer-a1", "peer-a1-ed25519", "peer-a1-x25519", "1.1.1.1:1111")
-	f.peerA2 = scopedRegister(t, f, f.netA, f.tokenA, "peer-a2", "peer-a2-ed25519", "peer-a2-x25519", "")
-	f.peerA3 = scopedRegister(t, f, f.netA2, f.tokenA, "peer-a3", "peer-a3-ed25519", "peer-a3-x25519", "")
-	f.peerB1 = scopedRegister(t, f, f.netB, f.tokenB, "peer-b1", "peer-b1-ed25519", "peer-b1-x25519", "")
+	f.peerA1, f.idA1 = scopedRegister(t, f, f.netA, f.tokenA, "peer-a1", "1.1.1.1:1111")
+	f.peerA2, _ = scopedRegister(t, f, f.netA, f.tokenA, "peer-a2", "")
+	f.peerA3, _ = scopedRegister(t, f, f.netA2, f.tokenA, "peer-a3", "")
+	f.peerB1, _ = scopedRegister(t, f, f.netB, f.tokenB, "peer-b1", "")
 	return f
 }
 
-// scopedRegister registers a peer through the Register RPC and returns the
-// assigned peer ID (hex of the Ed25519 key material).
-func scopedRegister(t *testing.T, f *scopedFixture, networkID, token, name, ed25519Mat, x25519Mat, endpoint string) string {
+// scopedRegister registers a peer through the Register RPC — generating a
+// fresh identity and signing the proof of possession like a real daemon —
+// and returns the assigned peer ID and the identity behind it.
+func scopedRegister(t *testing.T, f *scopedFixture, networkID, token, name, endpoint string) (string, *crypto.Identity) {
 	t.Helper()
-	resp, err := f.srv.Register(context.Background(), &coordv1.RegisterRequest{
-		NetworkId:     networkID,
-		Token:         token,
-		Name:          name,
-		Ed25519Public: scopedKeyB64(ed25519Mat),
-		X25519Public:  scopedKeyB64(x25519Mat),
-		Endpoint:      endpoint,
-	})
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, networkID, token, name, endpoint, nil)
+	signRegisterReq(t, id, req)
+	resp, err := f.srv.Register(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Register %s into %s: %v", name, networkID, err)
 	}
-	return resp.PeerId
+	return resp.PeerId, id
 }
 
 // scopedWatch runs a Watch stream for req to completion (stopping it after
@@ -883,13 +861,10 @@ func TestServer_PerAccountScoping(t *testing.T) {
 		{
 			name: "Register into another account's network",
 			call: func(t *testing.T, f *scopedFixture) error {
-				_, err := f.srv.Register(context.Background(), &coordv1.RegisterRequest{
-					NetworkId:     f.netA,
-					Token:         f.tokenB,
-					Name:          "b-new-peer",
-					Ed25519Public: scopedKeyB64("b-new-peer-ed25519"),
-					X25519Public:  scopedKeyB64("b-new-peer-x25519"),
-				})
+				id := newRegisterIdentity(t)
+				req := newRegisterRequest(id, f.netA, f.tokenB, "b-new-peer", "", nil)
+				signRegisterReq(t, id, req)
+				_, err := f.srv.Register(context.Background(), req)
 				return err
 			},
 			check: func(t *testing.T, f *scopedFixture) {
@@ -1016,17 +991,15 @@ func TestServer_PerAccountScoping(t *testing.T) {
 		{
 			name: "Register into own network succeeds",
 			call: func(t *testing.T, f *scopedFixture) error {
-				_, err := f.srv.Register(context.Background(), &coordv1.RegisterRequest{
-					NetworkId:     f.netB,
-					Token:         f.tokenB,
-					Name:          "b-second-peer",
-					Ed25519Public: scopedKeyB64("b-second-peer-ed25519"),
-					X25519Public:  scopedKeyB64("b-second-peer-x25519"),
-				})
+				id := newRegisterIdentity(t)
+				f.newPeerID = hex.EncodeToString(id.Ed25519Public)
+				req := newRegisterRequest(id, f.netB, f.tokenB, "b-second-peer", "", nil)
+				signRegisterReq(t, id, req)
+				_, err := f.srv.Register(context.Background(), req)
 				return err
 			},
 			check: func(t *testing.T, f *scopedFixture) {
-				assertNetworkPeers(t, f, f.tokenB, f.netB, f.peerB1, hex.EncodeToString([]byte("b-second-peer-ed25519")))
+				assertNetworkPeers(t, f, f.tokenB, f.netB, f.peerB1, f.newPeerID)
 				assertMachineCount(t, f, f.netB, 2)
 			},
 			wantCode: codes.OK,
@@ -1124,7 +1097,10 @@ func TestServer_PerAccountScoping(t *testing.T) {
 // peer ID (the Ed25519 public key) already registered in one network cannot
 // be registered into another network: the attempt is rejected with
 // codes.AlreadyExists and the existing registration, network membership and
-// endpoint are left untouched.
+// endpoint are left untouched. The request is signed by the key's true
+// holder — a forged attempt never gets this far (it is rejected as an
+// invalid proof of key possession) — so this exercises the registry's
+// global peer-ID namespace, not the signature check.
 func TestServer_Register_PeerIDAlreadyRegisteredElsewhere(t *testing.T) {
 	f := newScopedFixture(t)
 
@@ -1133,17 +1109,12 @@ func TestServer_Register_PeerIDAlreadyRegisteredElsewhere(t *testing.T) {
 		t.Fatalf("GetPeer before: %v", err)
 	}
 
-	// Account B registers account A's Ed25519 public key into B's own
-	// network while A's watcher is connected.
+	// The holder of A's key registers it into B's own network while B's
+	// watcher is connected.
 	events := f.watchDuring(t, f.tokenB, f.netB, f.peerB1, func() {
-		_, err = f.srv.Register(context.Background(), &coordv1.RegisterRequest{
-			NetworkId:     f.netB,
-			Token:         f.tokenB,
-			Name:          "b-clone",
-			Ed25519Public: scopedKeyB64("peer-a1-ed25519"),
-			X25519Public:  scopedKeyB64("b-clone-x25519"),
-			Endpoint:      "9.9.9.9:9999",
-		})
+		req := newRegisterRequest(f.idA1, f.netB, f.tokenB, "b-clone", "9.9.9.9:9999", nil)
+		signRegisterReq(t, f.idA1, req)
+		_, err = f.srv.Register(context.Background(), req)
 	})
 	if status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("Register: got %v, want code %s", err, codes.AlreadyExists)
@@ -1196,17 +1167,19 @@ func TestServer_Register_PeerIDAlreadyRegisteredElsewhere(t *testing.T) {
 // TestServer_Register_X25519MismatchOnReregistration verifies that a
 // same-network re-registration presenting a different X25519 public key
 // than the stored one is rejected with codes.AlreadyExists and the stored
-// key is kept. Re-registering with the same key stays idempotent.
+// key is kept. The request is signed by the peer's real Ed25519 key — key
+// rotation needs a signed handover flow (a planned follow-up), so even the
+// key holder cannot swap the X25519 key this way. Re-registering with the
+// same keys stays idempotent.
 func TestServer_Register_X25519MismatchOnReregistration(t *testing.T) {
 	f := newScopedFixture(t)
 
-	_, err := f.srv.Register(context.Background(), &coordv1.RegisterRequest{
-		NetworkId:     f.netA,
-		Token:         f.tokenA,
-		Name:          "peer-a1-rotated",
-		Ed25519Public: scopedKeyB64("peer-a1-ed25519"),
-		X25519Public:  scopedKeyB64("peer-a1-rotated-x25519"),
-	})
+	rotated := newRegisterIdentity(t) // source of an alternative X25519 key
+	req := newRegisterRequest(f.idA1, f.netA, f.tokenA, "peer-a1-rotated", "", nil)
+	req.X25519Public = base64.StdEncoding.EncodeToString(rotated.X25519Public[:])
+	signRegisterReq(t, f.idA1, req)
+
+	_, err := f.srv.Register(context.Background(), req)
 	if status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("Register with rotated X25519: got %v, want code %s", err, codes.AlreadyExists)
 	}
@@ -1215,7 +1188,7 @@ func TestServer_Register_X25519MismatchOnReregistration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPeer: %v", err)
 	}
-	if rec.X25519Public != scopedKeyB64("peer-a1-x25519") {
+	if rec.X25519Public != base64.StdEncoding.EncodeToString(f.idA1.X25519Public[:]) {
 		t.Errorf("stored X25519 key: got %q, want the original", rec.X25519Public)
 	}
 	if rec.Name == "peer-a1-rotated" {
@@ -1223,13 +1196,9 @@ func TestServer_Register_X25519MismatchOnReregistration(t *testing.T) {
 	}
 
 	// Re-registering with the same keys stays idempotent and keeps working.
-	if _, err := f.srv.Register(context.Background(), &coordv1.RegisterRequest{
-		NetworkId:     f.netA,
-		Token:         f.tokenA,
-		Name:          "peer-a1-renamed",
-		Ed25519Public: scopedKeyB64("peer-a1-ed25519"),
-		X25519Public:  scopedKeyB64("peer-a1-x25519"),
-	}); err != nil {
+	renamed := newRegisterRequest(f.idA1, f.netA, f.tokenA, "peer-a1-renamed", "", nil)
+	signRegisterReq(t, f.idA1, renamed)
+	if _, err := f.srv.Register(context.Background(), renamed); err != nil {
 		t.Fatalf("idempotent re-registration: %v", err)
 	}
 	rec, err = f.reg.GetPeer(f.peerA1)
@@ -1238,5 +1207,166 @@ func TestServer_Register_X25519MismatchOnReregistration(t *testing.T) {
 	}
 	if rec.Name != "peer-a1-renamed" {
 		t.Errorf("idempotent re-registration did not update the name: got %q", rec.Name)
+	}
+}
+
+// newSignatureFixture builds a server with two networks owned by one
+// account (net-a, net-a2) and no registered peers, so a rejected
+// registration is observable as "nothing changed". net-a2 exists so a
+// signature bound to net-a can be replayed against another network of the
+// same account — the proof must still fail.
+func newSignatureFixture(t *testing.T) (*Server, *Registry) {
+	t.Helper()
+	reg, err := NewRegistry(t.TempDir() + "/sig.db")
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+	for _, n := range []struct{ id, cidr string }{
+		{"net-a", "10.99.0.0/24"},
+		{"net-a2", "10.99.2.0/24"},
+	} {
+		cidr := netip.MustParsePrefix(n.cidr)
+		if err := reg.CreateNetwork(coordcore.Network{ID: n.id, CIDR: cidr, Name: n.id}, "acc-a"); err != nil {
+			t.Fatalf("CreateNetwork %s: %v", n.id, err)
+		}
+	}
+	accounts := ce.NewTokenAccountStore(map[string]coordcore.Account{
+		"token-a": {ID: "acc-a", Tier: coordcore.TierFree},
+	})
+	return New(reg, NewBus(), ce.NewFreeEnforcer(), accounts, ce.NewNoopAuditLogger(), ce.NewRejectSubnetPolicy(), ce.NewNoopHooks()), reg
+}
+
+// assertRegisterChangedNothing fails unless a rejected registration left
+// the registry exactly as it was: no peer record, no machine count, no
+// endpoint, and the network's address space untouched.
+func assertRegisterChangedNothing(t *testing.T, reg *Registry, networkID, peerID string) {
+	t.Helper()
+	if peers, err := reg.ListPeers(networkID); err != nil {
+		t.Fatalf("ListPeers %s: %v", networkID, err)
+	} else if len(peers) != 0 {
+		t.Errorf("rejected registration left %d peer(s): %+v", len(peers), peers)
+	}
+	if count, err := reg.NetworkMachineCount(networkID); err != nil {
+		t.Fatalf("NetworkMachineCount %s: %v", networkID, err)
+	} else if count != 0 {
+		t.Errorf("rejected registration changed machine count: got %d, want 0", count)
+	}
+	if _, err := reg.GetPeer(peerID); err == nil {
+		t.Errorf("rejected registration created a record for peer %s", peerID)
+	}
+}
+
+// TestServer_Register_RequiresProofOfKeyPossession verifies that only the
+// holder of the Ed25519 private key matching ed25519_public can register:
+// a valid signature is accepted, while a missing, garbage, wrong-key or
+// field-tampered signature and a stale or future timestamp are rejected
+// with codes.Unauthenticated — every time before anything is written, so
+// the registry is left unchanged and the network's address space is not
+// consumed.
+func TestServer_Register_RequiresProofOfKeyPossession(t *testing.T) {
+	srv, reg := newSignatureFixture(t)
+
+	now := time.Now().Unix()
+	rows := []struct {
+		name     string
+		mutate   func(t *testing.T, req *coordv1.RegisterRequest, id *crypto.Identity)
+		wantCode codes.Code
+	}{
+		{"missing signature", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.Signature = nil
+		}, codes.Unauthenticated},
+		{"empty signature", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.Signature = []byte{}
+		}, codes.Unauthenticated},
+		{"garbage signature", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.Signature = make([]byte, 64)
+		}, codes.Unauthenticated},
+		{"signature by a different key", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			other := newRegisterIdentity(t)
+			req.Signature = crypto.SignRegister(other.Ed25519Private, registerClaimsFor(req))
+		}, codes.Unauthenticated},
+		{"tampered network_id (replayed against another network of the same account)", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.NetworkId = "net-a2"
+		}, codes.Unauthenticated},
+		{"tampered ed25519_public", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			other := newRegisterIdentity(t)
+			req.Ed25519Public = base64.StdEncoding.EncodeToString(other.Ed25519Public)
+		}, codes.Unauthenticated},
+		{"tampered x25519_public", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			other := newRegisterIdentity(t)
+			req.X25519Public = base64.StdEncoding.EncodeToString(other.X25519Public[:])
+		}, codes.Unauthenticated},
+		{"tampered endpoint", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.Endpoint = "9.9.9.9:9999"
+		}, codes.Unauthenticated},
+		{"tampered subnet_routes", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.SubnetRoutes = append(req.SubnetRoutes, "10.99.9.0/24")
+		}, codes.Unauthenticated},
+		{"tampered timestamp", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.TimestampUnix++
+		}, codes.Unauthenticated},
+		{"stale timestamp (121 s old)", func(t *testing.T, req *coordv1.RegisterRequest, id *crypto.Identity) {
+			req.TimestampUnix = now - 121
+			req.Signature = crypto.SignRegister(id.Ed25519Private, registerClaimsFor(req))
+		}, codes.Unauthenticated},
+		{"future timestamp (121 s ahead)", func(t *testing.T, req *coordv1.RegisterRequest, id *crypto.Identity) {
+			req.TimestampUnix = now + 121
+			req.Signature = crypto.SignRegister(id.Ed25519Private, registerClaimsFor(req))
+		}, codes.Unauthenticated},
+		{"malformed ed25519_public (not 32 bytes)", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.Ed25519Public = base64.StdEncoding.EncodeToString([]byte("not-a-key"))
+		}, codes.InvalidArgument},
+	}
+
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			id := newRegisterIdentity(t)
+			req := newRegisterRequest(id, "net-a", "token-a", "sig-peer", "1.2.3.4:51820", nil)
+			signRegisterReq(t, id, req)
+			row.mutate(t, req, id)
+
+			_, err := srv.Register(context.Background(), req)
+			if status.Code(err) != row.wantCode {
+				t.Fatalf("Register: got %v (code %s), want code %s", err, status.Code(err), row.wantCode)
+			}
+			if row.wantCode != codes.OK {
+				assertRegisterChangedNothing(t, reg, "net-a", hex.EncodeToString(id.Ed25519Public))
+			}
+		})
+	}
+
+	// After all rejections, the first valid registration still gets the
+	// network's first address: no rejected request wrote a record or
+	// consumed an address.
+	id := newRegisterIdentity(t)
+	valid := newRegisterRequest(id, "net-a", "token-a", "first-valid", "1.2.3.4:51820", nil)
+	signRegisterReq(t, id, valid)
+	resp := mustRegister(t, srv, valid)
+	if resp.VpnAddr != "10.99.0.1" {
+		t.Errorf("first valid registration: got VPN address %q, want 10.99.0.1", resp.VpnAddr)
+	}
+	if resp.PeerId != hex.EncodeToString(id.Ed25519Public) {
+		t.Errorf("peer ID: got %q, want hex of the presented Ed25519 key", resp.PeerId)
+	}
+}
+
+// TestServer_Register_TimestampWindowEdge verifies a signature dated 60 s
+// ago (inside the ±120 s window) is still accepted: the window must
+// tolerate ordinary clock skew, not just perfectly synchronized clocks.
+func TestServer_Register_TimestampWindowEdge(t *testing.T) {
+	srv, _ := newSignatureFixture(t)
+
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, "net-a", "token-a", "skewed-clock", "1.2.3.4:51820", nil)
+	req.TimestampUnix = time.Now().Unix() - 60
+	req.Signature = crypto.SignRegister(id.Ed25519Private, registerClaimsFor(req))
+
+	resp, err := srv.Register(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Register with a 60 s old timestamp: %v", err)
+	}
+	if resp.VpnAddr != "10.99.0.1" {
+		t.Errorf("VPN address: got %q, want 10.99.0.1", resp.VpnAddr)
 	}
 }

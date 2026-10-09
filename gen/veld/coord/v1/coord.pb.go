@@ -66,7 +66,10 @@ func (x *Peer) GetX25519Public() string    { return x.X25519Public }
 func (x *Peer) GetEndpoint() string        { return x.Endpoint }
 func (x *Peer) GetSubnetRoutes() []string  { return x.SubnetRoutes }
 
-// RegisterRequest is sent by a daemon to join a network.
+// RegisterRequest is sent by a daemon to join a network. It must carry a
+// proof of key possession: timestamp_unix and signature hold an Ed25519
+// signature by the private key matching ed25519_public — see the Register
+// RPC in coord.proto for the signed message.
 type RegisterRequest struct {
 	NetworkId     string   `protobuf:"bytes,1,opt,name=network_id,json=networkId,proto3" json:"network_id,omitempty"`
 	Token         string   `protobuf:"bytes,2,opt,name=token,proto3" json:"token,omitempty"`
@@ -75,6 +78,8 @@ type RegisterRequest struct {
 	X25519Public  string   `protobuf:"bytes,5,opt,name=x25519_public,json=x25519Public,proto3" json:"x25519_public,omitempty"`
 	Endpoint      string   `protobuf:"bytes,6,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
 	SubnetRoutes  []string `protobuf:"bytes,7,rep,name=subnet_routes,json=subnetRoutes,proto3" json:"subnet_routes,omitempty"`
+	TimestampUnix int64    `protobuf:"varint,8,opt,name=timestamp_unix,json=timestampUnix,proto3" json:"timestamp_unix,omitempty"`
+	Signature     []byte   `protobuf:"bytes,9,opt,name=signature,proto3" json:"signature,omitempty"`
 }
 
 func (x *RegisterRequest) Reset()         { *x = RegisterRequest{} }
@@ -88,6 +93,8 @@ func (x *RegisterRequest) GetEd25519Public() string { return x.Ed25519Public }
 func (x *RegisterRequest) GetX25519Public() string  { return x.X25519Public }
 func (x *RegisterRequest) GetEndpoint() string      { return x.Endpoint }
 func (x *RegisterRequest) GetSubnetRoutes() []string { return x.SubnetRoutes }
+func (x *RegisterRequest) GetTimestampUnix() int64  { return x.TimestampUnix }
+func (x *RegisterRequest) GetSignature() []byte      { return x.Signature }
 
 // RegisterResponse is returned after successful registration.
 type RegisterResponse struct {
