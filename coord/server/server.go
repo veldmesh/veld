@@ -129,6 +129,7 @@ func (s *Server) ExpelStalePeers(ctx context.Context, ttl time.Duration) (int, e
 			At:        time.Now(),
 		})
 
+		s.bus.DropPendingSignals(rec.ID)
 		s.bus.Publish(rec.NetworkID, &coordv1.PeerEvent{
 			Type: coordv1.EventType_LEAVE,
 			Peer: &coordv1.Peer{Id: rec.ID, Name: rec.Name},

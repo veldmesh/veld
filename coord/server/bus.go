@@ -101,12 +101,17 @@ func (b *Bus) SubscribeSignals(peerID string) <-chan signalMsg {
 	held := b.pending[peerID]
 	delete(b.pending, peerID)
 	cutoff := b.now().Add(-pendingSignalTTL)
+	deliver := make([]signalMsg, 0, len(held))
 	for _, p := range held {
 		if p.at.After(cutoff) {
-			ch <- p.msg // cannot block: len(held) <= maxPendingPerPeer < cap(ch)
+			deliver = append(deliver, p.msg)
 		}
 	}
 	b.mu.Unlock()
+	// No channel send under b.mu. Cannot block: len(deliver) <= maxPendingPerPeer < cap(ch).
+	for _, msg := range deliver {
+		ch <- msg
+	}
 	return ch
 }
 
@@ -155,7 +160,10 @@ func (b *Bus) holdLocked(msg signalMsg) {
 	now := b.now()
 	cutoff := now.Add(-pendingSignalTTL)
 	if _, ok := b.pending[msg.ToPeerID]; !ok && len(b.pending) >= maxPendingRecipients {
-		for id, held := range b.pending { // make room: forget recipients whose signals all expired
+		// Make room: forget recipients whose signals all expired. Each held
+		// slice is time-ordered (holdLocked appends, newest last), so if the
+		// newest signal expired they all have.
+		for id, held := range b.pending {
 			if len(held) == 0 || !held[len(held)-1].at.After(cutoff) {
 				delete(b.pending, id)
 			}
