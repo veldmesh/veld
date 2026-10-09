@@ -8,6 +8,7 @@ import (
 	"context"
 	"log"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -227,7 +228,16 @@ func TestVerboseSpliceErrorsLeakNoEndpoints(t *testing.T) {
 	if strings.Contains(out, ":"+portA) {
 		t.Errorf("verbose logs must not contain client ports, got:\n%s", out)
 	}
-	if !strings.Contains(out, "connection reset by peer") {
+	// The OS renders an RST differently — POSIX reports ECONNRESET as
+	// "connection reset by peer" while Windows reports WSAECONNRESET as
+	// "forcibly closed by the remote host" — but either way the scrubbed
+	// error must keep the underlying cause: scrubbing strips the
+	// endpoints, not the diagnosis.
+	cause := "connection reset by peer"
+	if runtime.GOOS == "windows" {
+		cause = "forcibly closed by the remote host"
+	}
+	if !strings.Contains(out, cause) {
 		t.Errorf("the scrubbed error should keep its underlying cause, got:\n%s", out)
 	}
 }
