@@ -59,6 +59,13 @@ func pumpProbes(conn net.PacketConn, mgr *nat.Manager) {
 	}
 }
 
+// entryFor builds a peer.Entry stub for the given identity at VPN address
+// vpn. Only ID and X25519Pub are used by the manager; VPNAddr is set so
+// Upsert works.
+func entryFor(id *crypto.Identity, vpn netip.Addr) *peer.Entry {
+	return &peer.Entry{ID: [32]byte(id.Ed25519Public[:32]), X25519Pub: id.X25519Public, VPNAddr: vpn}
+}
+
 // TestNATManager_TwoPeersDiscover verifies that two Manager instances running
 // on loopback can discover each other's endpoint via the probe protocol.
 func TestNATManager_TwoPeersDiscover(t *testing.T) {
@@ -68,8 +75,12 @@ func TestNATManager_TwoPeersDiscover(t *testing.T) {
 	connA, portA := makeUDPConn(t)
 	connB, portB := makeUDPConn(t)
 
-	mgrA := nat.New(connA, portA, "" /*no STUN*/, idA)
-	mgrB := nat.New(connB, portB, "" /*no STUN*/, idB)
+	// Each manager authenticates senders against its own coord-synced peer
+	// table, mirroring the daemon wiring.
+	tblA := peer.New()
+	tblB := peer.New()
+	mgrA := nat.New(connA, portA, "" /*no STUN*/, idA, tblA)
+	mgrB := nat.New(connB, portB, "" /*no STUN*/, idB, tblB)
 
 	discoveredByA := make(chan netip.AddrPort, 1)
 	discoveredByB := make(chan netip.AddrPort, 1)
@@ -91,12 +102,11 @@ func TestNATManager_TwoPeersDiscover(t *testing.T) {
 	go pumpProbes(connA, mgrA)
 	go pumpProbes(connB, mgrB)
 
-	// Build peer.Entry stubs. Only ID and X25519Pub are needed by the manager.
-	entryA := &peer.Entry{ID: [32]byte(idA.Ed25519Public[:32]), X25519Pub: idA.X25519Public}
-	entryB := &peer.Entry{ID: [32]byte(idB.Ed25519Public[:32]), X25519Pub: idB.X25519Public}
-	// Set dummy VPN addrs so Upsert works (peer.Entry requires a valid VPNAddr).
-	entryA.VPNAddr = netip.MustParseAddr("10.0.0.1")
-	entryB.VPNAddr = netip.MustParseAddr("10.0.0.2")
+	// Build peer.Entry stubs and register each peer in the other's table.
+	entryA := entryFor(idA, netip.MustParseAddr("10.0.0.1"))
+	entryB := entryFor(idB, netip.MustParseAddr("10.0.0.2"))
+	tblA.Upsert(entryB)
+	tblB.Upsert(entryA)
 
 	// Wire signal delivery: what A sends goes directly to B's manager, and vice versa.
 	// In production this round-trips through the coord server.
@@ -159,10 +169,7 @@ func TestNATManager_SignalEncryption(t *testing.T) {
 	idEve := makeIdentity(t)
 
 	connA, portA := makeUDPConn(t)
-	mgrA := nat.New(connA, portA, "", idA)
-
-	entryB := &peer.Entry{ID: [32]byte(idB.Ed25519Public[:32]), X25519Pub: idB.X25519Public}
-	entryB.VPNAddr = netip.MustParseAddr("10.0.0.2")
+	mgrA := nat.New(connA, portA, "", idA, peer.New())
 
 	var captured []byte
 	_ = mgrA // silence unused warning; we test signal encryption directly
@@ -190,8 +197,6 @@ func TestNATManager_SignalEncryption(t *testing.T) {
 	if err == nil {
 		t.Error("Eve decrypted a signal not addressed to her")
 	}
-
-	_ = entryB
 }
 
 // TestNATManager_DuplicateStart verifies that calling Start twice for the
@@ -203,8 +208,10 @@ func TestNATManager_DuplicateStart(t *testing.T) {
 	connA, portA := makeUDPConn(t)
 	connB, portB := makeUDPConn(t)
 
-	mgrA := nat.New(connA, portA, "", idA)
-	mgrB := nat.New(connB, portB, "", idB)
+	tblA := peer.New()
+	tblB := peer.New()
+	mgrA := nat.New(connA, portA, "", idA, tblA)
+	mgrB := nat.New(connB, portB, "", idB, tblB)
 	go pumpProbes(connA, mgrA)
 	go pumpProbes(connB, mgrB)
 
@@ -217,10 +224,10 @@ func TestNATManager_DuplicateStart(t *testing.T) {
 	}
 
 	peerIDofA := hex.EncodeToString(idA.Ed25519Public[:32])
-	entryB := &peer.Entry{ID: [32]byte(idB.Ed25519Public[:32]), X25519Pub: idB.X25519Public}
-	entryB.VPNAddr = netip.MustParseAddr("10.0.0.2")
-	entryA := &peer.Entry{ID: [32]byte(idA.Ed25519Public[:32]), X25519Pub: idA.X25519Public}
-	entryA.VPNAddr = netip.MustParseAddr("10.0.0.1")
+	entryA := entryFor(idA, netip.MustParseAddr("10.0.0.1"))
+	entryB := entryFor(idB, netip.MustParseAddr("10.0.0.2"))
+	tblA.Upsert(entryB)
+	tblB.Upsert(entryA)
 
 	peerIDofB := hex.EncodeToString(idB.Ed25519Public[:32])
 	sendAtoB := func(payload []byte) error { mgrB.DeliverSignal(peerIDofA, payload); return nil }
@@ -258,8 +265,10 @@ func TestNATManager_PunchTimeoutFallback(t *testing.T) {
 	connA, portA := makeUDPConn(t)
 	connB, portB := makeUDPConn(t)
 
-	mgrA := nat.New(connA, portA, "", idA)
-	mgrB := nat.New(connB, portB, "", idB)
+	tblA := peer.New()
+	tblB := peer.New()
+	mgrA := nat.New(connA, portA, "", idA, tblA)
+	mgrB := nat.New(connB, portB, "", idB, tblB)
 
 	// No probe pumpers: probes vanish, as they would across symmetric NATs.
 	timedOutA := make(chan [32]byte, 1)
@@ -271,10 +280,10 @@ func TestNATManager_PunchTimeoutFallback(t *testing.T) {
 	mgrA.OnEndpointDiscovered = func(_ [32]byte, ep netip.AddrPort) { discovered <- ep }
 	mgrB.OnEndpointDiscovered = func(_ [32]byte, ep netip.AddrPort) { discovered <- ep }
 
-	entryA := &peer.Entry{ID: [32]byte(idA.Ed25519Public[:32]), X25519Pub: idA.X25519Public}
-	entryA.VPNAddr = netip.MustParseAddr("10.0.0.1")
-	entryB := &peer.Entry{ID: [32]byte(idB.Ed25519Public[:32]), X25519Pub: idB.X25519Public}
-	entryB.VPNAddr = netip.MustParseAddr("10.0.0.2")
+	entryA := entryFor(idA, netip.MustParseAddr("10.0.0.1"))
+	entryB := entryFor(idB, netip.MustParseAddr("10.0.0.2"))
+	tblA.Upsert(entryB)
+	tblB.Upsert(entryA)
 
 	peerIDofA := hex.EncodeToString(idA.Ed25519Public[:32])
 	peerIDofB := hex.EncodeToString(idB.Ed25519Public[:32])

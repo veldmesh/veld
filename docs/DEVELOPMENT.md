@@ -18,6 +18,8 @@ This document captures the architectural decisions, invariants, and patterns tha
 
 6. **TOFU fingerprints are checked before completing a handshake.** If a peer's Ed25519 pubkey doesn't match the locally pinned fingerprint, abort and log clearly. Do not downgrade to "warn only" mode.
 
+7. **NAT signals are signed by the sender's Ed25519 identity key.** Every NAT signal envelope carries an explicit version byte (currently 0x01), a unix timestamp, and an Ed25519 signature over `"veld-nat-signal-v1" || fromPeerID || toPeerID || timestamp || ciphertext`. The recipient verifies the signature against the sender's Ed25519 public key from its coord-registered peer table, requires the claimed sender to match that key, and rejects timestamps older than 60 s or more than 60 s in the future (replay). Unsigned or unknown-version signals are rejected — pre-1.0 formats have no compatibility. The coord server additionally relays a signal only when sender and recipient are registered peers of the same network, owned by the token's account. Invalid signals are dropped silently (debug-level logging only). The ±60 s replay window is a fixed protocol constant, not configurable per deployment: peers must run with synchronized clocks (NTP or equivalent), a requirement the Noise handshake's tighter ±30 s timestamp window already imposes. Envelopes are also size-capped (16 KiB) and held in bounded buffers on both sides — the server holds at most 64 signals per offline recipient, the client at most 256 held senders — so signalling cannot be used for memory exhaustion.
+
 ---
 
 ## Extension point rules
@@ -189,7 +191,7 @@ Required unit tests per package (non-exhaustive — add more as edge cases are f
 | `internal/session` | Encrypt→decrypt round-trip, nonce monotonicity, replay rejection (duplicate nonce, nonce outside window), auth tag failure → silent drop, rekey trigger at threshold |
 | `internal/peer` | Concurrent Upsert/Lookup/Remove, hold queue max-64 drop-oldest behaviour |
 | `internal/dataplane` | Packet routing to correct session, session-miss hold-queue behaviour, keepalive handling |
-| `coord/server` | Register validates Ed25519 sig, Register calls PlanEnforcer, ListPeers returns correct subset, SendSignal routes to correct watcher, Leave removes peer |
+| `coord/server` | Register validates Ed25519 sig, Register calls PlanEnforcer, ListPeers returns correct subset, SendSignal scopes sender/recipient to the token's network and routes to the recipient, Leave removes peer |
 
 ### Layer 2 — End-to-end tests (`tests/e2e/*_e2e_test.go`)
 

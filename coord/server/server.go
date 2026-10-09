@@ -170,6 +170,8 @@ func (s *Server) ExpelStalePeers(ctx context.Context, ttl time.Duration) (int, e
 			At:        time.Now(),
 		})
 
+		s.bus.DiscardHeldSignals(rec.ID)
+
 		s.bus.Publish(rec.NetworkID, &coordv1.PeerEvent{
 			Type: coordv1.EventType_LEAVE,
 			Peer: &coordv1.Peer{Id: rec.ID, Name: rec.Name},
@@ -408,7 +410,10 @@ func (s *Server) Watch(req *coordv1.WatchRequest, stream coordv1.Coord_WatchServ
 	}
 }
 
-// SendSignal relays an opaque signal from one peer to another.
+// SendSignal relays an opaque signal from one peer to another. The sender
+// and the recipient must both be registered peers of the same network, and
+// that network must belong to the account the token resolves to — a valid
+// token alone never buys access to another network's signalling.
 func (s *Server) SendSignal(ctx context.Context, req *coordv1.SendSignalRequest) (*coordv1.SendSignalResponse, error) {
 	acc, err := s.accounts.Resolve(ctx, req.Token)
 	if err != nil {
@@ -427,6 +432,9 @@ func (s *Server) SendSignal(ctx context.Context, req *coordv1.SendSignalRequest)
 	if from.NetworkID != to.NetworkID {
 		return nil, errPeerNotFound
 	}
+
+	// If the recipient has no open Watch stream the bus holds the signal
+	// until they watch again.
 	s.bus.SendSignal(req.FromPeerId, req.ToPeerId, req.Payload)
 	return &coordv1.SendSignalResponse{}, nil
 }
@@ -446,6 +454,7 @@ func (s *Server) Leave(ctx context.Context, req *coordv1.LeaveRequest) (*coordv1
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "peer not found")
 	}
+	s.bus.DiscardHeldSignals(req.PeerId)
 
 	vpnAddr, _ := netip.ParseAddr(removed.VPNAddr)
 	net, _, _ := s.registry.GetNetwork(removed.NetworkID)

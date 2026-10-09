@@ -56,8 +56,12 @@ func TestRelayFallback_TwoPeers(t *testing.T) {
 	connA, portA := makeDataConn(t)
 	connB, portB := makeDataConn(t)
 
-	mgrA := nat.New(connA, portA, "" /*no STUN in tests*/, idA)
-	mgrB := nat.New(connB, portB, "" /*no STUN in tests*/, idB)
+	// Each manager authenticates signal senders against its own coord-synced
+	// peer table, mirroring the daemon wiring.
+	tblA := peer.New()
+	tblB := peer.New()
+	mgrA := nat.New(connA, portA, "" /*no STUN in tests*/, idA, tblA)
+	mgrB := nat.New(connB, portB, "" /*no STUN in tests*/, idB, tblB)
 
 	// No pumpNATProbes goroutines: probes are blackholed, simulating both
 	// peers behind symmetric NATs. Hole punching must time out.
@@ -84,6 +88,8 @@ func TestRelayFallback_TwoPeers(t *testing.T) {
 	entryA.VPNAddr = netip.MustParseAddr("10.60.0.1")
 	entryB := &peer.Entry{ID: selfB, X25519Pub: idB.X25519Public}
 	entryB.VPNAddr = netip.MustParseAddr("10.60.0.2")
+	tblA.Upsert(entryB)
+	tblB.Upsert(entryA)
 
 	mgrA.OnPunchTimeout = func(peerID [32]byte) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
