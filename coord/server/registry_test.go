@@ -3,6 +3,8 @@
 package server
 
 import (
+	"encoding/base64"
+	"errors"
 	"net/netip"
 	"testing"
 
@@ -306,5 +308,114 @@ func TestRegistry_NetworkCount(t *testing.T) {
 	count2, err := reg.NetworkCount("acc2")
 	if err != nil || count2 != 1 {
 		t.Errorf("NetworkCount acc2: got %d, want 1", count2)
+	}
+}
+
+func TestRegistry_RegisterPeer_IDTakenInOtherNetwork(t *testing.T) {
+	reg := newSweepTestRegistry(t)
+	cidr := netip.MustParsePrefix("10.1.0.0/24")
+	if err := reg.CreateNetwork(coordcore.Network{ID: "net2", CIDR: cidr, Name: "net2"}, "acc1"); err != nil {
+		t.Fatalf("CreateNetwork net2: %v", err)
+	}
+
+	rec := peerRecord{
+		ID:            "shared-peer",
+		Name:          "shared",
+		Ed25519Public: "dGVzdA==",
+		X25519Public:  base64.StdEncoding.EncodeToString([]byte("x25519-original")),
+		Endpoint:      "1.2.3.4:51820",
+	}
+	vpn, err := reg.RegisterPeer(rec, "net1", 0)
+	if err != nil {
+		t.Fatalf("RegisterPeer net1: %v", err)
+	}
+
+	// The same ID cannot be registered into a different network.
+	if _, err := reg.RegisterPeer(rec, "net2", 0); !errors.Is(err, ErrPeerIDTaken) {
+		t.Fatalf("RegisterPeer net2: got %v, want ErrPeerIDTaken", err)
+	}
+
+	// Nothing changed: same network, VPN address and endpoint.
+	stored, err := reg.GetPeer("shared-peer")
+	if err != nil {
+		t.Fatalf("GetPeer: %v", err)
+	}
+	if stored.NetworkID != "net1" || stored.VPNAddr != vpn.String() {
+		t.Errorf("record changed: got %+v, want network net1 and VPN %s", stored, vpn)
+	}
+	if got := inMemoryEndpoint(t, reg, "shared-peer"); got != "1.2.3.4:51820" {
+		t.Errorf("endpoint changed: got %q, want 1.2.3.4:51820", got)
+	}
+	wantCounts := []struct {
+		netID string
+		want  int
+	}{
+		{"net1", 1},
+		{"net2", 0},
+	}
+	for _, tc := range wantCounts {
+		count, err := reg.NetworkMachineCount(tc.netID)
+		if err != nil {
+			t.Fatalf("NetworkMachineCount %s: %v", tc.netID, err)
+		}
+		if count != tc.want {
+			t.Errorf("network %s machine count: got %d, want %d", tc.netID, count, tc.want)
+		}
+	}
+
+	// Same-network re-registration stays idempotent.
+	again, err := reg.RegisterPeer(rec, "net1", 0)
+	if err != nil {
+		t.Fatalf("same-network re-registration: %v", err)
+	}
+	if again != vpn {
+		t.Errorf("re-registration VPN: got %s, want %s", again, vpn)
+	}
+}
+
+func TestRegistry_RegisterPeer_X25519Mismatch(t *testing.T) {
+	reg := newSweepTestRegistry(t)
+
+	first := peerRecord{
+		ID:            "p",
+		Name:          "p",
+		Ed25519Public: "dGVzdA==",
+		X25519Public:  base64.StdEncoding.EncodeToString([]byte("x25519-original")),
+	}
+	vpn, err := reg.RegisterPeer(first, "net1", 0)
+	if err != nil {
+		t.Fatalf("RegisterPeer: %v", err)
+	}
+
+	// A same-network re-registration presenting a different X25519 key is
+	// rejected; the stored key is never overwritten.
+	rotated := first
+	rotated.X25519Public = base64.StdEncoding.EncodeToString([]byte("x25519-rotated"))
+	if _, err := reg.RegisterPeer(rotated, "net1", 0); !errors.Is(err, ErrPeerKeyMismatch) {
+		t.Fatalf("RegisterPeer rotated key: got %v, want ErrPeerKeyMismatch", err)
+	}
+
+	stored, err := reg.GetPeer("p")
+	if err != nil {
+		t.Fatalf("GetPeer: %v", err)
+	}
+	if stored.X25519Public != first.X25519Public {
+		t.Errorf("stored X25519 key: got %q, want %q", stored.X25519Public, first.X25519Public)
+	}
+	count, err := reg.NetworkMachineCount("net1")
+	if err != nil || count != 1 {
+		t.Errorf("machine count: got %d (err %v), want 1", count, err)
+	}
+
+	// Re-registering with the same key stays idempotent.
+	if _, err := reg.RegisterPeer(first, "net1", 0); err != nil {
+		t.Fatalf("idempotent re-registration: %v", err)
+	}
+	again, err := reg.RegisterPeer(first, "net1", 0)
+	if err != nil {
+		t.Fatalf("idempotent re-registration: %v", err)
+	}
+	if again != vpn {
+		t.Errorf("re-registration VPN: got %s, want %s", again, vpn)
 	}
 }
