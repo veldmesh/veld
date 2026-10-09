@@ -20,12 +20,29 @@ type windowsTUN struct {
 	mtu  int
 }
 
+// wintunDownloadURL is the official Wintun download page — the same place
+// the release workflow fetches the DLL from (see the Download Wintun step in
+// .github/workflows/release.yml). If the URL ever moves, update both.
+const wintunDownloadURL = "https://www.wintun.net/"
+
+// wintunMissingHint points at the fix for the most common Windows failure:
+// Wintun's DLL is not installed system-wide and must sit next to the daemon
+// binary, otherwise adapter creation fails with an opaque LoadLibraryEx error.
+const wintunMissingHint = "wintun.dll not found next to veld-daemon.exe — download it from " + wintunDownloadURL + " or use the release zip"
+
+// tunCreateError wraps a Windows adapter-creation failure with the interface
+// name and wintunMissingHint so the error is actionable. err is wrapped with
+// %w so errors.Is/errors.As keep working for callers.
+func tunCreateError(name string, err error) error {
+	return fmt.Errorf("tun create %s: %w (hint: %s)", name, err, wintunMissingHint)
+}
+
 // CreateTUN creates a Wintun adapter, assigns ip to it, and brings it up.
 // Requires administrator privileges; wintun.dll must be on PATH or next to the binary.
 func CreateTUN(name string, ip netip.Prefix, mtu int) (TUN, error) {
 	dev, err := wgtun.CreateTUN(name, mtu)
 	if err != nil {
-		return nil, fmt.Errorf("tun create %s: %w", name, err)
+		return nil, tunCreateError(name, err)
 	}
 
 	realName, err := dev.Name()
