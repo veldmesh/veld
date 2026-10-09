@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
 	coordcore "github.com/veldmesh/veld/coord/core"
@@ -317,14 +319,29 @@ func TestServer_SendSignal_OK(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	req := &coordv1.SendSignalRequest{
-		Token:      "test-token",
-		FromPeerId: "peer1",
-		ToPeerId:   "peer2",
-		Payload:    []byte("test signal"),
+	register := func(name string) string {
+		t.Helper()
+		resp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
+			NetworkId:     "test-net",
+			Token:         "test-token",
+			Name:          name,
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("ed25519-" + name)),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x25519-" + name)),
+		})
+		if err != nil {
+			t.Fatalf("Register %s: %v", name, err)
+		}
+		return resp.PeerId
 	}
+	idA := register("signal-a")
+	idB := register("signal-b")
 
-	_, err := srv.SendSignal(context.Background(), req)
+	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token:      "test-token",
+		FromPeerId: idA,
+		ToPeerId:   idB,
+		Payload:    []byte("test signal"),
+	})
 	if err != nil {
 		t.Fatalf("SendSignal: %v", err)
 	}
@@ -689,14 +706,131 @@ func TestServer_SignalToUnknownPeer_IsNotHeld(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	if _, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
-		Token: "test-token", FromPeerId: "x", ToPeerId: "no-such-peer", Payload: []byte("p"),
-	}); err != nil {
-		t.Fatalf("SendSignal: %v", err)
+	resp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
+		NetworkId:     "test-net",
+		Token:         "test-token",
+		Name:          "signal-sender",
+		Ed25519Public: base64.StdEncoding.EncodeToString([]byte("ed25519-signal-sender")),
+		X25519Public:  base64.StdEncoding.EncodeToString([]byte("x25519-signal-sender")),
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// The recipient is not registered: the request must be rejected outright
+	// instead of silently accepted, and nothing may be held for it.
+	_, err = srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token: "test-token", FromPeerId: resp.PeerId, ToPeerId: "no-such-peer", Payload: []byte("p"),
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("SendSignal to an unregistered peer: got %v, want NotFound", err)
 	}
 	srv.bus.mu.RLock()
 	defer srv.bus.mu.RUnlock()
 	if len(srv.bus.pending) != 0 {
 		t.Fatalf("signal for an unregistered peer was held: %v", srv.bus.pending)
+	}
+}
+
+// twoAccountTestServer builds a server with two accounts (token "tok-a" ->
+// account acc1, token "tok-b" -> account acc2) and two networks: "net-a"
+// owned by acc1 and "net-b" owned by acc2.
+func twoAccountTestServer(t *testing.T) (*Server, *Registry) {
+	t.Helper()
+	reg, err := NewRegistry(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	if err := reg.CreateNetwork(coordcore.Network{ID: "net-a", CIDR: netip.MustParsePrefix("10.1.0.0/24"), Name: "A"}, "acc1"); err != nil {
+		t.Fatalf("CreateNetwork net-a: %v", err)
+	}
+	if err := reg.CreateNetwork(coordcore.Network{ID: "net-b", CIDR: netip.MustParsePrefix("10.2.0.0/24"), Name: "B"}, "acc2"); err != nil {
+		t.Fatalf("CreateNetwork net-b: %v", err)
+	}
+	accounts := ce.NewTokenAccountStore(map[string]coordcore.Account{
+		"tok-a": {ID: "acc1", Tier: coordcore.TierFree},
+		"tok-b": {ID: "acc2", Tier: coordcore.TierFree},
+	})
+	srv := New(reg, NewBus(), ce.NewFreeEnforcer(), accounts, ce.NewNoopAuditLogger(), ce.NewRejectSubnetPolicy(), ce.NewNoopHooks())
+	return srv, reg
+}
+
+// registerTestPeer inserts a peer record directly into the registry.
+func registerTestPeer(t *testing.T, reg *Registry, id, networkID string) {
+	t.Helper()
+	now := time.Now().Unix()
+	rec := peerRecord{
+		ID:            id,
+		Name:          id,
+		Ed25519Public: "dGVzdA==",
+		X25519Public:  "dGVzdA==",
+		LastSeen:      now,
+		RegisteredAt:  now,
+	}
+	if _, err := reg.RegisterPeer(rec, networkID, 0); err != nil {
+		t.Fatalf("RegisterPeer %s: %v", id, err)
+	}
+}
+
+func TestServer_SendSignal_SenderNotOwnedByCaller_IsRejected(t *testing.T) {
+	srv, reg := twoAccountTestServer(t)
+	defer reg.Close()
+	registerTestPeer(t, reg, "a1", "net-a") // acc1's peer
+	registerTestPeer(t, reg, "b1", "net-b") // acc2's peer
+
+	// A caller authenticated as acc1 claims to be acc2's peer. Without the
+	// ownership check it could both spoof acc2 and make the registered
+	// recipient hold a signal that never really came from b1's account.
+	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token: "tok-a", FromPeerId: "b1", ToPeerId: "a1", Payload: []byte("spoofed"),
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("SendSignal with a foreign from_peer_id: got %v, want PermissionDenied", err)
+	}
+
+	srv.bus.mu.RLock()
+	defer srv.bus.mu.RUnlock()
+	if len(srv.bus.pending) != 0 {
+		t.Fatalf("signal from a spoofed sender was held: %v", srv.bus.pending)
+	}
+}
+
+func TestServer_SendSignal_PeersNotInSameNetwork_IsRejected(t *testing.T) {
+	srv, reg := twoAccountTestServer(t)
+	defer reg.Close()
+	registerTestPeer(t, reg, "a1", "net-a")
+	registerTestPeer(t, reg, "b1", "net-b")
+
+	// Both peers are registered, but they do not share a network.
+	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token: "tok-a", FromPeerId: "a1", ToPeerId: "b1", Payload: []byte("p"),
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("SendSignal across networks: got %v, want PermissionDenied", err)
+	}
+
+	srv.bus.mu.RLock()
+	defer srv.bus.mu.RUnlock()
+	if len(srv.bus.pending) != 0 {
+		t.Fatalf("signal to a peer in another network was held: %v", srv.bus.pending)
+	}
+}
+
+func TestServer_SendSignal_UnknownSender_IsRejected(t *testing.T) {
+	srv, reg := twoAccountTestServer(t)
+	defer reg.Close()
+	registerTestPeer(t, reg, "a1", "net-a")
+
+	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token: "tok-a", FromPeerId: "no-such-sender", ToPeerId: "a1", Payload: []byte("p"),
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("SendSignal with an unregistered sender: got %v, want NotFound", err)
+	}
+
+	srv.bus.mu.RLock()
+	defer srv.bus.mu.RUnlock()
+	if len(srv.bus.pending) != 0 {
+		t.Fatalf("signal from an unregistered sender was held: %v", srv.bus.pending)
 	}
 }

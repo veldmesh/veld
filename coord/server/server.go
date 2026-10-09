@@ -346,15 +346,34 @@ func (s *Server) Watch(req *coordv1.WatchRequest, stream coordv1.Coord_WatchServ
 	}
 }
 
-// SendSignal relays an opaque signal from one peer to another.
+// SendSignal relays an opaque signal from one peer to another. The sender
+// must be a registered peer of the authenticated account and the recipient
+// a registered peer of the same network, so a valid token cannot be used to
+// impersonate another peer or to reach peers of other networks.
 func (s *Server) SendSignal(ctx context.Context, req *coordv1.SendSignalRequest) (*coordv1.SendSignalResponse, error) {
-	if _, err := s.accounts.Resolve(ctx, req.Token); err != nil {
+	acc, err := s.accounts.Resolve(ctx, req.Token)
+	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "invalid token")
 	}
-	// Hold the signal briefly if the recipient is registered but has not opened
-	// its Watch stream yet (it registers first, then watches).
-	_, err := s.registry.GetPeer(req.ToPeerId)
-	s.bus.SendSignal(req.FromPeerId, req.ToPeerId, req.Payload, err == nil)
+	// from_peer_id must be one of the caller's own registered peers.
+	from, err := s.registry.GetPeer(req.FromPeerId)
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "sender peer not found")
+	}
+	if _, owner, err := s.registry.GetNetwork(from.NetworkID); err != nil || owner != acc.ID {
+		return nil, status.Errorf(codes.PermissionDenied, "sender peer does not belong to this account")
+	}
+	// The recipient must be a registered peer of the same network.
+	to, err := s.registry.GetPeer(req.ToPeerId)
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "recipient peer not found")
+	}
+	if to.NetworkID != from.NetworkID {
+		return nil, status.Errorf(codes.PermissionDenied, "recipient peer is not in the sender's network")
+	}
+	// The recipient is registered: hold the signal briefly if it has not
+	// opened its Watch stream yet (it registers first, then watches).
+	s.bus.SendSignal(req.FromPeerId, req.ToPeerId, req.Payload, true)
 	return &coordv1.SendSignalResponse{}, nil
 }
 
