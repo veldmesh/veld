@@ -349,11 +349,17 @@ func (s *Server) Watch(req *coordv1.WatchRequest, stream coordv1.Coord_WatchServ
 // SendSignal relays an opaque signal from one peer to another. The sender
 // must be a registered peer of the authenticated account and the recipient
 // a registered peer of the same network, so a valid token cannot be used to
-// impersonate another peer or to reach peers of other networks.
+// impersonate another peer or to reach peers of other networks. Payloads
+// above maxSignalPayload are rejected.
 func (s *Server) SendSignal(ctx context.Context, req *coordv1.SendSignalRequest) (*coordv1.SendSignalResponse, error) {
 	acc, err := s.accounts.Resolve(ctx, req.Token)
 	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "invalid token")
+	}
+	// The payload cap bounds the memory the pending store-and-forward can
+	// occupy; oversized signals are rejected outright.
+	if len(req.Payload) > maxSignalPayload {
+		return nil, status.Errorf(codes.InvalidArgument, "signal payload exceeds %d bytes", maxSignalPayload)
 	}
 	// from_peer_id must be one of the caller's own registered peers.
 	from, err := s.registry.GetPeer(req.FromPeerId)
@@ -377,11 +383,22 @@ func (s *Server) SendSignal(ctx context.Context, req *coordv1.SendSignalRequest)
 	return &coordv1.SendSignalResponse{}, nil
 }
 
-// Leave removes a peer from the registry.
+// Leave removes a peer from the registry. The peer must belong to a network
+// owned by the authenticated account.
 func (s *Server) Leave(ctx context.Context, req *coordv1.LeaveRequest) (*coordv1.LeaveResponse, error) {
 	acc, err := s.accounts.Resolve(ctx, req.Token)
 	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "invalid token")
+	}
+
+	// The removed peer must belong to one of the caller's networks: a valid
+	// token for one account must not delete another account's peers.
+	target, err := s.registry.GetPeer(req.PeerId)
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "peer not found")
+	}
+	if _, owner, err := s.registry.GetNetwork(target.NetworkID); err != nil || owner != acc.ID {
+		return nil, status.Errorf(codes.PermissionDenied, "peer does not belong to this account")
 	}
 
 	removed, err := s.registry.RemovePeer(req.PeerId)

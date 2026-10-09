@@ -25,6 +25,12 @@ const (
 	pendingSignalTTL     = 30 * time.Second
 	maxPendingPerPeer    = 16
 	maxPendingRecipients = 4096
+
+	// maxSignalPayload caps the size of one relayed signal payload (NAT
+	// candidates are a few hundred bytes; 64 KiB is a generous ceiling).
+	// Held signals are a store-and-forward buffer, and this cap bounds its
+	// worst-case memory instead of relying on the gRPC message limit.
+	maxSignalPayload = 64 << 10 // 64 KiB
 )
 
 type pendingSignal struct {

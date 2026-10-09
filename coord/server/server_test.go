@@ -834,3 +834,80 @@ func TestServer_SendSignal_UnknownSender_IsRejected(t *testing.T) {
 		t.Fatalf("signal from an unregistered sender was held: %v", srv.bus.pending)
 	}
 }
+
+// Leave may only remove a peer that belongs to a network owned by the
+// authenticated account; a valid token for one account must not delete
+// another account's peers.
+func TestServer_Leave_PeerNotOwnedByCaller_IsRejected(t *testing.T) {
+	srv, reg := twoAccountTestServer(t)
+	defer reg.Close()
+	registerTestPeer(t, reg, "a1", "net-a") // acc1's peer
+	registerTestPeer(t, reg, "b1", "net-b") // acc2's peer
+
+	_, err := srv.Leave(context.Background(), &coordv1.LeaveRequest{
+		Token: "tok-a", PeerId: "b1",
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("Leave removing a peer of another account: got %v, want PermissionDenied", err)
+	}
+
+	// The peer must still be registered.
+	peers, err := reg.ListPeers("net-b")
+	if err != nil {
+		t.Fatalf("ListPeers net-b: %v", err)
+	}
+	if len(peers) != 1 || peers[0].ID != "b1" {
+		t.Fatalf("Leave removed another account's peer; net-b peers: %+v", peers)
+	}
+}
+
+// Held signals are a store-and-forward buffer, so the payload size must be
+// capped at the application level, not only by the gRPC message limit.
+func TestServer_SendSignal_PayloadTooLarge_IsRejected(t *testing.T) {
+	srv, reg := testServer(t)
+	defer reg.Close()
+
+	register := func(name string) string {
+		t.Helper()
+		resp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
+			NetworkId:     "test-net",
+			Token:         "test-token",
+			Name:          name,
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("ed25519-" + name)),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x25519-" + name)),
+		})
+		if err != nil {
+			t.Fatalf("Register %s: %v", name, err)
+		}
+		return resp.PeerId
+	}
+	idA := register("signal-a")
+	idB := register("signal-b")
+
+	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token:      "test-token",
+		FromPeerId: idA,
+		ToPeerId:   idB,
+		Payload:    make([]byte, maxSignalPayload+1),
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("SendSignal with an oversized payload: got %v, want InvalidArgument", err)
+	}
+	srv.bus.mu.RLock()
+	held := len(srv.bus.pending)
+	srv.bus.mu.RUnlock()
+	if held != 0 {
+		t.Fatalf("oversized signal was held: %v", srv.bus.pending)
+	}
+
+	// The boundary is inclusive: a payload of exactly maxSignalPayload
+	// bytes is accepted (held for the recipient that has no Watch yet).
+	if _, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token:      "test-token",
+		FromPeerId: idA,
+		ToPeerId:   idB,
+		Payload:    make([]byte, maxSignalPayload),
+	}); err != nil {
+		t.Fatalf("SendSignal with a max-size payload: %v", err)
+	}
+}
