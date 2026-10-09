@@ -35,10 +35,12 @@ import (
 )
 
 const (
-	probeTimeout      = 10 * time.Second
-	probeSendInterval = 100 * time.Millisecond
-	probeFlag         = uint32(0) // outgoing probe
-	replyFlag         = uint32(1) // probe reply
+	probeTimeout         = 10 * time.Second
+	probeSendInterval    = 100 * time.Millisecond
+	signalResendInterval = 500 * time.Millisecond
+	signalResendWindow   = probeTimeout // bound signal retransmission
+	probeFlag            = uint32(0)    // outgoing probe
+	replyFlag            = uint32(1)    // probe reply
 )
 
 // Manager handles NAT hole-punch negotiation for all active peer pairs.
@@ -143,7 +145,7 @@ func (m *Manager) Start(ctx context.Context, e *peer.Entry, sendFn func([]byte) 
 		}
 	}
 
-	go m.negotiate(sessCtx, sess)
+	go m.negotiate(sessCtx, ctx, sess)
 }
 
 // DeliverSignal is called by the coord client's OnSignal callback.
@@ -211,7 +213,11 @@ func (m *Manager) HandleProbe(pkt []byte, addr net.Addr) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) negotiate(ctx context.Context, sess *natSession) {
+// negotiate runs one NAT negotiation session.
+// sessCtx bounds the negotiation itself; parentCtx bounds signal
+// retransmission, which intentionally outlives the session (see
+// retransmitSignal).
+func (m *Manager) negotiate(sessCtx, parentCtx context.Context, sess *natSession) {
 	defer func() {
 		sess.cancel()
 		m.mu.Lock()
@@ -220,7 +226,7 @@ func (m *Manager) negotiate(ctx context.Context, sess *natSession) {
 	}()
 
 	// Gather local candidates.
-	candidates := m.gatherCandidates(ctx)
+	candidates := m.gatherCandidates(sessCtx)
 	if len(candidates) == 0 {
 		return
 	}
@@ -241,14 +247,13 @@ func (m *Manager) negotiate(ctx context.Context, sess *natSession) {
 	if err != nil {
 		return
 	}
-	if err := sess.sendFn(enc); err != nil {
-		return
-	}
+	_ = sess.sendFn(enc)
+	go m.retransmitSignal(parentCtx, sess, enc)
 
 	// Wait for the peer's signal.
 	var peerMsg natSignalMsg
 	select {
-	case <-ctx.Done():
+	case <-sessCtx.Done():
 		return
 	case plain := <-sess.signalIn:
 		if err := json.Unmarshal(plain, &peerMsg); err != nil {
@@ -276,7 +281,7 @@ func (m *Manager) negotiate(ctx context.Context, sess *natSession) {
 
 	// Probe all remote candidates simultaneously.
 	// We also need to reply to the peer's probes (done by HandleProbe).
-	probeCtx, probeCancel := context.WithTimeout(ctx, probeTimeout)
+	probeCtx, probeCancel := context.WithTimeout(sessCtx, probeTimeout)
 	defer probeCancel()
 
 	probe := buildProbe(probeFlag, sess.probeNonce)
@@ -306,6 +311,34 @@ func (m *Manager) negotiate(ctx context.Context, sess *natSession) {
 	case ep := <-sess.result:
 		if m.OnEndpointDiscovered != nil {
 			m.OnEndpointDiscovered(sess.peerID, ep)
+		}
+	}
+}
+
+// retransmitSignal re-sends the session's encrypted signal every
+// signalResendInterval for signalResendWindow, or until ctx is cancelled.
+//
+// The coordination channel is at-most-once: the coord server silently drops
+// a signal addressed to a peer whose Watch stream is not yet established (a
+// normal race while both sides register) and drops signals when the
+// recipient's buffer is full. A single send can therefore be lost.
+//
+// The retransmission window is deliberately independent of this session's
+// lifetime: the session may end early (e.g. on local discovery) while the
+// remote peer is still waiting for the signal it needs to start probing —
+// local discovery proves reachability in one direction only. Receiving
+// sessions ignore duplicate signals, so retransmission is safe.
+func (m *Manager) retransmitSignal(ctx context.Context, sess *natSession, enc []byte) {
+	ctx, cancel := context.WithTimeout(ctx, signalResendWindow)
+	defer cancel()
+	ticker := time.NewTicker(signalResendInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = sess.sendFn(enc)
 		}
 	}
 }
