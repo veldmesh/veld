@@ -29,7 +29,11 @@ addresses or per-connection details. Rules — enforce these in review:
 2. **Never log a full client IP address.** If a remote address is genuinely
    needed to debug, truncate it with `internal/logsafe.TruncIP` first
    (IPv4 → first three octets, `a.b.c.x`; IPv6 → first 48 bits) — or drop
-   the field entirely if it is not needed.
+   the field entirely if it is not needed. Error text counts as a field:
+   `*net.OpError` (what every `net.Conn` read/write returns) embeds both
+   endpoints' full `ip:port`, so never log a raw connection error — render it
+   with `logsafe.ScrubErr`, which drops the endpoints and truncates any
+   surviving address.
 3. **`veld-relay` logs no per-connection events by default** — no channel
    IDs, no client addresses; only startup/shutdown output. The `-verbose`
    flag re-enables per-connection logs (channel IDs, truncated addresses)

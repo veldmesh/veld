@@ -320,12 +320,13 @@ func (s *Service) evict(channel [relayc.ChannelIDSize]byte, sc *serverConn) {
 
 // splice forwards frames from src to dst until an error occurs, then closes
 // both connections. Benign teardowns (EOF, closed conn) are quiet; real
-// errors are reported through the per-connection debug log, which is only
-// enabled in verbose mode.
+// errors are reported through the per-connection debug log — only enabled
+// in verbose mode — with the error text scrubbed, because network errors
+// embed both endpoints' full ip:port in their text.
 func (s *Service) splice(dst, src *serverConn) {
 	fail := func(err error) {
 		if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-			s.logf("channel %x splice ended: %v", src.channel[:4], err)
+			s.logf("channel %x splice ended: %s", src.channel[:4], logsafe.ScrubErr(err))
 		}
 		_ = src.raw.Close()
 		_ = dst.raw.Close()

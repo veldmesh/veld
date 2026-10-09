@@ -136,6 +136,38 @@ func spliceErrorScenario(t *testing.T, svc *Service, relayKey [32]byte) {
 	}
 }
 
+// networkTeardownScenario pairs two manual clients on one channel, then
+// aborts A's TCP connection with an RST (SO_LINGER 0) instead of a clean
+// FIN, so the relay's splice read fails with a real network error — the
+// kind whose *net.OpError text embeds both endpoints' full ip:port. It
+// returns A's local port and once the relay has torn down B's end, which
+// happens after the error path — and any log line it emits — has run.
+func networkTeardownScenario(t *testing.T, svc *Service, relayKey [32]byte) string {
+	t.Helper()
+	idA, idB := mustIdentity(t), mustIdentity(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rawA := dialManual(t, ctx, svc.Addr(), relayKey, idA, idB.X25519Public)
+	rawB := dialManual(t, ctx, svc.Addr(), relayKey, idB, idA.X25519Public)
+	t.Cleanup(func() { _ = rawB.Close() })
+
+	_, portA, _ := net.SplitHostPort(rawA.LocalAddr().String())
+
+	// SO_LINGER 0 makes Close send an RST rather than a FIN, so the relay's
+	// splice read fails with "connection reset by peer" instead of a benign
+	// EOF. The resulting error's text names both endpoints' ip:port.
+	if tc, ok := rawA.(*net.TCPConn); ok {
+		_ = tc.SetLinger(0)
+	}
+	_ = rawA.Close()
+
+	_ = rawB.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := rawB.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expected the relay to close B's connection after the splice error")
+	}
+	return portA
+}
+
 // TestQuietByDefault drives a full connection lifecycle — connect, pair and
 // a real splice error — and verifies the relay with default flags logs no
 // per-connection lines at all: no channel IDs, no client addresses.
@@ -170,5 +202,32 @@ func TestVerboseLogsTruncatedAddresses(t *testing.T) {
 	}
 	if !strings.Contains(out, "splice ended") {
 		t.Errorf("verbose logs should report the splice error, got:\n%s", out)
+	}
+}
+
+// TestVerboseSpliceErrorsLeakNoEndpoints forces a real network teardown
+// error mid-splice (an RST, so the relay's read fails with *net.OpError)
+// and verifies that even verbose per-connection logs carry no full client
+// addresses or ports: network error text embeds both endpoints' ip:port and
+// must be scrubbed before it is logged.
+func TestVerboseSpliceErrorsLeakNoEndpoints(t *testing.T) {
+	relayID := mustIdentity(t)
+	logs := captureLog(t)
+	svc := startOptService(t, relayID, Verbose())
+
+	portA := networkTeardownScenario(t, svc, relayID.X25519Public)
+
+	out := logs.String()
+	if !strings.Contains(out, "splice ended") {
+		t.Errorf("verbose logs should report the splice error, got:\n%s", out)
+	}
+	if strings.Contains(out, "127.0.0.1") {
+		t.Errorf("verbose logs must not contain full client addresses, got:\n%s", out)
+	}
+	if strings.Contains(out, ":"+portA) {
+		t.Errorf("verbose logs must not contain client ports, got:\n%s", out)
+	}
+	if !strings.Contains(out, "connection reset by peer") {
+		t.Errorf("the scrubbed error should keep its underlying cause, got:\n%s", out)
 	}
 }
