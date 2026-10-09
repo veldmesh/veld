@@ -28,6 +28,7 @@ import (
 	"github.com/flynn/noise"
 
 	"github.com/veldmesh/veld/internal/crypto"
+	"github.com/veldmesh/veld/internal/logsafe"
 	relayc "github.com/veldmesh/veld/internal/relay"
 )
 
@@ -46,6 +47,10 @@ const waitingTimeout = 60 * time.Second
 // splices matched connections. It runs on a volunteer mesh peer — deploy it
 // with the veld-relay command anywhere the failing pair can both reach over
 // TCP. Traffic never transits the coord server.
+//
+// By default the service logs no per-connection events (no channel IDs, no
+// client addresses); per-connection debug output requires the Verbose
+// option.
 type Service struct {
 	id *crypto.Identity
 	ln net.Listener
@@ -59,6 +64,8 @@ type Service struct {
 	waitTimeout time.Duration
 	done        chan struct{}
 	wg          sync.WaitGroup // tracks running splice goroutines
+	// verbose enables per-connection debug logging; off by default.
+	verbose bool
 }
 
 // serverConn is one client connection on the relay side.
@@ -70,10 +77,21 @@ type serverConn struct {
 	wmu        sync.Mutex
 }
 
+// Option configures a relay Service at construction time.
+type Option func(*Service)
+
+// Verbose enables per-connection debug logging: connection attempts (with
+// truncated client addresses), channel IDs, and splice errors. It is off by
+// default — with default settings the relay logs no per-connection events
+// at all — and is meant for local debugging only, not production.
+func Verbose() Option {
+	return func(s *Service) { s.verbose = true }
+}
+
 // NewService creates a relay Service listening on ln with the given identity.
 // Clients must be configured with the identity's X25519 public key.
-func NewService(id *crypto.Identity, ln net.Listener) *Service {
-	return &Service{
+func NewService(id *crypto.Identity, ln net.Listener, opts ...Option) *Service {
+	s := &Service{
 		id:          id,
 		ln:          ln,
 		waiting:     make(map[[relayc.ChannelIDSize]byte]*serverConn),
@@ -81,10 +99,25 @@ func NewService(id *crypto.Identity, ln net.Listener) *Service {
 		done:        make(chan struct{}),
 		waitTimeout: waitingTimeout,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Addr returns the listener's address.
 func (s *Service) Addr() string { return s.ln.Addr().String() }
+
+// logf emits a per-connection debug line through the standard logger. It is
+// a no-op unless Verbose was set: by default the relay logs nothing about
+// individual connections (no channel IDs, no client addresses), so
+// default-flag logs retain no client-identifying data.
+func (s *Service) logf(format string, args ...any) {
+	if !s.verbose {
+		return
+	}
+	log.Printf("relay: "+format, args...)
+}
 
 // Serve accepts connections until the listener is closed or ctx is cancelled.
 // It returns nil on clean shutdown and never returns while its internal
@@ -155,6 +188,10 @@ func (s *Service) Close() error {
 // from the authenticated client key plus that payload, and pairs the
 // connection.
 func (s *Service) handleConn(raw net.Conn) {
+	// Verbose-only, and truncated: full client addresses are never logged.
+	if from := logsafe.TruncIP(raw.RemoteAddr().String()); from != "" {
+		s.logf("connection from %s", from)
+	}
 	hs, err := noise.NewHandshakeState(noise.Config{
 		CipherSuite: relayc.NoiseSuite,
 		Pattern:     noise.HandshakeIK,
@@ -254,11 +291,11 @@ func (s *Service) handleConn(raw net.Conn) {
 	go func() {
 		defer s.wg.Done()
 		defer s.forget(sc)
-		splice(sc, other)
+		s.splice(sc, other)
 	}()
 	defer s.wg.Done()
 	defer s.forget(other)
-	splice(other, sc)
+	s.splice(other, sc)
 }
 
 // forget removes sc from the active set once its splice has exited.
@@ -283,11 +320,13 @@ func (s *Service) evict(channel [relayc.ChannelIDSize]byte, sc *serverConn) {
 
 // splice forwards frames from src to dst until an error occurs, then closes
 // both connections. Benign teardowns (EOF, closed conn) are quiet; real
-// errors are logged for operational visibility.
-func splice(dst, src *serverConn) {
+// errors are reported through the per-connection debug log — only enabled
+// in verbose mode — with the error text scrubbed, because network errors
+// embed both endpoints' full ip:port in their text.
+func (s *Service) splice(dst, src *serverConn) {
 	fail := func(err error) {
 		if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-			log.Printf("relay: channel %x splice ended: %v", src.channel[:4], err)
+			s.logf("channel %x splice ended: %s", src.channel[:4], logsafe.ScrubErr(err))
 		}
 		_ = src.raw.Close()
 		_ = dst.raw.Close()

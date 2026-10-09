@@ -20,6 +20,34 @@ This document captures the architectural decisions, invariants, and patterns tha
 
 ---
 
+## Logging & privacy
+
+Server components (`veld-coord`, `veld-relay`) must not log client IP
+addresses or per-connection details. Rules — enforce these in review:
+
+1. **Never log tokens, keys, or other credentials** — not even partially.
+2. **Never log a full client IP address.** If a remote address is genuinely
+   needed to debug, truncate it with `internal/logsafe.TruncIP` first
+   (IPv4 → first three octets, `a.b.c.x`; IPv6 → first 48 bits) — or drop
+   the field entirely if it is not needed. Error text counts as a field:
+   `*net.OpError` (what every `net.Conn` read/write returns) embeds both
+   endpoints' full `ip:port`, so never log a raw connection error — render it
+   with `logsafe.ScrubErr`, which drops the endpoints and truncates any
+   surviving address.
+3. **`veld-relay` logs no per-connection events by default** — no channel
+   IDs, no client addresses; only startup/shutdown output. The `-verbose`
+   flag re-enables per-connection logs (channel IDs, truncated addresses)
+   for local debugging only: off by default, not for production.
+4. **`veld-coord` logs no per-connection events at all** — only
+   startup/shutdown and top-level operational errors. Auth failures return
+   a generic "invalid token" without echoing the token.
+
+Retention: with these rules, default logs retain nothing that identifies a
+client — no IP addresses, no channel IDs, no tokens — only what is needed
+to operate and debug the service itself.
+
+---
+
 ## Extension point rules
 
 All tier enforcement goes through the interfaces in `coord/core/`. Rules:
