@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/veldmesh/veld/internal/coexist"
 	intconfig "github.com/veldmesh/veld/internal/config"
 	"github.com/veldmesh/veld/internal/coord"
 	"github.com/veldmesh/veld/internal/crypto"
@@ -150,6 +151,15 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	d := New(localID, networkID, tunDev, conn, peerTbl)
 	d.routeMgr = route.New()
 
+	// Commercial VPN coexistence: detect VPN tunnels and routing conflicts
+	// at startup and log actionable guidance (kill switches, split tunneling,
+	// CIDR overlaps). Detection never blocks startup.
+	selfIface := ""
+	if tunDev != nil {
+		selfIface = tunDev.Name()
+	}
+	coexist.Report(fmt.Printf, selfIface, vpnPrefix)
+
 	// If this node advertises subnet routes, enable IP forwarding on Linux.
 	if len(cfg.Node.SubnetRoutes) > 0 {
 		if err := route.EnableIPForward(); err != nil {
@@ -162,6 +172,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	if cfg.Coord.Addr == "" {
 		for _, e := range peerTbl.List() {
 			for _, pfx := range e.SubnetRoutes {
+				logRouteCollisions(pfx, selfIface)
 				if err := d.routeMgr.Add(pfx, e.VPNAddr); err != nil {
 					fmt.Printf("warning: add route %s via %s: %v\n", pfx, e.VPNAddr, err)
 				}
@@ -281,6 +292,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 		d.coordCli.OnPeerAdded = func(e *peer.Entry) {
 			// Install OS routes for any subnets this peer advertises.
 			for _, pfx := range e.SubnetRoutes {
+				logRouteCollisions(pfx, selfIface)
 				if err := d.routeMgr.Add(pfx, e.VPNAddr); err != nil {
 					fmt.Printf("warning: add route %s via %s: %v\n", pfx, e.VPNAddr, err)
 				}
@@ -378,6 +390,14 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	}
 
 	return d, nil
+}
+
+// logRouteCollisions warns when a route Veldmesh is about to install
+// overlaps a route on another interface (e.g. a commercial VPN's).
+func logRouteCollisions(pfx netip.Prefix, selfIface string) {
+	for _, c := range coexist.CheckRoute(pfx, selfIface) {
+		fmt.Printf("%s\n", c)
+	}
 }
 
 func buildPeerTable(peerCfgs []intconfig.PeerConfig) (*peer.Table, error) {
