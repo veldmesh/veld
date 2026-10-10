@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -143,6 +144,93 @@ func TestNATManager_TwoPeersDiscover(t *testing.T) {
 	}
 
 	// Each side should see the other's loopback port.
+	if epAtA.Port() != portB {
+		t.Errorf("A sees B at port %d, want %d", epAtA.Port(), portB)
+	}
+	if epAtB.Port() != portA {
+		t.Errorf("B sees A at port %d, want %d", epAtB.Port(), portA)
+	}
+}
+
+// TestNATManager_RetransmitsDroppedSignal verifies that a session recovers when
+// the signaling channel drops early signals — as the coord server does when a
+// signal arrives addressed to a peer that has registered but not yet opened its
+// Watch stream. B's first two signals to A are dropped; the session must
+// retransmit until one gets through, and both peers must still discover each
+// other.
+func TestNATManager_RetransmitsDroppedSignal(t *testing.T) {
+	idA := makeIdentity(t)
+	idB := makeIdentity(t)
+
+	connA, portA := makeUDPConn(t)
+	connB, portB := makeUDPConn(t)
+
+	mgrA := nat.New(connA, portA, "" /*no STUN*/, idA)
+	mgrB := nat.New(connB, portB, "" /*no STUN*/, idB)
+
+	discoveredByA := make(chan netip.AddrPort, 1)
+	discoveredByB := make(chan netip.AddrPort, 1)
+	mgrA.OnEndpointDiscovered = func(_ [32]byte, ep netip.AddrPort) {
+		select {
+		case discoveredByA <- ep:
+		default:
+		}
+	}
+	mgrB.OnEndpointDiscovered = func(_ [32]byte, ep netip.AddrPort) {
+		select {
+		case discoveredByB <- ep:
+		default:
+		}
+	}
+
+	go pumpProbes(connA, mgrA)
+	go pumpProbes(connB, mgrB)
+
+	entryA := &peer.Entry{ID: [32]byte(idA.Ed25519Public[:32]), X25519Pub: idA.X25519Public}
+	entryA.VPNAddr = netip.MustParseAddr("10.0.0.1")
+	entryB := &peer.Entry{ID: [32]byte(idB.Ed25519Public[:32]), X25519Pub: idB.X25519Public}
+	entryB.VPNAddr = netip.MustParseAddr("10.0.0.2")
+
+	peerIDofA := hex.EncodeToString(idA.Ed25519Public[:32])
+	peerIDofB := hex.EncodeToString(idB.Ed25519Public[:32])
+
+	// A→B is a reliable channel. B→A drops the first two signals, then
+	// delivers, mirroring the coord server discarding signals for a peer
+	// whose Watch stream is not yet established.
+	var sentBtoA atomic.Int32
+	sendAtoB := func(payload []byte) error {
+		mgrB.DeliverSignal(peerIDofA, payload)
+		return nil
+	}
+	sendBtoA := func(payload []byte) error {
+		if sentBtoA.Add(1) <= 2 {
+			return nil
+		}
+		mgrA.DeliverSignal(peerIDofB, payload)
+		return nil
+	}
+
+	ctx := context.Background()
+	mgrA.Start(ctx, entryB, sendAtoB)
+	mgrB.Start(ctx, entryA, sendBtoA)
+
+	// Both must discover, even though B's first two signals were dropped.
+	timeout := time.After(5 * time.Second)
+	var epAtA, epAtB netip.AddrPort
+	remaining := 2
+	for remaining > 0 {
+		select {
+		case ep := <-discoveredByA:
+			epAtA = ep
+			remaining--
+		case ep := <-discoveredByB:
+			epAtB = ep
+			remaining--
+		case <-timeout:
+			t.Fatalf("timeout: A discovered=%v B discovered=%v", epAtA.IsValid(), epAtB.IsValid())
+		}
+	}
+
 	if epAtA.Port() != portB {
 		t.Errorf("A sees B at port %d, want %d", epAtA.Port(), portB)
 	}

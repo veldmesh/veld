@@ -184,7 +184,12 @@ func (c *Client) registerAndWatch(ctx context.Context, gc coordv1.CoordClient) e
 	ed25519B64 := base64.StdEncoding.EncodeToString(c.cfg.Identity.Ed25519Public)
 	x25519B64 := base64.StdEncoding.EncodeToString(c.cfg.Identity.X25519Public[:])
 
-	resp, err := gc.Register(ctx, &coordv1.RegisterRequest{
+	// Register is always signed with the machine Ed25519 key, proving
+	// possession of the private key behind the peer ID: the coord
+	// server rejects an unsigned Register. The signature covers every
+	// field that names or addresses the peer plus a fresh timestamp.
+	ts := time.Now().Unix()
+	req := &coordv1.RegisterRequest{
 		NetworkId:     c.cfg.NetworkID,
 		Token:         c.cfg.Token,
 		Name:          c.cfg.LocalName,
@@ -192,7 +197,18 @@ func (c *Client) registerAndWatch(ctx context.Context, gc coordv1.CoordClient) e
 		X25519Public:  x25519B64,
 		Endpoint:      c.cfg.Endpoint,
 		SubnetRoutes:  c.cfg.SubnetRoutes,
+		TimestampUnix: ts,
+	}
+	req.Signature = crypto.SignRegister(c.cfg.Identity.Ed25519Private, crypto.RegisterClaims{
+		NetworkID:     req.NetworkId,
+		Ed25519Public: req.Ed25519Public,
+		X25519Public:  req.X25519Public,
+		Endpoint:      req.Endpoint,
+		SubnetRoutes:  req.SubnetRoutes,
+		TimestampUnix: req.TimestampUnix,
 	})
+
+	resp, err := gc.Register(ctx, req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil

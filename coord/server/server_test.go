@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net/netip"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
 	coordcore "github.com/veldmesh/veld/coord/core"
 	"github.com/veldmesh/veld/coord/ce"
+	"github.com/veldmesh/veld/internal/crypto"
 )
 
 // fakeWatchStream implements coordv1.Coord_WatchServer for testing.
@@ -74,21 +76,69 @@ func testServer(t *testing.T) (*Server, *Registry) {
 	return New(reg, bus, enforcer, accounts, audit, subnet, hooks), reg
 }
 
+// --- Register proof of key possession test helpers ---
+
+// newRegisterIdentity generates a fresh identity for a peer registration.
+func newRegisterIdentity(t *testing.T) *crypto.Identity {
+	t.Helper()
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("Generate identity: %v", err)
+	}
+	return id
+}
+
+// registerClaimsFor builds the signed-message claims matching req.
+func registerClaimsFor(req *coordv1.RegisterRequest) crypto.RegisterClaims {
+	return crypto.RegisterClaims{
+		NetworkID:     req.NetworkId,
+		Ed25519Public: req.Ed25519Public,
+		X25519Public:  req.X25519Public,
+		Endpoint:      req.Endpoint,
+		SubnetRoutes:  req.SubnetRoutes,
+		TimestampUnix: req.TimestampUnix,
+	}
+}
+
+// signRegisterReq stamps and signs req in place with the identity's Ed25519
+// private key, exactly like the coord client does.
+func signRegisterReq(t *testing.T, id *crypto.Identity, req *coordv1.RegisterRequest) {
+	t.Helper()
+	req.TimestampUnix = time.Now().Unix()
+	req.Signature = crypto.SignRegister(id.Ed25519Private, registerClaimsFor(req))
+}
+
+// newRegisterRequest builds an unsigned RegisterRequest presenting id's
+// public keys.
+func newRegisterRequest(id *crypto.Identity, networkID, token, name, endpoint string, routes []string) *coordv1.RegisterRequest {
+	return &coordv1.RegisterRequest{
+		NetworkId:     networkID,
+		Token:         token,
+		Name:          name,
+		Ed25519Public: base64.StdEncoding.EncodeToString(id.Ed25519Public),
+		X25519Public:  base64.StdEncoding.EncodeToString(id.X25519Public[:]),
+		Endpoint:      endpoint,
+		SubnetRoutes:  routes,
+	}
+}
+
+// mustRegister registers req through the RPC and fails the test on error.
+func mustRegister(t *testing.T, srv *Server, req *coordv1.RegisterRequest) *coordv1.RegisterResponse {
+	t.Helper()
+	resp, err := srv.Register(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Register %s: %v", req.Name, err)
+	}
+	return resp
+}
+
 func TestServer_Register_OK(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey123"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey123"))
-
-	req := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-		Endpoint:      "192.168.1.1:51820",
-	}
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, "test-net", "test-token", "peer1", "192.168.1.1:51820", nil)
+	signRegisterReq(t, id, req)
 
 	resp, err := srv.Register(context.Background(), req)
 	if err != nil {
@@ -109,22 +159,20 @@ func TestServer_Register_OK(t *testing.T) {
 	if resp.NetworkId != "test-net" {
 		t.Errorf("NetworkId mismatch: got %s, want test-net", resp.NetworkId)
 	}
+
+	// The peer ID is the presented Ed25519 public key.
+	if resp.PeerId != hex.EncodeToString(id.Ed25519Public) {
+		t.Errorf("PeerId mismatch: got %s, want %s", resp.PeerId, hex.EncodeToString(id.Ed25519Public))
+	}
 }
 
 func TestServer_Register_InvalidToken(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey123"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey123"))
-
-	req := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "bad-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-	}
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, "test-net", "bad-token", "peer1", "", nil)
+	signRegisterReq(t, id, req)
 
 	_, err := srv.Register(context.Background(), req)
 	if err == nil {
@@ -136,16 +184,9 @@ func TestServer_Register_NetworkNotFound(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey123"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey123"))
-
-	req := &coordv1.RegisterRequest{
-		NetworkId:     "nonexistent-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-	}
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, "nonexistent-net", "test-token", "peer1", "", nil)
+	signRegisterReq(t, id, req)
 
 	_, err := srv.Register(context.Background(), req)
 	if err == nil {
@@ -159,16 +200,9 @@ func TestServer_Register_MachineLimit(t *testing.T) {
 
 	// Register 5 peers (free limit is 5)
 	for i := 0; i < 5; i++ {
-		ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey" + string(rune('0'+i))))
-		x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey" + string(rune('0'+i))))
-
-		req := &coordv1.RegisterRequest{
-			NetworkId:     "test-net",
-			Token:         "test-token",
-			Name:          "peer" + string(rune('1'+i)),
-			Ed25519Public: ed25519Pub,
-			X25519Public:  x25519Pub,
-		}
+		id := newRegisterIdentity(t)
+		req := newRegisterRequest(id, "test-net", "test-token", fmt.Sprintf("peer%d", i+1), "", nil)
+		signRegisterReq(t, id, req)
 
 		if _, err := srv.Register(context.Background(), req); err != nil {
 			t.Fatalf("Register peer %d: %v", i+1, err)
@@ -176,16 +210,9 @@ func TestServer_Register_MachineLimit(t *testing.T) {
 	}
 
 	// 6th registration should fail
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey5"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey5"))
-
-	req := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer6",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-	}
+	sixth := newRegisterIdentity(t)
+	req := newRegisterRequest(sixth, "test-net", "test-token", "peer6", "", nil)
+	signRegisterReq(t, sixth, req)
 
 	_, err := srv.Register(context.Background(), req)
 	if err == nil {
@@ -199,16 +226,9 @@ func TestServer_ListPeers_OK(t *testing.T) {
 
 	// Register 2 peers
 	for i := 0; i < 2; i++ {
-		ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey" + string(rune('0'+i))))
-		x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey" + string(rune('0'+i))))
-
-		req := &coordv1.RegisterRequest{
-			NetworkId:     "test-net",
-			Token:         "test-token",
-			Name:          "peer" + string(rune('1'+i)),
-			Ed25519Public: ed25519Pub,
-			X25519Public:  x25519Pub,
-		}
+		id := newRegisterIdentity(t)
+		req := newRegisterRequest(id, "test-net", "test-token", fmt.Sprintf("peer%d", i+1), "", nil)
+		signRegisterReq(t, id, req)
 
 		if _, err := srv.Register(context.Background(), req); err != nil {
 			t.Fatalf("Register: %v", err)
@@ -230,9 +250,15 @@ func TestServer_ListPeers_OK(t *testing.T) {
 		t.Errorf("ListPeers: got %d peers, want 2", len(resp.Peers))
 	}
 
-	for i, peer := range resp.Peers {
-		if peer.Name != "peer"+string(rune('1'+i)) {
-			t.Errorf("Peer %d name: got %s, want peer%d", i, peer.Name, 1+i)
+	// Peer IDs are Ed25519 keys, so bucket order is not registration
+	// order: assert the exact set of names instead.
+	names := make(map[string]bool, len(resp.Peers))
+	for _, peer := range resp.Peers {
+		names[peer.Name] = true
+	}
+	for _, want := range []string{"peer1", "peer2"} {
+		if !names[want] {
+			t.Errorf("ListPeers: missing peer %s, got %v", want, names)
 		}
 	}
 }
@@ -257,16 +283,9 @@ func TestServer_Leave_OK(t *testing.T) {
 	defer reg.Close()
 
 	// Register a peer
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey123"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey123"))
-
-	regReq := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-	}
+	id := newRegisterIdentity(t)
+	regReq := newRegisterRequest(id, "test-net", "test-token", "peer1", "", nil)
+	signRegisterReq(t, id, regReq)
 
 	regResp, err := srv.Register(context.Background(), regReq)
 	if err != nil {
@@ -319,31 +338,70 @@ func TestServer_SendSignal_OK(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	register := func(name string) string {
-		t.Helper()
-		resp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
-			NetworkId:     "test-net",
-			Token:         "test-token",
-			Name:          name,
-			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("ed25519-" + name)),
-			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x25519-" + name)),
-		})
-		if err != nil {
-			t.Fatalf("Register %s: %v", name, err)
-		}
-		return resp.PeerId
+	idA := newRegisterIdentity(t)
+	reqA := newRegisterRequest(idA, "test-net", "test-token", "signal-a", "", nil)
+	signRegisterReq(t, idA, reqA)
+	respA, err := srv.Register(context.Background(), reqA)
+	if err != nil {
+		t.Fatalf("Register A: %v", err)
 	}
-	idA := register("signal-a")
-	idB := register("signal-b")
 
-	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+	idB := newRegisterIdentity(t)
+	reqB := newRegisterRequest(idB, "test-net", "test-token", "signal-b", "", nil)
+	signRegisterReq(t, idB, reqB)
+	respB, err := srv.Register(context.Background(), reqB)
+	if err != nil {
+		t.Fatalf("Register B: %v", err)
+	}
+
+	// Watch as the target peer so the delivered signal is observable.
+	stream := newFakeWatchStream()
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.Watch(&coordv1.WatchRequest{
+			NetworkId: "test-net",
+			Token:     "test-token",
+			PeerId:    respB.PeerId,
+		}, stream)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	_, err = srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
 		Token:      "test-token",
-		FromPeerId: idA,
-		ToPeerId:   idB,
+		FromPeerId: respA.PeerId,
+		ToPeerId:   respB.PeerId,
 		Payload:    []byte("test signal"),
 	})
 	if err != nil {
+		stream.cancel()
 		t.Fatalf("SendSignal: %v", err)
+	}
+
+	// Let the signal flow through the bus before closing the stream.
+	time.Sleep(100 * time.Millisecond)
+	stream.cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Watch error: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Watch goroutine did not finish")
+	}
+
+	var got *coordv1.SignalEvent
+	for _, ev := range stream.events {
+		if ev.Type == coordv1.EventType_SIGNAL && ev.Signal != nil {
+			got = ev.Signal
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("signal not delivered to target peer; events: %+v", stream.events)
+	}
+	if got.FromPeerId != respA.PeerId || string(got.Payload) != "test signal" {
+		t.Errorf("delivered signal: got %+v, want from %s payload %q", got, respA.PeerId, "test signal")
 	}
 }
 
@@ -385,16 +443,9 @@ func TestServer_Watch_ReceivesJoinEvent(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Register a peer (this should trigger a JOIN event)
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey123"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey123"))
-
-	regReq := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-	}
+	id := newRegisterIdentity(t)
+	regReq := newRegisterRequest(id, "test-net", "test-token", "peer1", "", nil)
+	signRegisterReq(t, id, regReq)
 
 	_, err := srv.Register(context.Background(), regReq)
 	if err != nil {
@@ -433,16 +484,11 @@ func TestServer_Watch_ReceivesLeaveEvent(t *testing.T) {
 	defer reg.Close()
 
 	// Register a peer first.
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey123"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey123"))
+	id := newRegisterIdentity(t)
+	regReq := newRegisterRequest(id, "test-net", "test-token", "peer1", "", nil)
+	signRegisterReq(t, id, regReq)
 
-	regResp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-	})
+	regResp, err := srv.Register(context.Background(), regReq)
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -500,18 +546,12 @@ func TestServer_Watch_ReceivesEndpointUpdate(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkey123"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkey123"))
+	id := newRegisterIdentity(t)
 
 	// First registration.
-	regResp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-		Endpoint:      "1.2.3.4:51820",
-	})
+	firstReq := newRegisterRequest(id, "test-net", "test-token", "peer1", "1.2.3.4:51820", nil)
+	signRegisterReq(t, id, firstReq)
+	regResp, err := srv.Register(context.Background(), firstReq)
 	if err != nil {
 		t.Fatalf("first Register: %v", err)
 	}
@@ -529,14 +569,9 @@ func TestServer_Watch_ReceivesEndpointUpdate(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Re-register with a different endpoint.
-	_, err = srv.Register(context.Background(), &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "peer1",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-		Endpoint:      "9.8.7.6:51820",
-	})
+	secondReq := newRegisterRequest(id, "test-net", "test-token", "peer1", "9.8.7.6:51820", nil)
+	signRegisterReq(t, id, secondReq)
+	_, err = srv.Register(context.Background(), secondReq)
 	if err != nil {
 		t.Fatalf("second Register: %v", err)
 	}
@@ -582,15 +617,14 @@ func TestServer_Register_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ed25519Pub := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("ed25519pubkey%02d", i)))
-			x25519Pub := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("x25519pubkey%02d", i)))
-			_, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
-				NetworkId:     "test-net",
-				Token:         "test-token",
-				Name:          fmt.Sprintf("peer%d", i),
-				Ed25519Public: ed25519Pub,
-				X25519Public:  x25519Pub,
-			})
+			id, err := crypto.Generate()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			req := newRegisterRequest(id, "test-net", "test-token", fmt.Sprintf("peer%d", i), "", nil)
+			signRegisterReq(t, id, req)
+			_, err = srv.Register(context.Background(), req)
 			errCh <- err
 		}()
 	}
@@ -620,16 +654,9 @@ func TestServer_Register_Idempotent(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	ed25519Pub := base64.StdEncoding.EncodeToString([]byte("ed25519pubkeyXX"))
-	x25519Pub := base64.StdEncoding.EncodeToString([]byte("x25519pubkeyXX"))
-
-	req := &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "idempotent-peer",
-		Ed25519Public: ed25519Pub,
-		X25519Public:  x25519Pub,
-	}
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, "test-net", "test-token", "idempotent-peer", "", nil)
+	signRegisterReq(t, id, req)
 
 	resp1, err := srv.Register(context.Background(), req)
 	if err != nil {
@@ -649,6 +676,8 @@ func TestServer_Register_Idempotent(t *testing.T) {
 	}
 }
 
+// --- Signal holding tests ---
+
 // A client registers first and opens Watch afterwards. A peer that is already
 // watching sees the JOIN in between and signals immediately; that signal must
 // reach the newcomer once its Watch opens (it used to be dropped, so NAT
@@ -657,25 +686,25 @@ func TestServer_SignalSentBeforeRecipientWatches_IsDelivered(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	register := func(name string) string {
-		resp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
-			NetworkId:     "test-net",
-			Token:         "test-token",
-			Name:          name,
-			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("ed25519-" + name)),
-			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x25519-" + name)),
-		})
-		if err != nil {
-			t.Fatalf("Register %s: %v", name, err)
-		}
-		return resp.PeerId
+	idA := newRegisterIdentity(t)
+	reqA := newRegisterRequest(idA, "test-net", "test-token", "node-a", "", nil)
+	signRegisterReq(t, idA, reqA)
+	respA, err := srv.Register(context.Background(), reqA)
+	if err != nil {
+		t.Fatalf("Register A: %v", err)
 	}
-	idA := register("node-a")
-	idB := register("node-b")
+
+	idB := newRegisterIdentity(t)
+	reqB := newRegisterRequest(idB, "test-net", "test-token", "node-b", "", nil)
+	signRegisterReq(t, idB, reqB)
+	respB, err := srv.Register(context.Background(), reqB)
+	if err != nil {
+		t.Fatalf("Register B: %v", err)
+	}
 
 	// B signals A before A has opened its Watch stream.
 	if _, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
-		Token: "test-token", FromPeerId: idB, ToPeerId: idA, Payload: []byte("candidates-from-b"),
+		Token: "test-token", FromPeerId: respB.PeerId, ToPeerId: respA.PeerId, Payload: []byte("candidates-from-b"),
 	}); err != nil {
 		t.Fatalf("SendSignal: %v", err)
 	}
@@ -683,7 +712,7 @@ func TestServer_SignalSentBeforeRecipientWatches_IsDelivered(t *testing.T) {
 	stream := newFakeWatchStream()
 	done := make(chan error, 1)
 	go func() {
-		done <- srv.Watch(&coordv1.WatchRequest{NetworkId: "test-net", Token: "test-token", PeerId: idA}, stream)
+		done <- srv.Watch(&coordv1.WatchRequest{NetworkId: "test-net", Token: "test-token", PeerId: respA.PeerId}, stream)
 	}()
 	time.Sleep(100 * time.Millisecond)
 	stream.cancel()
@@ -695,7 +724,7 @@ func TestServer_SignalSentBeforeRecipientWatches_IsDelivered(t *testing.T) {
 
 	for _, ev := range stream.events {
 		if ev.Type == coordv1.EventType_SIGNAL && ev.Signal != nil &&
-			ev.Signal.FromPeerId == idB && string(ev.Signal.Payload) == "candidates-from-b" {
+			ev.Signal.FromPeerId == respB.PeerId && string(ev.Signal.Payload) == "candidates-from-b" {
 			return
 		}
 	}
@@ -706,13 +735,10 @@ func TestServer_SignalToUnknownPeer_IsNotHeld(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	resp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
-		NetworkId:     "test-net",
-		Token:         "test-token",
-		Name:          "signal-sender",
-		Ed25519Public: base64.StdEncoding.EncodeToString([]byte("ed25519-signal-sender")),
-		X25519Public:  base64.StdEncoding.EncodeToString([]byte("x25519-signal-sender")),
-	})
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, "test-net", "test-token", "signal-sender", "", nil)
+	signRegisterReq(t, id, req)
+	resp, err := srv.Register(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -734,7 +760,8 @@ func TestServer_SignalToUnknownPeer_IsNotHeld(t *testing.T) {
 
 // twoAccountTestServer builds a server with two accounts (token "tok-a" ->
 // account acc1, token "tok-b" -> account acc2) and two networks: "net-a"
-// owned by acc1 and "net-b" owned by acc2.
+// owned by acc1 and "net-b" owned by acc2. Peers are registered via the RPC
+// so they have valid keys and signatures.
 func twoAccountTestServer(t *testing.T) (*Server, *Registry) {
 	t.Helper()
 	reg, err := NewRegistry(t.TempDir() + "/test.db")
@@ -752,40 +779,66 @@ func twoAccountTestServer(t *testing.T) (*Server, *Registry) {
 		"tok-b": {ID: "acc2", Tier: coordcore.TierFree},
 	})
 	srv := New(reg, NewBus(), ce.NewFreeEnforcer(), accounts, ce.NewNoopAuditLogger(), ce.NewRejectSubnetPolicy(), ce.NewNoopHooks())
-	return srv, reg
-}
 
-// registerTestPeer inserts a peer record directly into the registry.
-func registerTestPeer(t *testing.T, reg *Registry, id, networkID string) {
-	t.Helper()
-	now := time.Now().Unix()
-	rec := peerRecord{
-		ID:            id,
-		Name:          id,
-		Ed25519Public: "dGVzdA==",
-		X25519Public:  "dGVzdA==",
-		LastSeen:      now,
-		RegisteredAt:  now,
+	// Register one peer per network via the RPC so they have valid keys.
+	idA := newRegisterIdentity(t)
+	reqA := newRegisterRequest(idA, "net-a", "tok-a", "peer-a1", "", nil)
+	signRegisterReq(t, idA, reqA)
+	_, err = srv.Register(context.Background(), reqA)
+	if err != nil {
+		t.Fatalf("Register A: %v", err)
 	}
-	if _, err := reg.RegisterPeer(rec, networkID, 0); err != nil {
-		t.Fatalf("RegisterPeer %s: %v", id, err)
+
+	idB := newRegisterIdentity(t)
+	reqB := newRegisterRequest(idB, "net-b", "tok-b", "peer-b1", "", nil)
+	signRegisterReq(t, idB, reqB)
+	_, err = srv.Register(context.Background(), reqB)
+	if err != nil {
+		t.Fatalf("Register B: %v", err)
 	}
+
+	return srv, reg
 }
 
 func TestServer_SendSignal_SenderNotOwnedByCaller_IsRejected(t *testing.T) {
 	srv, reg := twoAccountTestServer(t)
 	defer reg.Close()
-	registerTestPeer(t, reg, "a1", "net-a") // acc1's peer
-	registerTestPeer(t, reg, "b1", "net-b") // acc2's peer
 
-	// A caller authenticated as acc1 claims to be acc2's peer. Without the
-	// ownership check it could both spoof acc2 and make the registered
+	// We need a second peer in net-a to be the recipient.
+	idA2 := newRegisterIdentity(t)
+	reqA2 := newRegisterRequest(idA2, "net-a", "tok-a", "peer-a2", "", nil)
+	signRegisterReq(t, idA2, reqA2)
+	_, err := srv.Register(context.Background(), reqA2)
+	if err != nil {
+		t.Fatalf("Register A2: %v", err)
+	}
+
+	// Get the peer IDs from the registry (they're the hex Ed25519 public keys).
+	var peerA1, peerB1 string
+	peersA, _ := reg.ListPeers("net-a")
+	for _, p := range peersA {
+		if p.Name == "peer-a1" {
+			peerA1 = p.ID
+		}
+		if p.Name == "peer-a2" {
+			// peer-a2 is the recipient, peerA1 is the spoofed sender
+		}
+	}
+	peersB, _ := reg.ListPeers("net-b")
+	for _, p := range peersB {
+		if p.Name == "peer-b1" {
+			peerB1 = p.ID
+		}
+	}
+
+	// A caller authenticated as acc1 (tok-a) claims to be acc2's peer (peerB1).
+	// Without the ownership check it could both spoof acc2 and make the registered
 	// recipient hold a signal that never really came from b1's account.
-	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
-		Token: "tok-a", FromPeerId: "b1", ToPeerId: "a1", Payload: []byte("spoofed"),
+	_, err = srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token: "tok-a", FromPeerId: peerB1, ToPeerId: peerA1, Payload: []byte("spoofed"),
 	})
-	if status.Code(err) != codes.PermissionDenied {
-		t.Fatalf("SendSignal with a foreign from_peer_id: got %v, want PermissionDenied", err)
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("SendSignal with a foreign from_peer_id: got %v, want NotFound", err)
 	}
 
 	srv.bus.mu.RLock()
@@ -798,15 +851,28 @@ func TestServer_SendSignal_SenderNotOwnedByCaller_IsRejected(t *testing.T) {
 func TestServer_SendSignal_PeersNotInSameNetwork_IsRejected(t *testing.T) {
 	srv, reg := twoAccountTestServer(t)
 	defer reg.Close()
-	registerTestPeer(t, reg, "a1", "net-a")
-	registerTestPeer(t, reg, "b1", "net-b")
+
+	// Get the peer IDs from the registry.
+	var peerA1, peerB1 string
+	peersA, _ := reg.ListPeers("net-a")
+	for _, p := range peersA {
+		if p.Name == "peer-a1" {
+			peerA1 = p.ID
+		}
+	}
+	peersB, _ := reg.ListPeers("net-b")
+	for _, p := range peersB {
+		if p.Name == "peer-b1" {
+			peerB1 = p.ID
+		}
+	}
 
 	// Both peers are registered, but they do not share a network.
 	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
-		Token: "tok-a", FromPeerId: "a1", ToPeerId: "b1", Payload: []byte("p"),
+		Token: "tok-a", FromPeerId: peerA1, ToPeerId: peerB1, Payload: []byte("p"),
 	})
-	if status.Code(err) != codes.PermissionDenied {
-		t.Fatalf("SendSignal across networks: got %v, want PermissionDenied", err)
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("SendSignal across networks: got %v, want NotFound", err)
 	}
 
 	srv.bus.mu.RLock()
@@ -819,10 +885,17 @@ func TestServer_SendSignal_PeersNotInSameNetwork_IsRejected(t *testing.T) {
 func TestServer_SendSignal_UnknownSender_IsRejected(t *testing.T) {
 	srv, reg := twoAccountTestServer(t)
 	defer reg.Close()
-	registerTestPeer(t, reg, "a1", "net-a")
+
+	var peerA1 string
+	peersA, _ := reg.ListPeers("net-a")
+	for _, p := range peersA {
+		if p.Name == "peer-a1" {
+			peerA1 = p.ID
+		}
+	}
 
 	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
-		Token: "tok-a", FromPeerId: "no-such-sender", ToPeerId: "a1", Payload: []byte("p"),
+		Token: "tok-a", FromPeerId: "no-such-sender", ToPeerId: peerA1, Payload: []byte("p"),
 	})
 	if status.Code(err) != codes.NotFound {
 		t.Fatalf("SendSignal with an unregistered sender: got %v, want NotFound", err)
@@ -841,14 +914,20 @@ func TestServer_SendSignal_UnknownSender_IsRejected(t *testing.T) {
 func TestServer_Leave_PeerNotOwnedByCaller_IsRejected(t *testing.T) {
 	srv, reg := twoAccountTestServer(t)
 	defer reg.Close()
-	registerTestPeer(t, reg, "a1", "net-a") // acc1's peer
-	registerTestPeer(t, reg, "b1", "net-b") // acc2's peer
+
+	var peerB1 string
+	peersB, _ := reg.ListPeers("net-b")
+	for _, p := range peersB {
+		if p.Name == "peer-b1" {
+			peerB1 = p.ID
+		}
+	}
 
 	_, err := srv.Leave(context.Background(), &coordv1.LeaveRequest{
-		Token: "tok-a", PeerId: "b1",
+		Token: "tok-a", PeerId: peerB1,
 	})
-	if status.Code(err) != codes.PermissionDenied {
-		t.Fatalf("Leave removing a peer of another account: got %v, want PermissionDenied", err)
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("Leave removing a peer of another account: got %v, want NotFound", err)
 	}
 
 	// The peer must still be registered.
@@ -856,7 +935,7 @@ func TestServer_Leave_PeerNotOwnedByCaller_IsRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPeers net-b: %v", err)
 	}
-	if len(peers) != 1 || peers[0].ID != "b1" {
+	if len(peers) != 1 || peers[0].ID != peerB1 {
 		t.Fatalf("Leave removed another account's peer; net-b peers: %+v", peers)
 	}
 }
@@ -867,27 +946,26 @@ func TestServer_SendSignal_PayloadTooLarge_IsRejected(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	register := func(name string) string {
-		t.Helper()
-		resp, err := srv.Register(context.Background(), &coordv1.RegisterRequest{
-			NetworkId:     "test-net",
-			Token:         "test-token",
-			Name:          name,
-			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("ed25519-" + name)),
-			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x25519-" + name)),
-		})
-		if err != nil {
-			t.Fatalf("Register %s: %v", name, err)
-		}
-		return resp.PeerId
+	idA := newRegisterIdentity(t)
+	reqA := newRegisterRequest(idA, "test-net", "test-token", "signal-a", "", nil)
+	signRegisterReq(t, idA, reqA)
+	respA, err := srv.Register(context.Background(), reqA)
+	if err != nil {
+		t.Fatalf("Register A: %v", err)
 	}
-	idA := register("signal-a")
-	idB := register("signal-b")
 
-	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+	idB := newRegisterIdentity(t)
+	reqB := newRegisterRequest(idB, "test-net", "test-token", "signal-b", "", nil)
+	signRegisterReq(t, idB, reqB)
+	respB, err := srv.Register(context.Background(), reqB)
+	if err != nil {
+		t.Fatalf("Register B: %v", err)
+	}
+
+	_, err = srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
 		Token:      "test-token",
-		FromPeerId: idA,
-		ToPeerId:   idB,
+		FromPeerId: respA.PeerId,
+		ToPeerId:   respB.PeerId,
 		Payload:    make([]byte, maxSignalPayload+1),
 	})
 	if status.Code(err) != codes.InvalidArgument {
@@ -904,10 +982,709 @@ func TestServer_SendSignal_PayloadTooLarge_IsRejected(t *testing.T) {
 	// bytes is accepted (held for the recipient that has no Watch yet).
 	if _, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
 		Token:      "test-token",
-		FromPeerId: idA,
-		ToPeerId:   idB,
+		FromPeerId: respA.PeerId,
+		ToPeerId:   respB.PeerId,
 		Payload:    make([]byte, maxSignalPayload),
 	}); err != nil {
 		t.Fatalf("SendSignal with a max-size payload: %v", err)
+	}
+}
+
+// --- Per-account scoping tests ---
+
+// scopedFixture is a Server wired for per-account scoping tests: account A
+// ("acc-a", token "token-a") owns netA and netA2, account B ("acc-b", token
+// "token-b") owns netB, and seed peers are registered in each network.
+type scopedFixture struct {
+	srv    *Server
+	reg    *Registry
+	netA   string
+	netA2  string
+	netB   string
+	tokenA string
+	tokenB string
+	peerA1 string // peer in netA  (account A)
+	peerA2 string // peer in netA  (account A)
+	peerA3 string // peer in netA2 (account A)
+	peerB1 string // peer in netB  (account B)
+	idA1   *crypto.Identity // identity behind peerA1
+
+	// newPeerID carries the peer ID registered by the most recent call
+	// row so its check can assert on it.
+	newPeerID string
+
+	// watched holds the events collected by the most recent watch helper
+	// call so a table row's check can assert on them.
+	watched []*coordv1.PeerEvent
+}
+
+// newScopedFixture builds the two-account test server and registers the
+// seed peers through the Register RPC, exactly like real daemons do.
+func newScopedFixture(t *testing.T) *scopedFixture {
+	t.Helper()
+	reg, err := NewRegistry(t.TempDir() + "/scoped.db")
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+
+	nets := []struct{ id, cidr, owner string }{
+		{"net-a", "10.99.0.0/24", "acc-a"},
+		{"net-a2", "10.99.2.0/24", "acc-a"},
+		{"net-b", "10.99.1.0/24", "acc-b"},
+	}
+	for _, n := range nets {
+		cidr := netip.MustParsePrefix(n.cidr)
+		if err := reg.CreateNetwork(coordcore.Network{ID: n.id, CIDR: cidr, Name: n.id}, n.owner); err != nil {
+			t.Fatalf("CreateNetwork %s: %v", n.id, err)
+		}
+	}
+
+	accounts := ce.NewTokenAccountStore(map[string]coordcore.Account{
+		"token-a": {ID: "acc-a", Tier: coordcore.TierFree},
+		"token-b": {ID: "acc-b", Tier: coordcore.TierFree},
+	})
+	srv := New(reg, NewBus(), ce.NewFreeEnforcer(), accounts, ce.NewNoopAuditLogger(), ce.NewRejectSubnetPolicy(), ce.NewNoopHooks())
+
+	f := &scopedFixture{
+		srv:    srv,
+		reg:    reg,
+		netA:   "net-a",
+		netA2:  "net-a2",
+		netB:   "net-b",
+		tokenA: "token-a",
+		tokenB: "token-b",
+	}
+	f.peerA1, f.idA1 = scopedRegister(t, f, f.netA, f.tokenA, "peer-a1", "1.1.1.1:1111")
+	f.peerA2, _ = scopedRegister(t, f, f.netA, f.tokenA, "peer-a2", "")
+	f.peerA3, _ = scopedRegister(t, f, f.netA2, f.tokenA, "peer-a3", "")
+	f.peerB1, _ = scopedRegister(t, f, f.netB, f.tokenB, "peer-b1", "")
+	return f
+}
+
+// scopedRegister registers a peer through the Register RPC — generating a
+// fresh identity and signing the proof of possession like a real daemon —
+// and returns the assigned peer ID and the identity behind it.
+func scopedRegister(t *testing.T, f *scopedFixture, networkID, token, name, endpoint string) (string, *crypto.Identity) {
+	t.Helper()
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, networkID, token, name, endpoint, nil)
+	signRegisterReq(t, id, req)
+	resp, err := f.srv.Register(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Register %s into %s: %v", name, networkID, err)
+	}
+	return resp.PeerId, id
+}
+
+// scopedWatch runs a Watch stream for req to completion (stopping it after
+// a short wait) and returns the stream error and the events received.
+func (f *scopedFixture) scopedWatch(t *testing.T, req *coordv1.WatchRequest) ([]*coordv1.PeerEvent, error) {
+	t.Helper()
+	stream := newFakeWatchStream()
+	done := make(chan error, 1)
+	go func() { done <- f.srv.Watch(req, stream) }()
+	time.Sleep(100 * time.Millisecond)
+	stream.cancel()
+	select {
+	case err := <-done:
+		return stream.events, err
+	case <-time.After(2 * time.Second):
+		t.Fatal("Watch did not finish after cancel")
+		return nil, nil
+	}
+}
+
+// watchDuring starts a Watch for peerID in networkID (authenticated with
+// token), lets the subscription establish, runs fn, then stops the stream
+// and returns the events it received.
+func (f *scopedFixture) watchDuring(t *testing.T, token, networkID, peerID string, fn func()) []*coordv1.PeerEvent {
+	t.Helper()
+	stream := newFakeWatchStream()
+	done := make(chan error, 1)
+	go func() {
+		done <- f.srv.Watch(&coordv1.WatchRequest{NetworkId: networkID, Token: token, PeerId: peerID}, stream)
+	}()
+	time.Sleep(100 * time.Millisecond) // let the subscription establish
+	fn()
+	time.Sleep(100 * time.Millisecond) // let any (wrongly) delivered signal arrive
+	stream.cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchDuring: Watch did not finish")
+	}
+	return stream.events
+}
+
+// assertNetworkPeers fails unless an authorized ListPeers shows networkID
+// holding exactly the given peer IDs.
+func assertNetworkPeers(t *testing.T, f *scopedFixture, token, networkID string, wantIDs ...string) {
+	t.Helper()
+	resp, err := f.srv.ListPeers(context.Background(), &coordv1.ListPeersRequest{NetworkId: networkID, Token: token})
+	if err != nil {
+		t.Fatalf("ListPeers %s: %v", networkID, err)
+	}
+	got := make(map[string]bool, len(resp.Peers))
+	for _, p := range resp.Peers {
+		got[p.Id] = true
+	}
+	if len(got) != len(wantIDs) {
+		t.Errorf("network %s peers: got %d (%v), want exactly %d (%v)", networkID, len(got), got, len(wantIDs), wantIDs)
+		return
+	}
+	for _, id := range wantIDs {
+		if !got[id] {
+			t.Errorf("network %s: expected peer %s, got %v", networkID, id, got)
+		}
+	}
+}
+
+// assertMachineCount fails unless the network's registered machine count
+// equals want.
+func assertMachineCount(t *testing.T, f *scopedFixture, networkID string, want int) {
+	t.Helper()
+	count, err := f.reg.NetworkMachineCount(networkID)
+	if err != nil {
+		t.Fatalf("NetworkMachineCount %s: %v", networkID, err)
+	}
+	if count != want {
+		t.Errorf("network %s machine count: got %d, want %d", networkID, count, want)
+	}
+}
+
+// assertNoSignal fails if any collected event is a delivered signal.
+func assertNoSignal(t *testing.T, events []*coordv1.PeerEvent) {
+	t.Helper()
+	for _, ev := range events {
+		if ev.Type == coordv1.EventType_SIGNAL {
+			t.Errorf("signal delivered despite scoping: %+v", ev.Signal)
+		}
+	}
+}
+
+// TestServer_PerAccountScoping is a table over every coord RPC: a request
+// may only read or change state inside networks owned by the token's
+// account, and may only name peers registered in those networks. Each
+// cross-account row uses account B's valid token against account A's
+// networks or peers and must fail with codes.NotFound without any state
+// change; each same-account row keeps working.
+func TestServer_PerAccountScoping(t *testing.T) {
+	cases := []struct {
+		name     string
+		call     func(t *testing.T, f *scopedFixture) error
+		check    func(t *testing.T, f *scopedFixture)
+		wantCode codes.Code
+	}{
+		{
+			name: "Register into another account's network",
+			call: func(t *testing.T, f *scopedFixture) error {
+				id := newRegisterIdentity(t)
+				req := newRegisterRequest(id, f.netA, f.tokenB, "b-new-peer", "", nil)
+				signRegisterReq(t, id, req)
+				_, err := f.srv.Register(context.Background(), req)
+				return err
+			},
+			check: func(t *testing.T, f *scopedFixture) {
+				// A's network still holds exactly its own peers.
+				assertNetworkPeers(t, f, f.tokenA, f.netA, f.peerA1, f.peerA2)
+				assertMachineCount(t, f, f.netA, 2)
+			},
+			wantCode: codes.NotFound,
+		},
+		{
+			name: "ListPeers of another account's network",
+			call: func(t *testing.T, f *scopedFixture) error {
+				_, err := f.srv.ListPeers(context.Background(), &coordv1.ListPeersRequest{NetworkId: f.netA, Token: f.tokenB})
+				return err
+			},
+			check: func(t *testing.T, f *scopedFixture) {
+				// Account A's own view is unchanged.
+				assertNetworkPeers(t, f, f.tokenA, f.netA, f.peerA1, f.peerA2)
+			},
+			wantCode: codes.NotFound,
+		},
+		{
+			name: "Watch another account's network",
+			call: func(t *testing.T, f *scopedFixture) error {
+				events, err := f.scopedWatch(t, &coordv1.WatchRequest{NetworkId: f.netA, Token: f.tokenB})
+				f.watched = events
+				return err
+			},
+			check: func(t *testing.T, f *scopedFixture) {
+				if len(f.watched) != 0 {
+					t.Errorf("rejected Watch delivered events: %+v", f.watched)
+				}
+			},
+			wantCode: codes.NotFound,
+		},
+		{
+			name: "Watch own network naming another account's peer",
+			call: func(t *testing.T, f *scopedFixture) error {
+				events, err := f.scopedWatch(t, &coordv1.WatchRequest{NetworkId: f.netB, Token: f.tokenB, PeerId: f.peerA1})
+				f.watched = events
+				return err
+			},
+			check: func(t *testing.T, f *scopedFixture) {
+				if len(f.watched) != 0 {
+					t.Errorf("rejected Watch delivered events: %+v", f.watched)
+				}
+				if f.srv.IsConnected(f.peerA1) {
+					t.Error("rejected Watch still marked the foreign peer connected")
+				}
+			},
+			wantCode: codes.NotFound,
+		},
+		{
+			name: "SendSignal to another account's peer",
+			call: func(t *testing.T, f *scopedFixture) error {
+				var rpcErr error
+				f.watched = f.watchDuring(t, f.tokenA, f.netA, f.peerA1, func() {
+					_, rpcErr = f.srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+						Token:      f.tokenB,
+						FromPeerId: f.peerB1,
+						ToPeerId:   f.peerA1,
+						Payload:    []byte("scoped?"),
+					})
+				})
+				return rpcErr
+			},
+			check: func(t *testing.T, f *scopedFixture) {
+				assertNoSignal(t, f.watched)
+			},
+			wantCode: codes.NotFound,
+		},
+		{
+			name: "SendSignal as another account's peer",
+			call: func(t *testing.T, f *scopedFixture) error {
+				var rpcErr error
+				f.watched = f.watchDuring(t, f.tokenA, f.netA, f.peerA2, func() {
+					_, rpcErr = f.srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+						Token:      f.tokenB,
+						FromPeerId: f.peerA1,
+						ToPeerId:   f.peerA2,
+						Payload:    []byte("scoped?"),
+					})
+				})
+				return rpcErr
+			},
+			check: func(t *testing.T, f *scopedFixture) {
+				assertNoSignal(t, f.watched)
+			},
+			wantCode: codes.NotFound,
+		},
+		{
+			name: "Leave another account's peer",
+			call: func(t *testing.T, f *scopedFixture) error {
+				_, err := f.srv.Leave(context.Background(), &coordv1.LeaveRequest{Token: f.tokenB, PeerId: f.peerA1})
+				return err
+			},
+			check: func(t *testing.T, f *scopedFixture) {
+				// The peer is still registered.
+				assertNetworkPeers(t, f, f.tokenA, f.netA, f.peerA1, f.peerA2)
+				assertMachineCount(t, f, f.netA, 2)
+			},
+			wantCode: codes.NotFound,
+		},
+		{
+			name: "SendSignal across two networks of the same account",
+			call: func(t *testing.T, f *scopedFixture) error {
+				var rpcErr error
+				f.watched = f.watchDuring(t, f.tokenA, f.netA2, f.peerA3, func() {
+					_, rpcErr = f.srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+						Token:      f.tokenA,
+						FromPeerId: f.peerA1,
+						ToPeerId:   f.peerA3,
+						Payload:    []byte("cross-net"),
+					})
+				})
+				return rpcErr
+			},
+			check: func(t *testing.T, f *scopedFixture) {
+				assertNoSignal(t, f.watched)
+			},
+			wantCode: codes.NotFound,
+		},
+		// Same-account requests keep working.
+		{
+			name: "Register into own network succeeds",
+			call: func(t *testing.T, f *scopedFixture) error {
+				id := newRegisterIdentity(t)
+				f.newPeerID = hex.EncodeToString(id.Ed25519Public)
+				req := newRegisterRequest(id, f.netB, f.tokenB, "b-second-peer", "", nil)
+				signRegisterReq(t, id, req)
+				_, err := f.srv.Register(context.Background(), req)
+				return err
+			},
+			check: func(t *testing.T, f *scopedFixture) {
+				assertNetworkPeers(t, f, f.tokenB, f.netB, f.peerB1, f.newPeerID)
+				assertMachineCount(t, f, f.netB, 2)
+			},
+			wantCode: codes.OK,
+		},
+		{
+			name: "ListPeers of own network succeeds",
+			call: func(t *testing.T, f *scopedFixture) error {
+				_, err := f.srv.ListPeers(context.Background(), &coordv1.ListPeersRequest{NetworkId: f.netA, Token: f.tokenA})
+				return err
+			},
+			check: func(t *testing.T, f *scopedFixture) {
+				assertNetworkPeers(t, f, f.tokenA, f.netA, f.peerA1, f.peerA2)
+			},
+			wantCode: codes.OK,
+		},
+		{
+			name: "Watch own network with own peer succeeds",
+			call: func(t *testing.T, f *scopedFixture) error {
+				events, err := f.scopedWatch(t, &coordv1.WatchRequest{NetworkId: f.netA, Token: f.tokenA, PeerId: f.peerA1})
+				f.watched = events
+				return err
+			},
+			check: func(t *testing.T, f *scopedFixture) {
+				// The initial snapshot arrives as synthetic JOIN events
+				// for the other peers in the network.
+				var sawPeerA2 bool
+				for _, ev := range f.watched {
+					if ev.Type == coordv1.EventType_JOIN && ev.Peer != nil && ev.Peer.Id == f.peerA2 {
+						sawPeerA2 = true
+					}
+				}
+				if !sawPeerA2 {
+					t.Errorf("Watch snapshot missing JOIN for %s; events: %+v", f.peerA2, f.watched)
+				}
+			},
+			wantCode: codes.OK,
+		},
+		{
+			name: "SendSignal within own network succeeds",
+			call: func(t *testing.T, f *scopedFixture) error {
+				var rpcErr error
+				f.watched = f.watchDuring(t, f.tokenA, f.netA, f.peerA2, func() {
+					_, rpcErr = f.srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+						Token:      f.tokenA,
+						FromPeerId: f.peerA1,
+						ToPeerId:   f.peerA2,
+						Payload:    []byte("probe"),
+					})
+				})
+				return rpcErr
+			},
+			check: func(t *testing.T, f *scopedFixture) {
+				var got *coordv1.SignalEvent
+				for _, ev := range f.watched {
+					if ev.Type == coordv1.EventType_SIGNAL && ev.Signal != nil {
+						got = ev.Signal
+					}
+				}
+				if got == nil {
+					t.Fatalf("no SIGNAL delivered; events: %+v", f.watched)
+				}
+				if got.FromPeerId != f.peerA1 || string(got.Payload) != "probe" {
+					t.Errorf("SIGNAL content: got %+v, want from %s payload %q", got, f.peerA1, "probe")
+				}
+			},
+			wantCode: codes.OK,
+		},
+		{
+			name: "Leave own peer succeeds",
+			call: func(t *testing.T, f *scopedFixture) error {
+				_, err := f.srv.Leave(context.Background(), &coordv1.LeaveRequest{Token: f.tokenA, PeerId: f.peerA2})
+				return err
+			},
+			check: func(t *testing.T, f *scopedFixture) {
+				assertNetworkPeers(t, f, f.tokenA, f.netA, f.peerA1)
+				assertMachineCount(t, f, f.netA, 1)
+			},
+			wantCode: codes.OK,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newScopedFixture(t)
+			err := tc.call(t, f)
+			if status.Code(err) != tc.wantCode {
+				t.Fatalf("RPC returned %v (code %s), want code %s", err, status.Code(err), tc.wantCode)
+			}
+			tc.check(t, f)
+		})
+	}
+}
+
+// TestServer_Register_PeerIDAlreadyRegisteredElsewhere verifies that a
+// peer ID (the Ed25519 public key) already registered in one network cannot
+// be registered into another network: the attempt is rejected with
+// codes.AlreadyExists and the existing registration, network membership and
+// endpoint are left untouched. The request is signed by the key's true
+// holder — a forged attempt never gets this far (it is rejected as an
+// invalid proof of key possession) — so this exercises the registry's
+// global peer-ID namespace, not the signature check.
+func TestServer_Register_PeerIDAlreadyRegisteredElsewhere(t *testing.T) {
+	f := newScopedFixture(t)
+
+	before, err := f.reg.GetPeer(f.peerA1)
+	if err != nil {
+		t.Fatalf("GetPeer before: %v", err)
+	}
+
+	// The holder of A's key registers it into B's own network while B's
+	// watcher is connected.
+	events := f.watchDuring(t, f.tokenB, f.netB, f.peerB1, func() {
+		req := newRegisterRequest(f.idA1, f.netB, f.tokenB, "b-clone", "9.9.9.9:9999", nil)
+		signRegisterReq(t, f.idA1, req)
+		_, err = f.srv.Register(context.Background(), req)
+	})
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("Register: got %v, want code %s", err, codes.AlreadyExists)
+	}
+
+	// No JOIN event for the clone reached B's network watchers.
+	for _, ev := range events {
+		if ev.Type == coordv1.EventType_JOIN && ev.Peer != nil && ev.Peer.Id == f.peerA1 {
+			t.Errorf("JOIN event published for rejected registration: %+v", ev.Peer)
+		}
+	}
+
+	// A's peer record is unchanged: still in A's network with its VPN
+	// address, name and X25519 key.
+	after, err := f.reg.GetPeer(f.peerA1)
+	if err != nil {
+		t.Fatalf("GetPeer after: %v", err)
+	}
+	if after.NetworkID != f.netA {
+		t.Errorf("peer moved networks: got %q, want %q", after.NetworkID, f.netA)
+	}
+	if after.VPNAddr != before.VPNAddr {
+		t.Errorf("VPN address changed: got %q, want %q", after.VPNAddr, before.VPNAddr)
+	}
+	if after.Name != before.Name {
+		t.Errorf("name changed: got %q, want %q", after.Name, before.Name)
+	}
+	if after.X25519Public != before.X25519Public {
+		t.Errorf("X25519 key changed: got %q, want %q", after.X25519Public, before.X25519Public)
+	}
+
+	// Network membership is unchanged on both sides...
+	assertNetworkPeers(t, f, f.tokenA, f.netA, f.peerA1, f.peerA2)
+	assertMachineCount(t, f, f.netA, 2)
+	assertNetworkPeers(t, f, f.tokenB, f.netB, f.peerB1)
+	assertMachineCount(t, f, f.netB, 1)
+
+	// ...and A's peer still serves its original advertised endpoint.
+	resp, err := f.srv.ListPeers(context.Background(), &coordv1.ListPeersRequest{NetworkId: f.netA, Token: f.tokenA})
+	if err != nil {
+		t.Fatalf("ListPeers: %v", err)
+	}
+	for _, p := range resp.Peers {
+		if p.Id == f.peerA1 && p.Endpoint != "1.1.1.1:1111" {
+			t.Errorf("endpoint changed: got %q, want 1.1.1.1:1111", p.Endpoint)
+		}
+	}
+}
+
+// TestServer_Register_X25519MismatchOnReregistration verifies that a
+// same-network re-registration presenting a different X25519 public key
+// than the stored one is rejected with codes.AlreadyExists and the stored
+// key is kept. The request is signed by the peer's real Ed25519 key — key
+// rotation needs a signed handover flow (a planned follow-up), so even the
+// key holder cannot swap the X25519 key this way. Re-registering with the
+// same keys stays idempotent.
+func TestServer_Register_X25519MismatchOnReregistration(t *testing.T) {
+	f := newScopedFixture(t)
+
+	rotated := newRegisterIdentity(t) // source of an alternative X25519 key
+	req := newRegisterRequest(f.idA1, f.netA, f.tokenA, "peer-a1-rotated", "", nil)
+	req.X25519Public = base64.StdEncoding.EncodeToString(rotated.X25519Public[:])
+	signRegisterReq(t, f.idA1, req)
+
+	_, err := f.srv.Register(context.Background(), req)
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("Register with rotated X25519: got %v, want code %s", err, codes.AlreadyExists)
+	}
+
+	rec, err := f.reg.GetPeer(f.peerA1)
+	if err != nil {
+		t.Fatalf("GetPeer: %v", err)
+	}
+	if rec.X25519Public != base64.StdEncoding.EncodeToString(f.idA1.X25519Public[:]) {
+		t.Errorf("stored X25519 key: got %q, want the original", rec.X25519Public)
+	}
+	if rec.Name == "peer-a1-rotated" {
+		t.Errorf("rejected re-registration still updated the name: %q", rec.Name)
+	}
+
+	// Re-registering with the same keys stays idempotent and keeps working.
+	renamed := newRegisterRequest(f.idA1, f.netA, f.tokenA, "peer-a1-renamed", "", nil)
+	signRegisterReq(t, f.idA1, renamed)
+	if _, err := f.srv.Register(context.Background(), renamed); err != nil {
+		t.Fatalf("idempotent re-registration: %v", err)
+	}
+	rec, err = f.reg.GetPeer(f.peerA1)
+	if err != nil {
+		t.Fatalf("GetPeer after re-register: %v", err)
+	}
+	if rec.Name != "peer-a1-renamed" {
+		t.Errorf("idempotent re-registration did not update the name: got %q", rec.Name)
+	}
+}
+
+// newSignatureFixture builds a server with two networks owned by one
+// account (net-a, net-a2) and no registered peers, so a rejected
+// registration is observable as "nothing changed". net-a2 exists so a
+// signature bound to net-a can be replayed against another network of the
+// same account — the proof must still fail.
+func newSignatureFixture(t *testing.T) (*Server, *Registry) {
+	t.Helper()
+	reg, err := NewRegistry(t.TempDir() + "/sig.db")
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+	for _, n := range []struct{ id, cidr string }{
+		{"net-a", "10.99.0.0/24"},
+		{"net-a2", "10.99.2.0/24"},
+	} {
+		cidr := netip.MustParsePrefix(n.cidr)
+		if err := reg.CreateNetwork(coordcore.Network{ID: n.id, CIDR: cidr, Name: n.id}, "acc-a"); err != nil {
+			t.Fatalf("CreateNetwork %s: %v", n.id, err)
+		}
+	}
+	accounts := ce.NewTokenAccountStore(map[string]coordcore.Account{
+		"token-a": {ID: "acc-a", Tier: coordcore.TierFree},
+	})
+	return New(reg, NewBus(), ce.NewFreeEnforcer(), accounts, ce.NewNoopAuditLogger(), ce.NewRejectSubnetPolicy(), ce.NewNoopHooks()), reg
+}
+
+// assertRegisterChangedNothing fails unless a rejected registration left
+// the registry exactly as it was: no peer record, no machine count, no
+// endpoint, and the network's address space untouched.
+func assertRegisterChangedNothing(t *testing.T, reg *Registry, networkID, peerID string) {
+	t.Helper()
+	if peers, err := reg.ListPeers(networkID); err != nil {
+		t.Fatalf("ListPeers %s: %v", networkID, err)
+	} else if len(peers) != 0 {
+		t.Errorf("rejected registration left %d peer(s): %+v", len(peers), peers)
+	}
+	if count, err := reg.NetworkMachineCount(networkID); err != nil {
+		t.Fatalf("NetworkMachineCount %s: %v", networkID, err)
+	} else if count != 0 {
+		t.Errorf("rejected registration changed machine count: got %d, want 0", count)
+	}
+	if _, err := reg.GetPeer(peerID); err == nil {
+		t.Errorf("rejected registration created a record for peer %s", peerID)
+	}
+}
+
+// TestServer_Register_RequiresProofOfKeyPossession verifies that only the
+// holder of the Ed25519 private key matching ed25519_public can register:
+// a valid signature is accepted, while a missing, garbage, wrong-key or
+// field-tampered signature and a stale or future timestamp are rejected
+// with codes.Unauthenticated — every time before anything is written, so
+// the registry is left unchanged and the network's address space is not
+// consumed.
+func TestServer_Register_RequiresProofOfKeyPossession(t *testing.T) {
+	srv, reg := newSignatureFixture(t)
+
+	now := time.Now().Unix()
+	rows := []struct {
+		name     string
+		mutate   func(t *testing.T, req *coordv1.RegisterRequest, id *crypto.Identity)
+		wantCode codes.Code
+	}{
+		{"missing signature", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.Signature = nil
+		}, codes.Unauthenticated},
+		{"empty signature", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.Signature = []byte{}
+		}, codes.Unauthenticated},
+		{"garbage signature", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.Signature = make([]byte, 64)
+		}, codes.Unauthenticated},
+		{"signature by a different key", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			other := newRegisterIdentity(t)
+			req.Signature = crypto.SignRegister(other.Ed25519Private, registerClaimsFor(req))
+		}, codes.Unauthenticated},
+		{"tampered network_id (replayed against another network of the same account)", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.NetworkId = "net-a2"
+		}, codes.Unauthenticated},
+		{"tampered ed25519_public", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			other := newRegisterIdentity(t)
+			req.Ed25519Public = base64.StdEncoding.EncodeToString(other.Ed25519Public)
+		}, codes.Unauthenticated},
+		{"tampered x25519_public", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			other := newRegisterIdentity(t)
+			req.X25519Public = base64.StdEncoding.EncodeToString(other.X25519Public[:])
+		}, codes.Unauthenticated},
+		{"tampered endpoint", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.Endpoint = "9.9.9.9:9999"
+		}, codes.Unauthenticated},
+		{"tampered subnet_routes", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.SubnetRoutes = append(req.SubnetRoutes, "10.99.9.0/24")
+		}, codes.Unauthenticated},
+		{"tampered timestamp", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.TimestampUnix++
+		}, codes.Unauthenticated},
+		{"stale timestamp (121 s old)", func(t *testing.T, req *coordv1.RegisterRequest, id *crypto.Identity) {
+			req.TimestampUnix = now - 121
+			req.Signature = crypto.SignRegister(id.Ed25519Private, registerClaimsFor(req))
+		}, codes.Unauthenticated},
+		{"future timestamp (121 s ahead)", func(t *testing.T, req *coordv1.RegisterRequest, id *crypto.Identity) {
+			req.TimestampUnix = now + 121
+			req.Signature = crypto.SignRegister(id.Ed25519Private, registerClaimsFor(req))
+		}, codes.Unauthenticated},
+		{"malformed ed25519_public (not 32 bytes)", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.Ed25519Public = base64.StdEncoding.EncodeToString([]byte("not-a-key"))
+		}, codes.InvalidArgument},
+	}
+
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			id := newRegisterIdentity(t)
+			req := newRegisterRequest(id, "net-a", "token-a", "sig-peer", "1.2.3.4:51820", nil)
+			signRegisterReq(t, id, req)
+			row.mutate(t, req, id)
+
+			_, err := srv.Register(context.Background(), req)
+			if status.Code(err) != row.wantCode {
+				t.Fatalf("Register: got %v (code %s), want code %s", err, status.Code(err), row.wantCode)
+			}
+			if row.wantCode != codes.OK {
+				assertRegisterChangedNothing(t, reg, "net-a", hex.EncodeToString(id.Ed25519Public))
+			}
+		})
+	}
+
+	// After all rejections, the first valid registration still gets the
+	// network's first address: no rejected request wrote a record or
+	// consumed an address.
+	id := newRegisterIdentity(t)
+	valid := newRegisterRequest(id, "net-a", "token-a", "first-valid", "1.2.3.4:51820", nil)
+	signRegisterReq(t, id, valid)
+	resp := mustRegister(t, srv, valid)
+	if resp.VpnAddr != "10.99.0.1" {
+		t.Errorf("first valid registration: got VPN address %q, want 10.99.0.1", resp.VpnAddr)
+	}
+	if resp.PeerId != hex.EncodeToString(id.Ed25519Public) {
+		t.Errorf("peer ID: got %q, want hex of the presented Ed25519 key", resp.PeerId)
+	}
+}
+
+// TestServer_Register_TimestampWindowEdge verifies a signature dated 60 s
+// ago (inside the ±120 s window) is still accepted: the window must
+// tolerate ordinary clock skew, not just perfectly synchronized clocks.
+func TestServer_Register_TimestampWindowEdge(t *testing.T) {
+	srv, _ := newSignatureFixture(t)
+
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, "net-a", "token-a", "skewed-clock", "1.2.3.4:51820", nil)
+	req.TimestampUnix = time.Now().Unix() - 60
+	req.Signature = crypto.SignRegister(id.Ed25519Private, registerClaimsFor(req))
+
+	resp, err := srv.Register(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Register with a 60 s old timestamp: %v", err)
+	}
+	if resp.VpnAddr != "10.99.0.1" {
+		t.Errorf("VPN address: got %q, want 10.99.0.1", resp.VpnAddr)
 	}
 }

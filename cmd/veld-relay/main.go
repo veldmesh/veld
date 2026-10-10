@@ -13,6 +13,11 @@
 // On first start it generates an identity and prints its X25519 public key;
 // configure peers with that key as coord.relay_x25519 and this host's address
 // as coord.relay_addr.
+//
+// By default only startup output is printed; no per-connection events
+// (channel IDs, client addresses) are logged. The -verbose flag re-enables
+// per-connection debug logs — with client addresses truncated — for local
+// debugging only; it is off by default and not intended for production.
 package main
 
 import (
@@ -32,6 +37,7 @@ import (
 func main() {
 	listen := flag.String("listen", ":41820", "TCP address to listen on")
 	identity := flag.String("identity", "relay-identity.json", "path to identity keystore (created on first run)")
+	verbose := flag.Bool("verbose", false, "log per-connection events (channel IDs, truncated client addresses); for local debugging only, not for production")
 	flag.Parse()
 
 	id, err := config.LoadOrGenerate(*identity)
@@ -50,7 +56,11 @@ func main() {
 	fmt.Printf("relay X25519 public key (set as coord.relay_x25519 on peers): %s\n",
 		base64.StdEncoding.EncodeToString(id.X25519Public[:]))
 
-	svc := relaysrv.NewService(id, ln)
+	var opts []relaysrv.Option
+	if *verbose {
+		opts = append(opts, relaysrv.Verbose())
+	}
+	svc := relaysrv.NewService(id, ln, opts...)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

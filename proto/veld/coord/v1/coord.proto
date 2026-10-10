@@ -15,7 +15,10 @@ message Peer {
   repeated string subnet_routes    = 7;  // CIDR prefixes this peer advertises
 }
 
-// RegisterRequest is sent by a daemon to join a network.
+// RegisterRequest is sent by a daemon to join a network. It must carry a
+// proof of key possession: timestamp_unix and signature hold an Ed25519
+// signature by the private key matching ed25519_public — see the Register
+// RPC for the signed message.
 message RegisterRequest {
   string network_id                = 1;
   string token                     = 2;
@@ -24,6 +27,8 @@ message RegisterRequest {
   string x25519_public             = 5;  // base64 encoded
   string endpoint                  = 6;  // "ip:port" or ""
   repeated string subnet_routes    = 7;  // CIDR prefixes to advertise
+  int64 timestamp_unix             = 8;  // client clock when signing, unix seconds
+  bytes signature                  = 9;  // Ed25519 sig over the signed fields (see Register)
 }
 
 message RegisterResponse {
@@ -88,7 +93,16 @@ message LeaveRequest {
 message LeaveResponse {}
 
 service Coord {
-  // Register assigns a VPN IP to the calling daemon and validates its Ed25519 sig.
+  // Register assigns a VPN IP to the calling daemon and validates its Ed25519 sig:
+  // only the holder of the private key matching ed25519_public can register or
+  // update the peer whose ID is that key. The request must carry a signature —
+  // an Ed25519 signature over "veld-coord-register-v1\0" followed by the
+  // length-prefixed network_id, ed25519_public, x25519_public, endpoint, the
+  // sorted subnet_routes and the timestamp_unix (big-endian uint64) — with
+  // |now - timestamp_unix| <= 120 s. A missing, stale or invalid signature is
+  // rejected with Unauthenticated before any registry write, so a rejected
+  // registration changes nothing. Signed key rotation (an old-key → new-key
+  // handover) is a follow-up and is not part of this flow.
   rpc Register(RegisterRequest) returns (RegisterResponse);
 
   // ListPeers returns all currently registered peers in the network.

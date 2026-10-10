@@ -4,8 +4,10 @@ package server
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"net/netip"
 	"sync"
 	"time"
@@ -15,6 +17,7 @@ import (
 
 	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
 	coordcore "github.com/veldmesh/veld/coord/core"
+	"github.com/veldmesh/veld/internal/crypto"
 )
 
 // watchLastSeenRefresh is how often an active Watch stream refreshes the
@@ -59,6 +62,46 @@ func New(
 		hooks:     hooks,
 		connected: make(map[string]int),
 	}
+}
+
+// errNetworkNotFound and errPeerNotFound are the errors every per-account
+// authorization check fails with: codes.NotFound, the same error a
+// nonexistent network or peer produces, so a caller cannot tell "owned by
+// another account" apart from "does not exist".
+var (
+	errNetworkNotFound = status.Error(codes.NotFound, "network not found")
+	errPeerNotFound    = status.Error(codes.NotFound, "peer not found")
+)
+
+// authorizeNetwork returns nil when networkID names an existing network
+// owned by accountID. It is the single per-account gate every RPC that
+// names a network must pass, so a request can only read or change state
+// inside networks owned by the token's account.
+func (s *Server) authorizeNetwork(networkID, accountID string) error {
+	_, owner, err := s.registry.GetNetwork(networkID)
+	if err != nil || owner != accountID {
+		return errNetworkNotFound
+	}
+	return nil
+}
+
+// authorizePeer returns the record of peerID when that peer is registered
+// in a network owned by accountID — and, when networkID is non-empty, in
+// that network in particular. It is the single per-account gate every RPC
+// that names a peer must pass, so a request can only name peers registered
+// in networks owned by the token's account.
+func (s *Server) authorizePeer(peerID, networkID, accountID string) (peerRecord, error) {
+	rec, err := s.registry.GetPeer(peerID)
+	if err != nil {
+		return peerRecord{}, errPeerNotFound
+	}
+	if networkID != "" && rec.NetworkID != networkID {
+		return peerRecord{}, errPeerNotFound
+	}
+	if err := s.authorizeNetwork(rec.NetworkID, accountID); err != nil {
+		return peerRecord{}, errPeerNotFound
+	}
+	return rec, nil
 }
 
 // markConnected records an active Watch stream for peerID.
@@ -146,6 +189,10 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 		return nil, status.Errorf(codes.Unauthenticated, "invalid token")
 	}
 
+	if err := s.authorizeNetwork(req.NetworkId, acc.ID); err != nil {
+		return nil, err
+	}
+
 	// Ask the enforcer for the limit (-1 = unlimited) so we can enforce it
 	// atomically inside the registry write transaction.
 	machineLimit := s.enforcer.MachineLimitFor(ctx, req.NetworkId)
@@ -155,7 +202,27 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid ed25519_public")
 	}
+	if len(ed25519Bytes) != ed25519.PublicKeySize {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid ed25519_public")
+	}
 	peerID := hex.EncodeToString(ed25519Bytes)
+
+	// Proof of key possession: only the holder of the private key
+	// matching ed25519_public may register (or update) the peer whose
+	// ID is that key. The signature covers every field that names or
+	// addresses the peer plus a fresh timestamp, and this check runs
+	// before any registry write, so a rejected registration changes
+	// nothing.
+	if err := crypto.VerifyRegisterSignature(ed25519.PublicKey(ed25519Bytes), req.Signature, crypto.RegisterClaims{
+		NetworkID:     req.NetworkId,
+		Ed25519Public: req.Ed25519Public,
+		X25519Public:  req.X25519Public,
+		Endpoint:      req.Endpoint,
+		SubnetRoutes:  req.SubnetRoutes,
+		TimestampUnix: req.TimestampUnix,
+	}, time.Now().Unix()); err != nil {
+		return nil, status.Errorf(codes.Unauthenticated, "%v", err)
+	}
 
 	// Validate and policy-check each advertised subnet route.
 	var parsedRoutes []netip.Prefix
@@ -183,6 +250,9 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 
 	vpnAddr, err := s.registry.RegisterPeer(rec, req.NetworkId, machineLimit)
 	if err != nil {
+		if errors.Is(err, ErrPeerIDTaken) || errors.Is(err, ErrPeerKeyMismatch) {
+			return nil, status.Errorf(codes.AlreadyExists, "%v", err)
+		}
 		if err == ErrMachineLimit {
 			_ = s.audit.Log(ctx, coordcore.AuditEvent{
 				Kind:      coordcore.AuditRegistrationRejected,
@@ -236,8 +306,12 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 
 // ListPeers returns all peers in the network.
 func (s *Server) ListPeers(ctx context.Context, req *coordv1.ListPeersRequest) (*coordv1.ListPeersResponse, error) {
-	if _, err := s.accounts.Resolve(ctx, req.Token); err != nil {
+	acc, err := s.accounts.Resolve(ctx, req.Token)
+	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "invalid token")
+	}
+	if err := s.authorizeNetwork(req.NetworkId, acc.ID); err != nil {
+		return nil, err
 	}
 
 	peers, err := s.registry.ListPeers(req.NetworkId)
@@ -264,8 +338,19 @@ func (s *Server) ListPeers(ctx context.Context, req *coordv1.ListPeersRequest) (
 // If req.PeerId is set, signals addressed to that peer are also delivered.
 func (s *Server) Watch(req *coordv1.WatchRequest, stream coordv1.Coord_WatchServer) error {
 	ctx := stream.Context()
-	if _, err := s.accounts.Resolve(ctx, req.Token); err != nil {
+	acc, err := s.accounts.Resolve(ctx, req.Token)
+	if err != nil {
 		return status.Errorf(codes.Unauthenticated, "invalid token")
+	}
+
+	if err := s.authorizeNetwork(req.NetworkId, acc.ID); err != nil {
+		return err
+	}
+	if req.PeerId != "" {
+		// A Watch may only name a peer registered in the requested network.
+		if _, err := s.authorizePeer(req.PeerId, req.NetworkId, acc.ID); err != nil {
+			return err
+		}
 	}
 
 	// A peer with an active Watch stream is online: track it so the TTL
@@ -361,21 +446,18 @@ func (s *Server) SendSignal(ctx context.Context, req *coordv1.SendSignalRequest)
 	if len(req.Payload) > maxSignalPayload {
 		return nil, status.Errorf(codes.InvalidArgument, "signal payload exceeds %d bytes", maxSignalPayload)
 	}
-	// from_peer_id must be one of the caller's own registered peers.
-	from, err := s.registry.GetPeer(req.FromPeerId)
+	// The caller may only signal as a peer in a network owned by its
+	// account, and only to a peer in the same network.
+	from, err := s.authorizePeer(req.FromPeerId, "", acc.ID)
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "sender peer not found")
+		return nil, err
 	}
-	if _, owner, err := s.registry.GetNetwork(from.NetworkID); err != nil || owner != acc.ID {
-		return nil, status.Errorf(codes.PermissionDenied, "sender peer does not belong to this account")
-	}
-	// The recipient must be a registered peer of the same network.
-	to, err := s.registry.GetPeer(req.ToPeerId)
+	to, err := s.authorizePeer(req.ToPeerId, "", acc.ID)
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "recipient peer not found")
+		return nil, err
 	}
-	if to.NetworkID != from.NetworkID {
-		return nil, status.Errorf(codes.PermissionDenied, "recipient peer is not in the sender's network")
+	if from.NetworkID != to.NetworkID {
+		return nil, errPeerNotFound
 	}
 	// The recipient is registered: hold the signal briefly if it has not
 	// opened its Watch stream yet (it registers first, then watches).
@@ -391,14 +473,8 @@ func (s *Server) Leave(ctx context.Context, req *coordv1.LeaveRequest) (*coordv1
 		return nil, status.Errorf(codes.Unauthenticated, "invalid token")
 	}
 
-	// The removed peer must belong to one of the caller's networks: a valid
-	// token for one account must not delete another account's peers.
-	target, err := s.registry.GetPeer(req.PeerId)
-	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "peer not found")
-	}
-	if _, owner, err := s.registry.GetNetwork(target.NetworkID); err != nil || owner != acc.ID {
-		return nil, status.Errorf(codes.PermissionDenied, "peer does not belong to this account")
+	if _, err := s.authorizePeer(req.PeerId, "", acc.ID); err != nil {
+		return nil, err
 	}
 
 	removed, err := s.registry.RemovePeer(req.PeerId)

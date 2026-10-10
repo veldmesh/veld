@@ -71,9 +71,17 @@ Veld runs in three operating modes:
 
 - **Role:** public-key directory plus a NAT-traversal signal channel. Nothing else.
 - **Store:** bbolt single-file DB (`coord/server/registry.go`) mapping
-  `peer ID → public key (Ed25519 + cross-signed X25519) + last-seen endpoint + VPN address`.
+  `peer ID → public key (Ed25519 + cross-signed X25519) + VPN address + name`, plus a
+  coarse last-seen timestamp rounded to the hour. Machines' public endpoints (`ip:port`)
+  are kept in memory only and never written to disk; after a restart they are re-learned
+  when daemons re-register (they re-register on every reconnect).
 - **API:** gRPC service `Coord` (`proto/veld/coord/v1/coord.proto`), defined by five RPCs:
   `Register`, `ListPeers`, `Watch` (server-streaming), `SendSignal`, `Leave`.
+- **Proof of key possession:** `Register` must be signed by the Ed25519 private
+  key matching `ed25519_public` (fields `timestamp_unix` + `signature`, ±120 s
+  window) and the server verifies before any write — nobody can register or
+  update a peer but the holder of its key. The signed message is specified in
+  [`DEVELOPMENT.md`](DEVELOPMENT.md).
 - **Network isolation:** `ListPeers`/`Watch` are scoped by `network_id`. Peers in network
   A can never query network B.
 - **Auth:** a network `token` resolves to an account; the daemon presents it on every RPC.
@@ -210,6 +218,7 @@ rejected by default in the CE/free tier (`RejectSubnetPolicy`).
 | Private key never leaves the device | Ed25519 identity is generated locally and persisted 0600; only public keys cross the wire; no RPC requests a secret |
 | Deterministic, verifiable | Daemon, CLI, and coord server are MIT/BSL open source; protocol is in `proto/` and documented in `DEVELOPMENT.md` |
 | Peers in an org are isolated | `network_id` scoping on every coord RPC |
+| Nobody can register a peer but its key holder | `Register` requires an Ed25519 proof-of-possession signature over the request's identity fields plus a fresh timestamp (±120 s); verified before any registry write |
 | Compromised coord server ≠ compromised sessions | A malicious or pwned server can re-route handshakes, but TOFU key pinning (`internal/tofu/`) on a fresh-connect fingerprint blocks key substitution on subsequent connections |
 
 ---

@@ -20,6 +20,34 @@ This document captures the architectural decisions, invariants, and patterns tha
 
 ---
 
+## Logging & privacy
+
+Server components (`veld-coord`, `veld-relay`) must not log client IP
+addresses or per-connection details. Rules — enforce these in review:
+
+1. **Never log tokens, keys, or other credentials** — not even partially.
+2. **Never log a full client IP address.** If a remote address is genuinely
+   needed to debug, truncate it with `internal/logsafe.TruncIP` first
+   (IPv4 → first three octets, `a.b.c.x`; IPv6 → first 48 bits) — or drop
+   the field entirely if it is not needed. Error text counts as a field:
+   `*net.OpError` (what every `net.Conn` read/write returns) embeds both
+   endpoints' full `ip:port`, so never log a raw connection error — render it
+   with `logsafe.ScrubErr`, which drops the endpoints and truncates any
+   surviving address.
+3. **`veld-relay` logs no per-connection events by default** — no channel
+   IDs, no client addresses; only startup/shutdown output. The `-verbose`
+   flag re-enables per-connection logs (channel IDs, truncated addresses)
+   for local debugging only: off by default, not for production.
+4. **`veld-coord` logs no per-connection events at all** — only
+   startup/shutdown and top-level operational errors. Auth failures return
+   a generic "invalid token" without echoing the token.
+
+Retention: with these rules, default logs retain nothing that identifies a
+client — no IP addresses, no channel IDs, no tokens — only what is needed
+to operate and debug the service itself.
+
+---
+
 ## Extension point rules
 
 All tier enforcement goes through the interfaces in `coord/core/`. Rules:
@@ -114,6 +142,44 @@ Defined in `proto/veld/coord/v1/coord.proto`. Always regenerate with `make proto
 
 The `Coord` service is the daemon-facing gRPC API defined in `proto/veld/coord/v1/coord.proto`. Keep it focused on peer coordination — do not add management, billing, or dashboard endpoints to it. Any separate management surface has different auth, different stability guarantees, and a different audience.
 
+### Register: proof of key possession
+
+`Register` is signed: only the holder of the Ed25519 private key matching
+`ed25519_public` can register or update the peer whose ID is that key. The
+request carries `timestamp_unix` (field 8, the client clock in unix seconds)
+and `signature` (field 9) — an Ed25519 signature over the deterministic
+message
+
+```
+"veld-coord-register-v1\x00"                       domain-separation prefix
+|| u32(len(network_id))     || network_id
+|| u32(len(ed25519_public)) || ed25519_public       base64, exactly as sent
+|| u32(len(x25519_public))  || x25519_public        base64, exactly as sent
+|| u32(len(endpoint))       || endpoint             "ip:port" or ""
+|| u32(route count)         || each route as u32(len) || cidr, sorted
+|| u64(timestamp_unix)                              big-endian
+```
+
+with all lengths big-endian. The encoding lives in one function shared by
+client and server — `crypto.RegisterSignedMessage` (`internal/crypto/register.go`;
+sign with `crypto.SignRegister`, verify with `crypto.VerifyRegisterSignature`) —
+and is locked by the golden vector in `TestRegisterSignedMessage_Vector`
+(`internal/crypto/register_test.go`).
+
+The signature is required: there are no unsigned clients in the field, so there
+is no transition flag. A missing, garbage or wrong-key signature, any tampered
+signed field, or a timestamp with |now − timestamp_unix| > 120 s is rejected with
+`codes.Unauthenticated` — before any registry write, so a rejected registration
+changes nothing (no record, no machine count, no address consumed, no event).
+
+The proto3 wire addition is backwards compatible (old servers ignore the new
+fields), but the behavior is not: a new coord server rejects registrations from
+old clients, which never sign. Release the client (`veld`/`veld-daemon`) and
+the coord server (`veld-coord`) together — see `RELEASE_NOTES.md`.
+
+Signed key rotation (an old-key → new-key handover) is out of scope here; it is
+the planned follow-up.
+
 ---
 
 ## Coord server peer TTL sweep
@@ -135,6 +201,29 @@ model — entries age out instead of accumulating forever.
   the sweep) and `--sweep-interval` (default **1h**, `server.DefaultSweepInterval`). Values below
   `server.MinSweepInterval` (**1 minute**) are clamped up to it, so a misconfigured flag cannot
   churn the registry write path.
+
+## Coord server endpoint storage
+
+Peer endpoints (public `ip:port`) are the only registry data the coord server needs to
+serve to other peers, and they do not need to outlive the process. `coord/server/registry.go`
+keeps them in a mutex-guarded in-memory map keyed by peer ID:
+
+- Filled on `Register` (including idempotent re-registrations) and `UpdateEndpoint`.
+- Served wherever peers learn about each other: `ListPeers` results and `Watch` snapshot events.
+- Dropped when a peer leaves (`Leave`) or is removed by the TTL sweep.
+- Never written to bbolt: persisted peer records hold only the peer ID, network ID, name,
+  VPN address, public keys, subnet routes, and a last-seen timestamp rounded down to the
+  hour — coarse enough for the TTL sweep without retaining precise activity times.
+  A zero last-seen is preserved as-is: it is the "never sent a heartbeat"
+  sentinel, which the sweep ages by the peer's `RegisteredAt` timestamp
+  instead.
+
+After a coord restart the map starts empty; endpoints are re-learned as daemons re-register.
+Daemons already re-register whenever they (re)connect to the coord server, so no extra
+protocol or operator action is needed.
+
+A one-time, idempotent startup migration in `NewRegistry` blanks the `endpoint` field of
+records persisted by older builds, so upgrading never leaves historical endpoints on disk.
 
 ---
 
@@ -161,12 +250,12 @@ Required unit tests per package (non-exhaustive — add more as edge cases are f
 
 | Package | Must cover |
 |---|---|
-| `internal/crypto` | Key clamping, sign/verify happy path, wrong key, tampered sig, swapped keys, timestamp boundary (±30s), X25519Sig binding |
+| `internal/crypto` | Key clamping, sign/verify happy path, wrong key, tampered sig, swapped keys, timestamp boundary (±30s), X25519Sig binding, Register signed-message vector, proof-of-possession window (±120s) and tamper cases |
 | `internal/config` | Save/load round-trip, LoadOrGenerate idempotency, invalid JSON, wrong version, file permissions (0600) |
 | `internal/session` | Encrypt→decrypt round-trip, nonce monotonicity, replay rejection (duplicate nonce, nonce outside window), auth tag failure → silent drop, rekey trigger at threshold |
 | `internal/peer` | Concurrent Upsert/Lookup/Remove, hold queue max-64 drop-oldest behaviour |
 | `internal/dataplane` | Packet routing to correct session, session-miss hold-queue behaviour, keepalive handling |
-| `coord/server` | Register validates Ed25519 sig, Register calls PlanEnforcer, ListPeers returns correct subset, SendSignal routes to correct watcher, Leave removes peer |
+| `coord/server` | Register verifies proof of key possession (missing, wrong-key, tampered-field, stale and future-timestamp rejections change nothing), Register calls PlanEnforcer, ListPeers returns correct subset, SendSignal routes to correct watcher, Leave removes peer |
 
 ### Layer 2 — End-to-end tests (`tests/e2e/*_e2e_test.go`)
 
