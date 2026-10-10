@@ -60,8 +60,11 @@ func (m *linuxManager) Add(prefix netip.Prefix, via netip.Addr) error {
 
 	// Replace, not add: if a commercial VPN already installed a route for
 	// this prefix (VPN connected first), veld takes the prefix over; if the
-	// VPN displaced veld's route later (veld connected first), a re-add
-	// heals it. The low metric wins equal-prefix ties in both directions.
+	// VPN displaced veld's route later (veld connected first), the next
+	// Add — a peer rejoin or daemon restart — heals it. There is no
+	// background route watcher; restart veld if peers become unreachable
+	// after a VPN reconnects. The low metric wins equal-prefix ties in
+	// both directions.
 	if err := m.h.RouteReplace(&netlink.Route{Dst: dst, Gw: gw, Priority: DefaultRouteMetric}); err != nil {
 		return fmt.Errorf("route replace %s via %s: %w", prefix, via, err)
 	}

@@ -51,6 +51,7 @@ type Daemon struct {
 	peerID       string
 	coordAddr    string
 	relayProxies map[[32]byte]*relay.Proxy // one relay proxy per peer ID
+	tunDev       tun.TUN                   // veld's own TUN; nil in coord mode until the coordinator assigns the VPN address
 }
 
 // New creates a Daemon from pre-constructed components.
@@ -75,6 +76,7 @@ func New(
 		peerTbl:   peerTbl,
 		localID:   localID,
 		networkID: networkID,
+		tunDev:    t,
 	}
 }
 
@@ -154,11 +156,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	// Commercial VPN coexistence: detect VPN tunnels and routing conflicts
 	// at startup and log actionable guidance (kill switches, split tunneling,
 	// CIDR overlaps). Detection never blocks startup.
-	selfIface := ""
-	if tunDev != nil {
-		selfIface = tunDev.Name()
-	}
-	coexist.Report(fmt.Printf, selfIface, vpnPrefix)
+	coexist.Report(fmt.Printf, d.selfInterface(), vpnPrefix)
 
 	// If this node advertises subnet routes, enable IP forwarding on Linux.
 	if len(cfg.Node.SubnetRoutes) > 0 {
@@ -172,7 +170,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	if cfg.Coord.Addr == "" {
 		for _, e := range peerTbl.List() {
 			for _, pfx := range e.SubnetRoutes {
-				logRouteCollisions(pfx, selfIface)
+				d.logRouteCollisions(pfx)
 				if err := d.routeMgr.Add(pfx, e.VPNAddr); err != nil {
 					fmt.Printf("warning: add route %s via %s: %v\n", pfx, e.VPNAddr, err)
 				}
@@ -292,7 +290,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 		d.coordCli.OnPeerAdded = func(e *peer.Entry) {
 			// Install OS routes for any subnets this peer advertises.
 			for _, pfx := range e.SubnetRoutes {
-				logRouteCollisions(pfx, selfIface)
+				d.logRouteCollisions(pfx)
 				if err := d.routeMgr.Add(pfx, e.VPNAddr); err != nil {
 					fmt.Printf("warning: add route %s via %s: %v\n", pfx, e.VPNAddr, err)
 				}
@@ -392,10 +390,28 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	return d, nil
 }
 
+// selfInterface returns the name of veld's own TUN interface, or "" while
+// no TUN exists (coord mode until the coordinator assigns the VPN address).
+// Coexistence checks must resolve the name through this getter at check
+// time, never capture it once at startup: in coord mode a startup capture
+// would pin the pre-TUN empty string and make later checks misattribute
+// veld's own routes to a commercial VPN.
+func (d *Daemon) selfInterface() string {
+	d.mu.Lock()
+	t := d.tunDev
+	d.mu.Unlock()
+	if t == nil {
+		return ""
+	}
+	return t.Name()
+}
+
 // logRouteCollisions warns when a route Veldmesh is about to install
-// overlaps a route on another interface (e.g. a commercial VPN's).
-func logRouteCollisions(pfx netip.Prefix, selfIface string) {
-	for _, c := range coexist.CheckRoute(pfx, selfIface) {
+// overlaps a route on another interface (e.g. a commercial VPN's). Veldmesh's
+// own TUN routes are excluded via selfInterface, resolved at check time so
+// a TUN created after startup (coord mode) is recognized.
+func (d *Daemon) logRouteCollisions(pfx netip.Prefix) {
+	for _, c := range coexist.CheckRoute(pfx, d.selfInterface()) {
 		fmt.Printf("%s\n", c)
 	}
 }

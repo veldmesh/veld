@@ -321,9 +321,58 @@ func TestSuggestAlternative16Bits(t *testing.T) {
 	}
 }
 
-func TestSuggestAlternativeUnsupportedSize(t *testing.T) {
-	if _, ok := coexist.SuggestAlternative(pfx("10.100.0.0/20"), coexist.Snapshot{}); ok {
-		t.Error("no suggestion expected for unsupported prefix size")
+// Candidates are generated for every RFC 1918-feasible size, not just /24
+// and /16 — mesh CIDRs can use any prefix length.
+func TestSuggestAlternativeAnyPrefixSize(t *testing.T) {
+	s := coexist.Snapshot{Routes: []coexist.RouteEntry{{Dst: pfx("10.100.0.0/20"), Iface: "tun0"}}}
+	got, ok := coexist.SuggestAlternative(pfx("10.100.0.0/20"), s)
+	if !ok {
+		t.Fatal("expected a /20 suggestion")
+	}
+	if got.Bits() != 20 {
+		t.Errorf("want /20 suggestion, got %s", got)
+	}
+	if got.Overlaps(pfx("10.100.0.0/20")) {
+		t.Errorf("suggestion %s overlaps the colliding prefix", got)
+	}
+}
+
+// /12 is broader than the natural masks of the anchor addresses: candidates
+// must be re-masked, not copied verbatim.
+func TestSuggestAlternativeAcrossAnchorBoundaries(t *testing.T) {
+	s := coexist.Snapshot{
+		Routes: []coexist.RouteEntry{{Dst: pfx("10.96.0.0/12"), Iface: "tun0"}}, // 10.96.0.0–10.111.255.255
+	}
+	got, ok := coexist.SuggestAlternative(pfx("10.100.0.0/12"), s)
+	if !ok {
+		t.Fatal("expected a /12 suggestion")
+	}
+	if got.Bits() != 12 {
+		t.Errorf("want /12 suggestion, got %s", got)
+	}
+	for _, r := range s.Routes {
+		if r.Dst.Overlaps(got) {
+			t.Errorf("suggestion %s overlaps existing route %s", got, r.Dst)
+		}
+	}
+	if got.Overlaps(pfx("10.100.0.0/12")) {
+		t.Errorf("suggestion %s overlaps the colliding prefix", got)
+	}
+}
+
+// An IPv6 mesh CIDR must not be "fixed" with an IPv4 suggestion.
+func TestSuggestAlternativeNoIPv4SuggestionForIPv6(t *testing.T) {
+	if _, ok := coexist.SuggestAlternative(pfx("fd00::/8"), coexist.Snapshot{}); ok {
+		t.Error("no suggestion expected for an IPv6 prefix")
+	}
+}
+
+// No suggestion exists for sizes no RFC 1918 block can host: 10.0.0.0/8 is
+// the only fully private /8, and it is the contested prefix itself.
+func TestSuggestAlternativeNoSuggestionOutsidePrivateSpace(t *testing.T) {
+	s := coexist.Snapshot{Routes: []coexist.RouteEntry{{Dst: pfx("10.0.0.0/8"), Iface: "tun0"}}}
+	if _, ok := coexist.SuggestAlternative(pfx("10.0.0.0/8"), s); ok {
+		t.Error("no private-space /8 replacement exists besides 10.0.0.0/8 itself")
 	}
 }
 

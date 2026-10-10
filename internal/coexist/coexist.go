@@ -284,38 +284,58 @@ func FindCollisions(s Snapshot, selfIface string, prefixes ...netip.Prefix) []Co
 	return cs
 }
 
-// altCandidates are suggested replacement CIDRs for a contested mesh
-// prefix, tried in order. 100.64.0.0/10 is deliberately absent: it belongs
-// to Tailscale's CGNAT range.
-var altCandidates = map[int][]netip.Prefix{
-	24: {
-		netip.MustParsePrefix("10.100.0.0/24"),
-		netip.MustParsePrefix("10.109.0.0/24"),
-		netip.MustParsePrefix("10.110.0.0/24"),
-		netip.MustParsePrefix("10.200.0.0/24"),
-		netip.MustParsePrefix("172.16.100.0/24"),
-		netip.MustParsePrefix("172.20.100.0/24"),
-		netip.MustParsePrefix("172.30.100.0/24"),
-	},
-	16: {
-		netip.MustParsePrefix("10.100.0.0/16"),
-		netip.MustParsePrefix("10.110.0.0/16"),
-		netip.MustParsePrefix("10.200.0.0/16"),
-		netip.MustParsePrefix("172.16.0.0/16"),
-		netip.MustParsePrefix("172.20.0.0/16"),
-		netip.MustParsePrefix("172.30.0.0/16"),
-	},
+// altAnchors are addresses in RFC 1918 private space from which same-size
+// replacement candidates are derived, tried in order. 100.64.0.0/10 is
+// deliberately absent: it belongs to Tailscale's CGNAT range.
+var altAnchors = []netip.Addr{
+	netip.MustParseAddr("10.100.0.0"),
+	netip.MustParseAddr("10.109.0.0"),
+	netip.MustParseAddr("10.110.0.0"),
+	netip.MustParseAddr("10.200.0.0"),
+	netip.MustParseAddr("172.16.0.0"),
+	netip.MustParseAddr("172.20.0.0"),
+	netip.MustParseAddr("172.30.0.0"),
+	netip.MustParseAddr("192.168.100.0"),
+}
+
+// privateBlocks are the RFC 1918 ranges; a replacement candidate must fit
+// entirely inside one of them.
+var privateBlocks = []netip.Prefix{
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+}
+
+// altCandidates derives replacement CIDRs of the given size by re-masking
+// the anchor addresses, keeping only candidates that fit inside private
+// space. Every prefix size an RFC 1918 block can host yields candidates.
+func altCandidates(bits int) []netip.Prefix {
+	var out []netip.Prefix
+	for _, a := range altAnchors {
+		cand := netip.PrefixFrom(a, bits).Masked()
+		if !cand.IsValid() {
+			continue
+		}
+		for _, b := range privateBlocks {
+			if b.Contains(cand.Addr()) && b.Bits() <= cand.Bits() {
+				out = append(out, cand)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // SuggestAlternative returns a private CIDR of the same size as bad that
 // overlaps nothing in the snapshot's routing table (including bad itself).
-// ok is false when no candidate of that prefix size fits.
+// ok is false when no private-space candidate of that prefix size fits —
+// e.g. for IPv6 prefixes or sizes broader than any RFC 1918 block.
 func SuggestAlternative(bad netip.Prefix, s Snapshot) (netip.Prefix, bool) {
 	bad = bad.Masked()
-	if !bad.IsValid() {
+	if !bad.IsValid() || !bad.Addr().Is4() {
 		return netip.Prefix{}, false
 	}
-	for _, cand := range altCandidates[bad.Bits()] {
+	for _, cand := range altCandidates(bad.Bits()) {
 		if cand == bad || cand.Overlaps(bad) {
 			continue
 		}

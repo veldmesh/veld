@@ -34,7 +34,10 @@ also checks the routing table for conflicts at install time.
 | `... conflicts with 10.100.0.0/24 via tun0: ... exact conflict; Veldmesh installs its route with metric 0 ...` | Another interface claims the exact same prefix. Veld wins ties via metric. | Prefer moving one side to a different CIDR; the log suggests one (`consider using 10.109.0.0/24 instead`). |
 | `... conflicts with 10.100.0.128/25 via tun0: ... more specific ... never reaches the mesh` | A more-specific route carves destinations out of the mesh. Those destinations will not work over the mesh. | Change the mesh CIDR (the log suggests an alternative) or remove the other route. |
 
-Suggestions always stay outside Tailscale's `100.64.0.0/10` CGNAT range.
+Suggestions are same-size CIDRs inside RFC 1918 private space (`10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`), generated for any prefix size those
+blocks can host, and always stay outside Tailscale's `100.64.0.0/10` CGNAT
+range.
 
 ## Limitations
 
@@ -44,7 +47,9 @@ Suggestions always stay outside Tailscale's `100.64.0.0/10` CGNAT range.
   tunneling / kill-switch exclusions) can let veld's traffic through. No
   route metric can fix a firewall.
 - **Veldmesh's own TUN is excluded** from detection (`tun0` by default, or
-  `node.iface_name`), so veld never reports itself.
+  `node.iface_name`), so veld never reports itself. In coord mode the TUN
+  appears only after the coordinator assigns the VPN address; veld resolves
+  its own interface at check time, so the exclusion keeps working.
 - On macOS and Windows, detection works by interface name; CIDR-conflict
   checking currently requires Linux netlink.
 
