@@ -66,6 +66,16 @@ func (d *Dispatcher) Start() {
 	go d.udpLoop()
 }
 
+// SetTUN sets the TUN device. If the dispatcher was started with a nil TUN
+// (coord mode before VPN address assignment), this starts the tunLoop goroutine.
+func (d *Dispatcher) SetTUN(t tun.TUN) {
+	d.tun = t
+	if t != nil {
+		d.wg.Add(1)
+		go d.tunLoop()
+	}
+}
+
 // Stop closes the TUN and UDP conn, causing both loops to exit.
 // Safe to call multiple times.
 func (d *Dispatcher) Stop() {

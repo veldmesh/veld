@@ -50,6 +50,7 @@ type Daemon struct {
 	peerID       string
 	coordAddr    string
 	relayProxies map[[32]byte]*relay.Proxy // one relay proxy per peer ID
+	tunDev       tun.TUN                   // veld's own TUN; nil in coord mode until the coordinator assigns the VPN address
 }
 
 // New creates a Daemon from pre-constructed components.
@@ -74,6 +75,7 @@ func New(
 		peerTbl:   peerTbl,
 		localID:   localID,
 		networkID: networkID,
+		tunDev:    t,
 	}
 }
 
@@ -319,6 +321,63 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 		}
 
 		d.coordCli.OnSignal = d.natMgr.DeliverSignal
+
+		// When the coordinator assigns a VPN address, create the TUN and install the mesh route.
+		d.coordCli.OnVPNAddrAssigned = func(vpnAddr netip.Addr, networkCIDR string) {
+			d.mu.Lock()
+			// If we already have a TUN, nothing to do.
+			if d.tunDev != nil {
+				d.mu.Unlock()
+				return
+			}
+			d.mu.Unlock()
+
+			// Determine the network prefix for the TUN and mesh route.
+			var prefix netip.Prefix
+			if networkCIDR != "" {
+				netCIDR, err := netip.ParsePrefix(networkCIDR)
+				if err != nil {
+					fmt.Printf("warning: invalid network_cidr from coord %q: %v; falling back to /24\n", networkCIDR, err)
+					prefix = netip.PrefixFrom(vpnAddr, 24)
+				} else {
+					// Replace the host portion with this node's assigned VPN address.
+					prefix = netip.PrefixFrom(vpnAddr, netCIDR.Bits())
+				}
+			} else {
+				fmt.Printf("warning: coordinator did not provide network_cidr; assuming /24\n")
+				prefix = netip.PrefixFrom(vpnAddr, 24)
+			}
+
+			mtu := cfg.Node.MTU
+			if mtu == 0 {
+				mtu = 1420
+			}
+			ifaceName := cfg.Node.IfaceName
+			if ifaceName == "" {
+				ifaceName = "tun0"
+			}
+
+			tunDev, err := tun.CreateTUN(ifaceName, prefix, mtu)
+			if err != nil {
+				fmt.Printf("warning: failed to create TUN in coord mode: %v (data plane disabled)\n", err)
+				return
+			}
+
+			d.mu.Lock()
+			d.tunDev = tunDev
+			d.mu.Unlock()
+
+			// Wire the new TUN into the dispatcher.
+			d.disp.SetTUN(tunDev)
+
+			// Install the mesh route for the network prefix via the TUN address.
+			if err := d.routeMgr.Add(prefix, vpnAddr); err != nil {
+				fmt.Printf("warning: add mesh route %s via %s: %v\n", prefix, vpnAddr, err)
+			}
+
+			// Update IPC status now that we have a VPN address.
+			d.updateIPCStatus()
+		}
 	}
 
 	// Wire up IPC server
@@ -346,7 +405,9 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	}
 
 	// Wire up mDNS LAN discovery if enabled and we have a VPN address.
-	// Only available in static mode (coord assigns the VPN address dynamically).
+	// In coord mode, mDNS can only start after VPN address is assigned.
+	// We wire it up lazily in OnVPNAddrAssigned if needed, but for now
+	// it's only available in static mode.
 	if cfg.MDNS.Enabled && vpnPrefix.IsValid() {
 		mdnsName := cfg.MDNS.Name
 		if mdnsName == "" {
@@ -422,6 +483,18 @@ func buildPeerTable(peerCfgs []intconfig.PeerConfig) (*peer.Table, error) {
 	return tbl, nil
 }
 
+// selfInterface returns the name of veld's own TUN interface, or "" while
+// no TUN exists (coord mode until the coordinator assigns the VPN address).
+func (d *Daemon) selfInterface() string {
+	d.mu.Lock()
+	t := d.tunDev
+	d.mu.Unlock()
+	if t == nil {
+		return ""
+	}
+	return t.Name()
+}
+
 // Start launches the dispatcher, coord client, mDNS discovery, and IPC server goroutines.
 func (d *Daemon) Start() {
 	d.disp.Start()
@@ -446,6 +519,11 @@ func (d *Daemon) Stop() {
 	d.mu.Lock()
 	proxies := d.relayProxies
 	d.relayProxies = nil
+	// Close our TUN if we created one.
+	if d.tunDev != nil {
+		_ = d.tunDev.Close()
+		d.tunDev = nil
+	}
 	d.mu.Unlock()
 	for _, p := range proxies {
 		_ = p.Close()

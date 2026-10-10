@@ -46,9 +46,10 @@ type Config struct {
 type Client struct {
 	cfg Config
 
-	mu      sync.Mutex
-	vpnAddr netip.Addr
-	peerID  string
+	mu          sync.Mutex
+	vpnAddr     netip.Addr
+	peerID      string
+	networkCidr string
 
 	gcMu sync.Mutex
 	gc   coordv1.CoordClient // set when connected; nil when not
@@ -64,6 +65,10 @@ type Client struct {
 	// OnRouteUpdate is called when a peer's advertised subnet routes change.
 	// routes is the new set of prefixes (empty slice means peer removed all routes).
 	OnRouteUpdate func(peerID [32]byte, routes []netip.Prefix)
+	// OnVPNAddrAssigned is called when the coordinator assigns a VPN address
+	// to this daemon. It provides the assigned VPN address and the network CIDR
+	// (empty string if the server did not provide one).
+	OnVPNAddrAssigned func(vpnAddr netip.Addr, networkCIDR string)
 }
 
 // New creates a Client. Call Start to connect.
@@ -85,6 +90,14 @@ func (c *Client) PeerID() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.peerID
+}
+
+// NetworkCIDR returns the network CIDR prefix reported by the coordinator.
+// Returns "" until Start has completed a registration.
+func (c *Client) NetworkCIDR() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.networkCidr
 }
 
 // Start connects to the coord server and begins maintaining the peer table.
@@ -220,10 +233,19 @@ func (c *Client) registerAndWatch(ctx context.Context, gc coordv1.CoordClient) e
 	if err != nil {
 		return err
 	}
+
+	cidr := resp.NetworkCidr
+
 	c.mu.Lock()
 	c.vpnAddr = vpnAddr
 	c.peerID = resp.PeerId
+	c.networkCidr = cidr
 	c.mu.Unlock()
+
+	// Notify about VPN address assignment so the daemon can create its TUN.
+	if c.OnVPNAddrAssigned != nil {
+		c.OnVPNAddrAssigned(vpnAddr, cidr)
+	}
 
 	// Stream peer events (and signals addressed to us) until ctx is cancelled.
 	// The server sends a synthetic JOIN snapshot of current peers at stream
