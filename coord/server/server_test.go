@@ -92,6 +92,7 @@ func newRegisterIdentity(t *testing.T) *crypto.Identity {
 func registerClaimsFor(req *coordv1.RegisterRequest) crypto.RegisterClaims {
 	return crypto.RegisterClaims{
 		NetworkID:     req.NetworkId,
+		Name:          req.Name,
 		Ed25519Public: req.Ed25519Public,
 		X25519Public:  req.X25519Public,
 		Endpoint:      req.Endpoint,
@@ -1604,6 +1605,9 @@ func TestServer_Register_RequiresProofOfKeyPossession(t *testing.T) {
 		{"tampered network_id (replayed against another network of the same account)", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
 			req.NetworkId = "net-a2"
 		}, codes.Unauthenticated},
+		{"tampered name", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
+			req.Name = "different-name"
+		}, codes.Unauthenticated},
 		{"tampered ed25519_public", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
 			other := newRegisterIdentity(t)
 			req.Ed25519Public = base64.StdEncoding.EncodeToString(other.Ed25519Public)
@@ -1683,5 +1687,62 @@ func TestServer_Register_TimestampWindowEdge(t *testing.T) {
 	}
 	if resp.VpnAddr != "10.99.0.1" {
 		t.Errorf("VPN address: got %q, want 10.99.0.1", resp.VpnAddr)
+	}
+}
+// TestServer_Register_UniformAuthError verifies that the client-visible
+// error message is identical for different signature verification failures
+// (stale timestamp vs bad signature) to avoid leaking which check failed or
+// the server's clock. The detailed reason is still logged server-side.
+func TestServer_Register_UniformAuthError(t *testing.T) {
+	srv, _ := newSignatureFixture(t)
+
+	// Case 1: stale timestamp (121 s old) with a valid signature for that timestamp.
+	id := newRegisterIdentity(t)
+	staleReq := newRegisterRequest(id, "net-a", "token-a", "stale", "1.2.3.4:51820", nil)
+	staleReq.TimestampUnix = time.Now().Unix() - 121
+	staleReq.Signature = crypto.SignRegister(id.Ed25519Private, registerClaimsFor(staleReq))
+
+	_, err := srv.Register(context.Background(), staleReq)
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("stale timestamp: got %v (code %s), want Unauthenticated", err, status.Code(err))
+	}
+	staleMsg := err.Error()
+
+	// Case 2: current timestamp but garbage signature.
+	now := time.Now().Unix()
+	badSigReq := newRegisterRequest(id, "net-a", "token-a", "badsig", "1.2.3.4:51820", nil)
+	badSigReq.TimestampUnix = now
+	badSigReq.Signature = make([]byte, 64) // all zeros
+
+	_, err = srv.Register(context.Background(), badSigReq)
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("bad signature: got %v (code %s), want Unauthenticated", err, status.Code(err))
+	}
+	badSigMsg := err.Error()
+
+	// Both must return the exact same client-visible message.
+	if staleMsg != badSigMsg {
+		t.Fatalf("error messages differ:\n  stale: %q\n  badsig: %q", staleMsg, badSigMsg)
+	}
+	if staleMsg != "rpc error: code = Unauthenticated desc = invalid register signature or timestamp" {
+		t.Fatalf("unexpected error message: %q", staleMsg)
+	}
+}
+
+// TestServer_Register_TamperedName verifies that changing the Name field
+// after signing fails verification (Name is now covered by the signature).
+func TestServer_Register_TamperedName(t *testing.T) {
+	srv, _ := newSignatureFixture(t)
+
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, "net-a", "token-a", "original-name", "1.2.3.4:51820", nil)
+	signRegisterReq(t, id, req)
+
+	// Tamper with the Name after signing.
+	req.Name = "tampered-name"
+
+	_, err := srv.Register(context.Background(), req)
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("tampered name: got %v (code %s), want Unauthenticated", err, status.Code(err))
 	}
 }

@@ -13,9 +13,11 @@ import (
 // vectorClaims is the fixed input of the RegisterSignedMessage test vector.
 // It deliberately lists the subnet routes unsorted — the encoder must sign
 // them in sorted order — and uses a recognizable timestamp
-// (2025-01-01T00:00:00Z).
+// (2025-01-01T00:00:00Z). Name is empty to match the v1 test vector and
+// prove the empty-string encoding.
 var vectorClaims = RegisterClaims{
 	NetworkID:     "net-3f0b8a2c",
+	Name:          "",
 	Ed25519Public: "rU3j0Q9yJdBhpIS4Iac2BSGFciXqSm0CVBkNJGyzXBk=",
 	X25519Public:  "bEc9LidcTNF4gJpA2tJvJlIaSafqiIMmqtTIKYtEqzU=",
 	Endpoint:      "203.0.113.7:51820",
@@ -29,7 +31,7 @@ var vectorClaims = RegisterClaims{
 // expected bytes are the golden vector shared with the protocol docs.
 func TestRegisterSignedMessage_Vector(t *testing.T) {
 	got := hex.EncodeToString(RegisterSignedMessage(vectorClaims))
-	want := "76656c642d636f6f72642d72656769737465722d7631000000000c6e65742d33663062386132630000002c7255336a305139794a64426870495334496163324253474663695871536d304356426b4e4a47797a58426b3d0000002c624563394c696463544e4634674a704132744a764a6c49615361667169494d6d717454494b597445717a553d000000113230332e302e3131332e373a3531383230000000020000000c31302e34322e302e302f32340000000e3139322e3136382e312e302f32340000000067748580"
+	want := "76656c642d636f6f72642d72656769737465722d7632000000000c6e65742d3366306238613263000000000000002c7255336a305139794a64426870495334496163324253474663695871536d304356426b4e4a47797a58426b3d0000002c624563394c696463544e4634674a704132744a764a6c49615361667169494d6d717454494b597445717a553d000000113230332e302e3131332e373a3531383230000000020000000c31302e34322e302e302f32340000000e3139322e3136382e312e302f32340000000067748580"
 	if got != want {
 		t.Fatalf("RegisterSignedMessage vector:\n got  %s\n want %s", got, want)
 	}
@@ -105,6 +107,7 @@ func TestVerifyRegisterSignature_TamperedField(t *testing.T) {
 		mod  func(c *RegisterClaims)
 	}{
 		{"network_id", func(c *RegisterClaims) { c.NetworkID = "net-other" }},
+		{"name", func(c *RegisterClaims) { c.Name = "different-name" }},
 		{"ed25519_public", func(c *RegisterClaims) { c.Ed25519Public = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" }},
 		{"x25519_public", func(c *RegisterClaims) { c.X25519Public = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=" }},
 		{"endpoint", func(c *RegisterClaims) { c.Endpoint = "198.51.100.9:51820" }},
