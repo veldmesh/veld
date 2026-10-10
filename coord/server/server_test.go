@@ -820,9 +820,6 @@ func TestServer_SendSignal_SenderNotOwnedByCaller_IsRejected(t *testing.T) {
 		if p.Name == "peer-a1" {
 			peerA1 = p.ID
 		}
-		if p.Name == "peer-a2" {
-			// peer-a2 is the recipient, peerA1 is the spoofed sender
-		}
 	}
 	peersB, _ := reg.ListPeers("net-b")
 	for _, p := range peersB {
