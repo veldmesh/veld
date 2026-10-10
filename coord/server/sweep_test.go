@@ -283,6 +283,39 @@ func TestServer_ExpelStalePeers_FullLeaveSemantics(t *testing.T) {
 	}
 }
 
+func TestServer_ExpelStalePeers_DropsPendingSignals(t *testing.T) {
+	srv, reg, _, _ := newSweepTestServer(t)
+
+	now := time.Now().Unix()
+	registerSweepPeer(t, reg, "stale", now-int64((48*time.Hour).Seconds()))
+	registerSweepPeer(t, reg, "fresh", now)
+
+	// Both peers are registered but not watching: signals to them are held.
+	send := func(from, to string) {
+		t.Helper()
+		if _, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+			Token: "tok", FromPeerId: from, ToPeerId: to, Payload: []byte("candidate"),
+		}); err != nil {
+			t.Fatalf("SendSignal %s->%s: %v", from, to, err)
+		}
+	}
+	send("fresh", "stale")
+	send("stale", "fresh")
+
+	if _, err := srv.ExpelStalePeers(context.Background(), 24*time.Hour); err != nil {
+		t.Fatalf("ExpelStalePeers: %v", err)
+	}
+
+	srv.bus.mu.RLock()
+	defer srv.bus.mu.RUnlock()
+	if _, ok := srv.bus.pending["stale"]; ok {
+		t.Errorf("pending signals for the expelled peer were not dropped")
+	}
+	if _, ok := srv.bus.pending["fresh"]; !ok {
+		t.Errorf("pending signals for a surviving peer were dropped")
+	}
+}
+
 func TestServer_ExpelStalePeers_SkipsConnectedPeer(t *testing.T) {
 	srv, reg, hooks, _ := newSweepTestServer(t)
 

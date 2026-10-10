@@ -172,6 +172,7 @@ func (s *Server) ExpelStalePeers(ctx context.Context, ttl time.Duration) (int, e
 			At:        time.Now(),
 		})
 
+		s.bus.DropPendingSignals(rec.ID)
 		s.bus.Publish(rec.NetworkID, &coordv1.PeerEvent{
 			Type: coordv1.EventType_LEAVE,
 			Peer: &coordv1.Peer{Id: rec.ID, Name: rec.Name},
@@ -430,11 +431,20 @@ func (s *Server) Watch(req *coordv1.WatchRequest, stream coordv1.Coord_WatchServ
 	}
 }
 
-// SendSignal relays an opaque signal from one peer to another.
+// SendSignal relays an opaque signal from one peer to another. The sender
+// must be a registered peer of the authenticated account and the recipient
+// a registered peer of the same network, so a valid token cannot be used to
+// impersonate another peer or to reach peers of other networks. Payloads
+// above maxSignalPayload are rejected.
 func (s *Server) SendSignal(ctx context.Context, req *coordv1.SendSignalRequest) (*coordv1.SendSignalResponse, error) {
 	acc, err := s.accounts.Resolve(ctx, req.Token)
 	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "invalid token")
+	}
+	// The payload cap bounds the memory the pending store-and-forward can
+	// occupy; oversized signals are rejected outright.
+	if len(req.Payload) > maxSignalPayload {
+		return nil, status.Errorf(codes.InvalidArgument, "signal payload exceeds %d bytes", maxSignalPayload)
 	}
 	// The caller may only signal as a peer in a network owned by its
 	// account, and only to a peer in the same network.
@@ -449,11 +459,14 @@ func (s *Server) SendSignal(ctx context.Context, req *coordv1.SendSignalRequest)
 	if from.NetworkID != to.NetworkID {
 		return nil, errPeerNotFound
 	}
-	s.bus.SendSignal(req.FromPeerId, req.ToPeerId, req.Payload)
+	// The recipient is registered: hold the signal briefly if it has not
+	// opened its Watch stream yet (it registers first, then watches).
+	s.bus.SendSignal(req.FromPeerId, req.ToPeerId, req.Payload, true)
 	return &coordv1.SendSignalResponse{}, nil
 }
 
-// Leave removes a peer from the registry.
+// Leave removes a peer from the registry. The peer must belong to a network
+// owned by the authenticated account.
 func (s *Server) Leave(ctx context.Context, req *coordv1.LeaveRequest) (*coordv1.LeaveResponse, error) {
 	acc, err := s.accounts.Resolve(ctx, req.Token)
 	if err != nil {
@@ -482,6 +495,7 @@ func (s *Server) Leave(ctx context.Context, req *coordv1.LeaveRequest) (*coordv1
 		At:        time.Now(),
 	})
 
+	s.bus.DropPendingSignals(removed.ID)
 	s.bus.Publish(removed.NetworkID, &coordv1.PeerEvent{
 		Type: coordv1.EventType_LEAVE,
 		Peer: &coordv1.Peer{Id: removed.ID, Name: removed.Name},

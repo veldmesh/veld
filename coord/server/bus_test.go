@@ -110,7 +110,7 @@ func TestBus_SignalDelivery(t *testing.T) {
 	defer bus.UnsubscribeSignals("peer1", ch)
 
 	payload := []byte("test signal")
-	bus.SendSignal("peer2", "peer1", payload)
+	bus.SendSignal("peer2", "peer1", payload, false)
 
 	select {
 	case msg := <-ch:
@@ -139,5 +139,66 @@ func TestBus_SignalUnsubscribe(t *testing.T) {
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("timeout waiting for channel close")
+	}
+}
+
+func TestBus_HeldSignalDeliveredOnSubscribe(t *testing.T) {
+	bus := NewBus()
+	bus.SendSignal("b", "a", []byte("1"), true)
+	bus.SendSignal("b", "a", []byte("2"), true)
+	bus.SendSignal("b", "nobody", []byte("x"), false) // not held
+
+	ch := bus.SubscribeSignals("a")
+	defer bus.UnsubscribeSignals("a", ch)
+	for _, want := range []string{"1", "2"} {
+		select {
+		case got := <-ch:
+			if string(got.Payload) != want || got.FromPeerID != "b" {
+				t.Fatalf("got %+v, want payload %q from b", got, want)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("held signal %q not delivered", want)
+		}
+	}
+	if _, ok := bus.pending["nobody"]; ok {
+		t.Fatal("signal with hold=false was held")
+	}
+	if _, ok := bus.pending["a"]; ok {
+		t.Fatal("held signals not cleared after delivery")
+	}
+}
+
+func TestBus_HeldSignalsExpireAndAreCapped(t *testing.T) {
+	bus := NewBus()
+	now := time.Unix(1000, 0)
+	bus.now = func() time.Time { return now }
+
+	bus.SendSignal("b", "a", []byte("old"), true)
+	now = now.Add(pendingSignalTTL + time.Second)
+	for i := 0; i < maxPendingPerPeer+5; i++ {
+		bus.SendSignal("b", "a", []byte{byte(i)}, true)
+	}
+	if n := len(bus.pending["a"]); n != maxPendingPerPeer {
+		t.Fatalf("held %d signals, want cap %d", n, maxPendingPerPeer)
+	}
+
+	ch := bus.SubscribeSignals("a")
+	defer bus.UnsubscribeSignals("a", ch)
+	first := <-ch
+	if first.Payload[0] != 5 { // expired "old" dropped, oldest 5 trimmed by the cap
+		t.Fatalf("first delivered payload %v, want [5]", first.Payload)
+	}
+}
+
+func TestBus_DropPendingSignals(t *testing.T) {
+	bus := NewBus()
+	bus.SendSignal("b", "a", []byte("1"), true)
+	bus.DropPendingSignals("a")
+	ch := bus.SubscribeSignals("a")
+	defer bus.UnsubscribeSignals("a", ch)
+	select {
+	case got := <-ch:
+		t.Fatalf("dropped signal delivered: %+v", got)
+	default:
 	}
 }

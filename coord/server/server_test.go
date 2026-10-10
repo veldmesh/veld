@@ -338,18 +338,20 @@ func TestServer_SendSignal_OK(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
 
-	// Signals are scoped to registered peers, so register two first.
-	var ids [2]string
-	for i := 0; i < 2; i++ {
-		id := newRegisterIdentity(t)
-		req := newRegisterRequest(id, "test-net", "test-token", fmt.Sprintf("peer%d", i+1), "", nil)
-		signRegisterReq(t, id, req)
+	idA := newRegisterIdentity(t)
+	reqA := newRegisterRequest(idA, "test-net", "test-token", "signal-a", "", nil)
+	signRegisterReq(t, idA, reqA)
+	respA, err := srv.Register(context.Background(), reqA)
+	if err != nil {
+		t.Fatalf("Register A: %v", err)
+	}
 
-		resp, err := srv.Register(context.Background(), req)
-		if err != nil {
-			t.Fatalf("Register peer %d: %v", i+1, err)
-		}
-		ids[i] = resp.PeerId
+	idB := newRegisterIdentity(t)
+	reqB := newRegisterRequest(idB, "test-net", "test-token", "signal-b", "", nil)
+	signRegisterReq(t, idB, reqB)
+	respB, err := srv.Register(context.Background(), reqB)
+	if err != nil {
+		t.Fatalf("Register B: %v", err)
 	}
 
 	// Watch as the target peer so the delivered signal is observable.
@@ -359,15 +361,15 @@ func TestServer_SendSignal_OK(t *testing.T) {
 		done <- srv.Watch(&coordv1.WatchRequest{
 			NetworkId: "test-net",
 			Token:     "test-token",
-			PeerId:    ids[1],
+			PeerId:    respB.PeerId,
 		}, stream)
 	}()
 	time.Sleep(50 * time.Millisecond)
 
-	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+	_, err = srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
 		Token:      "test-token",
-		FromPeerId: ids[0],
-		ToPeerId:   ids[1],
+		FromPeerId: respA.PeerId,
+		ToPeerId:   respB.PeerId,
 		Payload:    []byte("test signal"),
 	})
 	if err != nil {
@@ -398,8 +400,8 @@ func TestServer_SendSignal_OK(t *testing.T) {
 	if got == nil {
 		t.Fatalf("signal not delivered to target peer; events: %+v", stream.events)
 	}
-	if got.FromPeerId != ids[0] || string(got.Payload) != "test signal" {
-		t.Errorf("delivered signal: got %+v, want from %s payload %q", got, ids[0], "test signal")
+	if got.FromPeerId != respA.PeerId || string(got.Payload) != "test signal" {
+		t.Errorf("delivered signal: got %+v, want from %s payload %q", got, respA.PeerId, "test signal")
 	}
 }
 
@@ -673,6 +675,319 @@ func TestServer_Register_Idempotent(t *testing.T) {
 		t.Errorf("PeerId changed on idempotent register: first %s, second %s", resp1.PeerId, resp2.PeerId)
 	}
 }
+
+// --- Signal holding tests ---
+
+// A client registers first and opens Watch afterwards. A peer that is already
+// watching sees the JOIN in between and signals immediately; that signal must
+// reach the newcomer once its Watch opens (it used to be dropped, so NAT
+// traversal succeeded on one side only — flaky TestNATTraversal_TwoPeersViaCoord).
+func TestServer_SignalSentBeforeRecipientWatches_IsDelivered(t *testing.T) {
+	srv, reg := testServer(t)
+	defer reg.Close()
+
+	idA := newRegisterIdentity(t)
+	reqA := newRegisterRequest(idA, "test-net", "test-token", "node-a", "", nil)
+	signRegisterReq(t, idA, reqA)
+	respA, err := srv.Register(context.Background(), reqA)
+	if err != nil {
+		t.Fatalf("Register A: %v", err)
+	}
+
+	idB := newRegisterIdentity(t)
+	reqB := newRegisterRequest(idB, "test-net", "test-token", "node-b", "", nil)
+	signRegisterReq(t, idB, reqB)
+	respB, err := srv.Register(context.Background(), reqB)
+	if err != nil {
+		t.Fatalf("Register B: %v", err)
+	}
+
+	// B signals A before A has opened its Watch stream.
+	if _, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token: "test-token", FromPeerId: respB.PeerId, ToPeerId: respA.PeerId, Payload: []byte("candidates-from-b"),
+	}); err != nil {
+		t.Fatalf("SendSignal: %v", err)
+	}
+
+	stream := newFakeWatchStream()
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.Watch(&coordv1.WatchRequest{NetworkId: "test-net", Token: "test-token", PeerId: respA.PeerId}, stream)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	stream.cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Watch goroutine did not finish")
+	}
+
+	for _, ev := range stream.events {
+		if ev.Type == coordv1.EventType_SIGNAL && ev.Signal != nil &&
+			ev.Signal.FromPeerId == respB.PeerId && string(ev.Signal.Payload) == "candidates-from-b" {
+			return
+		}
+	}
+	t.Fatalf("signal sent before Watch was not delivered; events: %v", stream.events)
+}
+
+func TestServer_SignalToUnknownPeer_IsNotHeld(t *testing.T) {
+	srv, reg := testServer(t)
+	defer reg.Close()
+
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, "test-net", "test-token", "signal-sender", "", nil)
+	signRegisterReq(t, id, req)
+	resp, err := srv.Register(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// The recipient is not registered: the request must be rejected outright
+	// instead of silently accepted, and nothing may be held for it.
+	_, err = srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token: "test-token", FromPeerId: resp.PeerId, ToPeerId: "no-such-peer", Payload: []byte("p"),
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("SendSignal to an unregistered peer: got %v, want NotFound", err)
+	}
+	srv.bus.mu.RLock()
+	defer srv.bus.mu.RUnlock()
+	if len(srv.bus.pending) != 0 {
+		t.Fatalf("signal for an unregistered peer was held: %v", srv.bus.pending)
+	}
+}
+
+// twoAccountTestServer builds a server with two accounts (token "tok-a" ->
+// account acc1, token "tok-b" -> account acc2) and two networks: "net-a"
+// owned by acc1 and "net-b" owned by acc2. Peers are registered via the RPC
+// so they have valid keys and signatures.
+func twoAccountTestServer(t *testing.T) (*Server, *Registry) {
+	t.Helper()
+	reg, err := NewRegistry(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	if err := reg.CreateNetwork(coordcore.Network{ID: "net-a", CIDR: netip.MustParsePrefix("10.1.0.0/24"), Name: "A"}, "acc1"); err != nil {
+		t.Fatalf("CreateNetwork net-a: %v", err)
+	}
+	if err := reg.CreateNetwork(coordcore.Network{ID: "net-b", CIDR: netip.MustParsePrefix("10.2.0.0/24"), Name: "B"}, "acc2"); err != nil {
+		t.Fatalf("CreateNetwork net-b: %v", err)
+	}
+	accounts := ce.NewTokenAccountStore(map[string]coordcore.Account{
+		"tok-a": {ID: "acc1", Tier: coordcore.TierFree},
+		"tok-b": {ID: "acc2", Tier: coordcore.TierFree},
+	})
+	srv := New(reg, NewBus(), ce.NewFreeEnforcer(), accounts, ce.NewNoopAuditLogger(), ce.NewRejectSubnetPolicy(), ce.NewNoopHooks())
+
+	// Register one peer per network via the RPC so they have valid keys.
+	idA := newRegisterIdentity(t)
+	reqA := newRegisterRequest(idA, "net-a", "tok-a", "peer-a1", "", nil)
+	signRegisterReq(t, idA, reqA)
+	_, err = srv.Register(context.Background(), reqA)
+	if err != nil {
+		t.Fatalf("Register A: %v", err)
+	}
+
+	idB := newRegisterIdentity(t)
+	reqB := newRegisterRequest(idB, "net-b", "tok-b", "peer-b1", "", nil)
+	signRegisterReq(t, idB, reqB)
+	_, err = srv.Register(context.Background(), reqB)
+	if err != nil {
+		t.Fatalf("Register B: %v", err)
+	}
+
+	return srv, reg
+}
+
+func TestServer_SendSignal_SenderNotOwnedByCaller_IsRejected(t *testing.T) {
+	srv, reg := twoAccountTestServer(t)
+	defer reg.Close()
+
+	// We need a second peer in net-a to be the recipient.
+	idA2 := newRegisterIdentity(t)
+	reqA2 := newRegisterRequest(idA2, "net-a", "tok-a", "peer-a2", "", nil)
+	signRegisterReq(t, idA2, reqA2)
+	_, err := srv.Register(context.Background(), reqA2)
+	if err != nil {
+		t.Fatalf("Register A2: %v", err)
+	}
+
+	// Get the peer IDs from the registry (they're the hex Ed25519 public keys).
+	var peerA1, peerB1 string
+	peersA, _ := reg.ListPeers("net-a")
+	for _, p := range peersA {
+		if p.Name == "peer-a1" {
+			peerA1 = p.ID
+		}
+	}
+	peersB, _ := reg.ListPeers("net-b")
+	for _, p := range peersB {
+		if p.Name == "peer-b1" {
+			peerB1 = p.ID
+		}
+	}
+
+	// A caller authenticated as acc1 (tok-a) claims to be acc2's peer (peerB1).
+	// Without the ownership check it could both spoof acc2 and make the registered
+	// recipient hold a signal that never really came from b1's account.
+	_, err = srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token: "tok-a", FromPeerId: peerB1, ToPeerId: peerA1, Payload: []byte("spoofed"),
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("SendSignal with a foreign from_peer_id: got %v, want NotFound", err)
+	}
+
+	srv.bus.mu.RLock()
+	defer srv.bus.mu.RUnlock()
+	if len(srv.bus.pending) != 0 {
+		t.Fatalf("signal from a spoofed sender was held: %v", srv.bus.pending)
+	}
+}
+
+func TestServer_SendSignal_PeersNotInSameNetwork_IsRejected(t *testing.T) {
+	srv, reg := twoAccountTestServer(t)
+	defer reg.Close()
+
+	// Get the peer IDs from the registry.
+	var peerA1, peerB1 string
+	peersA, _ := reg.ListPeers("net-a")
+	for _, p := range peersA {
+		if p.Name == "peer-a1" {
+			peerA1 = p.ID
+		}
+	}
+	peersB, _ := reg.ListPeers("net-b")
+	for _, p := range peersB {
+		if p.Name == "peer-b1" {
+			peerB1 = p.ID
+		}
+	}
+
+	// Both peers are registered, but they do not share a network.
+	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token: "tok-a", FromPeerId: peerA1, ToPeerId: peerB1, Payload: []byte("p"),
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("SendSignal across networks: got %v, want NotFound", err)
+	}
+
+	srv.bus.mu.RLock()
+	defer srv.bus.mu.RUnlock()
+	if len(srv.bus.pending) != 0 {
+		t.Fatalf("signal to a peer in another network was held: %v", srv.bus.pending)
+	}
+}
+
+func TestServer_SendSignal_UnknownSender_IsRejected(t *testing.T) {
+	srv, reg := twoAccountTestServer(t)
+	defer reg.Close()
+
+	var peerA1 string
+	peersA, _ := reg.ListPeers("net-a")
+	for _, p := range peersA {
+		if p.Name == "peer-a1" {
+			peerA1 = p.ID
+		}
+	}
+
+	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token: "tok-a", FromPeerId: "no-such-sender", ToPeerId: peerA1, Payload: []byte("p"),
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("SendSignal with an unregistered sender: got %v, want NotFound", err)
+	}
+
+	srv.bus.mu.RLock()
+	defer srv.bus.mu.RUnlock()
+	if len(srv.bus.pending) != 0 {
+		t.Fatalf("signal from an unregistered sender was held: %v", srv.bus.pending)
+	}
+}
+
+// Leave may only remove a peer that belongs to a network owned by the
+// authenticated account; a valid token for one account must not delete
+// another account's peers.
+func TestServer_Leave_PeerNotOwnedByCaller_IsRejected(t *testing.T) {
+	srv, reg := twoAccountTestServer(t)
+	defer reg.Close()
+
+	var peerB1 string
+	peersB, _ := reg.ListPeers("net-b")
+	for _, p := range peersB {
+		if p.Name == "peer-b1" {
+			peerB1 = p.ID
+		}
+	}
+
+	_, err := srv.Leave(context.Background(), &coordv1.LeaveRequest{
+		Token: "tok-a", PeerId: peerB1,
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("Leave removing a peer of another account: got %v, want NotFound", err)
+	}
+
+	// The peer must still be registered.
+	peers, err := reg.ListPeers("net-b")
+	if err != nil {
+		t.Fatalf("ListPeers net-b: %v", err)
+	}
+	if len(peers) != 1 || peers[0].ID != peerB1 {
+		t.Fatalf("Leave removed another account's peer; net-b peers: %+v", peers)
+	}
+}
+
+// Held signals are a store-and-forward buffer, so the payload size must be
+// capped at the application level, not only by the gRPC message limit.
+func TestServer_SendSignal_PayloadTooLarge_IsRejected(t *testing.T) {
+	srv, reg := testServer(t)
+	defer reg.Close()
+
+	idA := newRegisterIdentity(t)
+	reqA := newRegisterRequest(idA, "test-net", "test-token", "signal-a", "", nil)
+	signRegisterReq(t, idA, reqA)
+	respA, err := srv.Register(context.Background(), reqA)
+	if err != nil {
+		t.Fatalf("Register A: %v", err)
+	}
+
+	idB := newRegisterIdentity(t)
+	reqB := newRegisterRequest(idB, "test-net", "test-token", "signal-b", "", nil)
+	signRegisterReq(t, idB, reqB)
+	respB, err := srv.Register(context.Background(), reqB)
+	if err != nil {
+		t.Fatalf("Register B: %v", err)
+	}
+
+	_, err = srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token:      "test-token",
+		FromPeerId: respA.PeerId,
+		ToPeerId:   respB.PeerId,
+		Payload:    make([]byte, maxSignalPayload+1),
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("SendSignal with an oversized payload: got %v, want InvalidArgument", err)
+	}
+	srv.bus.mu.RLock()
+	held := len(srv.bus.pending)
+	srv.bus.mu.RUnlock()
+	if held != 0 {
+		t.Fatalf("oversized signal was held: %v", srv.bus.pending)
+	}
+
+	// The boundary is inclusive: a payload of exactly maxSignalPayload
+	// bytes is accepted (held for the recipient that has no Watch yet).
+	if _, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		Token:      "test-token",
+		FromPeerId: respA.PeerId,
+		ToPeerId:   respB.PeerId,
+		Payload:    make([]byte, maxSignalPayload),
+	}); err != nil {
+		t.Fatalf("SendSignal with a max-size payload: %v", err)
+	}
+}
+
+// --- Per-account scoping tests ---
 
 // scopedFixture is a Server wired for per-account scoping tests: account A
 // ("acc-a", token "token-a") owns netA and netA2, account B ("acc-b", token
