@@ -483,7 +483,7 @@ func loadConfigOrNew(cfgPath string) (*config.Config, error) {
 			Node: config.NodeConfig{
 				IdentityPath: filepath.Join(filepath.Dir(path), "identity.json"),
 				ListenAddr:   "0.0.0.0:51820",
-				IfaceName:    "tun0",
+				IfaceName:    "",
 				MTU:          1420,
 			},
 			Coord: config.CoordConfig{

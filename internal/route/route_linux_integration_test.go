@@ -102,10 +102,10 @@ func TestRouteReplaceTakesOverVPNRoute(t *testing.T) {
 		t.Fatalf("route %s not present after Add", testDst)
 	}
 	if found.Priority != route.DefaultRouteMetric {
-		t.Errorf("route metric = %d, want %d (veld must win ties)", found.Priority, route.DefaultRouteMetric)
+		t.Errorf("route metric = %d, want %d", found.Priority, route.DefaultRouteMetric)
 	}
 	if !found.Gw.Equal(gwVeld.AsSlice()) {
-		t.Errorf("route gw = %v, want %v (veld must take over the prefix)", found.Gw, gwVeld)
+		t.Errorf("route gw = %v, want %v (veld's replace took over the prefix)", found.Gw, gwVeld)
 	}
 
 	if err := m.Close(); err != nil {

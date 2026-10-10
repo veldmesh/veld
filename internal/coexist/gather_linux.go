@@ -11,10 +11,19 @@ import (
 	"net/netip"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
-// Observe gathers links and main-table routes via netlink. Both are
-// read-only dumps and work unprivileged.
+// Observe gathers links and routes from every routing table via netlink.
+// Both are read-only dumps and work unprivileged.
+//
+// Routes are dumped from ALL tables, not just main: wg-quick, Mullvad,
+// NordLynx and Tailscale install their routes in dedicated policy-routing
+// tables, and netlink's unfiltered route dump silently skips every route
+// whose table is not RT_TABLE_MAIN. Requesting RT_FILTER_TABLE with a
+// Table of RT_TABLE_UNSPEC disables both the non-main skip in the library
+// (its guard falls through when the table filter is set) and the filter
+// itself (UNSPEC filters nothing), yielding one dump with every table.
 func Observe() (Snapshot, error) {
 	nlLinks, err := netlink.LinkList()
 	if err != nil {
@@ -41,7 +50,8 @@ func Observe() (Snapshot, error) {
 		links = append(links, Link{Name: attrs.Name, Kind: l.Type(), Addrs: pfxs})
 	}
 
-	nlRoutes, err := netlink.RouteList(nil, netlink.FAMILY_ALL)
+	nlRoutes, err := netlink.RouteListFiltered(netlink.FAMILY_ALL,
+		&netlink.Route{Table: unix.RT_TABLE_UNSPEC}, netlink.RT_FILTER_TABLE)
 	if err != nil {
 		return Snapshot{Links: links}, fmt.Errorf("list routes: %w", err)
 	}
@@ -71,6 +81,7 @@ func Observe() (Snapshot, error) {
 			Gw:     gw,
 			Iface:  idx[r.LinkIndex],
 			Metric: r.Priority,
+			Table:  r.Table,
 		})
 	}
 

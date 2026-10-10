@@ -20,6 +20,12 @@ type windowsTUN struct {
 	mtu  int
 }
 
+// DefaultIfaceName is the default Wintun adapter name on Windows. A
+// dedicated name shows up as a stable, recognizable adapter in `netsh`
+// and the firewall UI, and keeps veld out of the generic tunnel patterns
+// used for VPN detection.
+func DefaultIfaceName() string { return "Veld" }
+
 // wintunDownloadURL is the official Wintun download page — the same place
 // the release workflow fetches the DLL from (see the Download Wintun step in
 // .github/workflows/release.yml). If the URL ever moves, update both.
