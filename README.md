@@ -34,7 +34,16 @@ Traffic flows directly between your devices. When direct connection isn't possib
 
 ## Quick start — managed service
 
-Install and log in with one command. See [veldmesh.io](https://veldmesh.io) for setup instructions.
+Install and log in with one command. The daemon connects to the coordinator, receives a VPN address, creates a TUN interface, and starts routing mesh traffic.
+
+```sh
+# On each machine
+curl -fsSL https://veldmesh.io/install.sh | sh   # or download from releases
+veld login                    # opens browser for auth
+veld up                       # connects, creates TUN, mesh is live
+```
+
+The coordinator assigns a VPN address (e.g., `10.100.0.1`) and the daemon creates a `tun0` interface with that address. Mesh traffic flows through the TUN; the coordinator never sees packet contents.
 
 ---
 
