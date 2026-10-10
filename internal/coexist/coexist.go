@@ -39,7 +39,13 @@ type RouteEntry struct {
 	Gw     netip.Addr   // gateway; zero if directly connected
 	Iface  string       // egress interface name; "" if unknown
 	Metric int
+	Table  int // routing table the route lives in (Linux: 254 main, 255 local, ...)
 }
+
+// rtTableLocal is the Linux "local" table (255). It holds a host route for
+// every assigned address; those are not routing decisions an operator can
+// change, so collision checks skip them to avoid host-route noise.
+const rtTableLocal = 255
 
 // Snapshot is a point-in-time view of the host's links and routes.
 type Snapshot struct {
@@ -60,8 +66,10 @@ type CollisionKind int
 
 const (
 	// CollisionEqual: another interface holds a route for the identical prefix.
-	// The kernel breaks the tie by metric; Veldmesh installs metric-0 routes,
-	// which win, but a VPN that reinstalls its route later can flip the table.
+	// Veldmesh installs its route via replace-on-conflict, so each side's
+	// (re)install claims the prefix in turn; on IPv4 veld's metric-0 route
+	// also wins while routes with higher metrics coexist. A VPN that
+	// reinstalls its route later can still take the prefix back.
 	CollisionEqual CollisionKind = iota
 	// CollisionInside: a more-specific route is carved out of the mesh prefix.
 	// Those destinations follow the other route and never reach the mesh.
@@ -240,8 +248,8 @@ func containsVPN(vpns []VPN, name string) bool {
 }
 
 // FindCollisions checks the given Veldmesh prefixes against routes in the
-// snapshot held by other interfaces. Default routes and routes on
-// selfIface (Veldmesh's own TUN) are never conflicts.
+// snapshot held by other interfaces. Default routes, local-table host
+// routes, and routes on selfIface (Veldmesh's own TUN) are never conflicts.
 func FindCollisions(s Snapshot, selfIface string, prefixes ...netip.Prefix) []Collision {
 	var cs []Collision
 	for _, p := range prefixes {
@@ -250,7 +258,7 @@ func FindCollisions(s Snapshot, selfIface string, prefixes ...netip.Prefix) []Co
 			continue
 		}
 		for _, r := range s.Routes {
-			if (selfIface != "" && r.Iface == selfIface) || isDefault(r.Dst) || !p.Overlaps(r.Dst) {
+			if (selfIface != "" && r.Iface == selfIface) || isDefault(r.Dst) || r.Table == rtTableLocal || !p.Overlaps(r.Dst) {
 				continue
 			}
 			switch {
@@ -260,7 +268,7 @@ func FindCollisions(s Snapshot, selfIface string, prefixes ...netip.Prefix) []Co
 					Route:  r.Dst,
 					Iface:  r.Iface,
 					Kind:   CollisionEqual,
-					Advice: fmt.Sprintf("route %s via %s is an exact conflict; Veldmesh installs its route with metric 0 (highest priority), so veld wins ties — but if the VPN reinstalls the route later, traffic to %s breaks; prefer moving one side to a different CIDR", r.Dst, r.Iface, p),
+					Advice: fmt.Sprintf("route %s via %s is an exact conflict; Veldmesh installs its route by replacing any same-prefix route, and on IPv4 its metric-0 route also beats routes with higher metrics — but if the VPN reinstalls its route later, traffic to %s breaks; prefer moving one side to a different CIDR", r.Dst, r.Iface, p),
 				})
 			case r.Dst.Bits() < p.Bits():
 				cs = append(cs, Collision{

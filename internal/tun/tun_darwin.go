@@ -20,6 +20,11 @@ type darwinTUN struct {
 	mtu  int
 }
 
+// DefaultIfaceName is the default TUN name request on macOS. The kernel
+// ignores arbitrary names and assigns the next free utunN; veld passes the
+// "utun" prefix and reads the real name back after creation.
+func DefaultIfaceName() string { return "utun" }
+
 // CreateTUN creates a macOS utun device, assigns ip to it, and brings it up.
 // Requires root or an entitlement that allows virtual network interface creation.
 func CreateTUN(name string, ip netip.Prefix, mtu int) (TUN, error) {

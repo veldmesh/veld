@@ -51,16 +51,20 @@ func newTestManager(h *recordingHandle) *linuxManager {
 	return newLinuxManager(h)
 }
 
-// TestAddSetsLowMetricAndReplaces verifies the two commercial-VPN coexistence
-// guarantees of Add on Linux:
+// TestAddReplacesWithExplicitMetric verifies what Add asks the kernel for on
+// Linux, the two commercial-VPN coexistence properties of the install:
 //
-//  1. The route is installed via replace, not add — so a conflicting route
-//     a commercial VPN installed *before* veld started is taken over
-//     (order-independence for the "VPN connected first" case).
-//  2. The route carries metric DefaultRouteMetric, so among equal-prefix
-//     routes the kernel prefers veld's route (order-independence for the
-//     "veld connected first, VPN added an equal route" case).
-func TestAddSetsLowMetricAndReplaces(t *testing.T) {
+//  1. The route is installed via replace, not add — a conflicting route a
+//     commercial VPN installed *before* veld started is taken over, and a
+//     route a VPN installs *later* is healed by the next Add (peer rejoin
+//     or daemon restart). This replace-on-conflict is the
+//     order-independence mechanism.
+//  2. The route carries metric DefaultRouteMetric — the explicit lowest
+//     metric, which on IPv4 keeps veld's route ahead of higher-metric
+//     routes when both sides hold distinct routes for the same prefix.
+//     (On IPv6 the kernel raises metric 0 to 1024, so there is no such
+//     advantage; same-prefix claims are handled by the replace instead.)
+func TestAddReplacesWithExplicitMetric(t *testing.T) {
 	h := &recordingHandle{}
 	m := newTestManager(h)
 
@@ -83,10 +87,7 @@ func TestAddSetsLowMetricAndReplaces(t *testing.T) {
 		t.Errorf("Gw = %v, want 10.100.0.2", r.Gw)
 	}
 	if r.Priority != DefaultRouteMetric {
-		t.Errorf("Priority = %d, want %d (metric must beat commercial VPNs on ties)", r.Priority, DefaultRouteMetric)
-	}
-	if DefaultRouteMetric > 0 {
-		t.Errorf("DefaultRouteMetric should be the highest-priority metric, got %d", DefaultRouteMetric)
+		t.Errorf("Priority = %d, want %d (explicit lowest metric for the IPv4 coexistence advantage)", r.Priority, DefaultRouteMetric)
 	}
 }
 

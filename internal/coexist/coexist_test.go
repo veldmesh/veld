@@ -35,15 +35,15 @@ func TestDetectVPNsWithNoVPNs(t *testing.T) {
 func TestDetectVPNExcludesSelfInterface(t *testing.T) {
 	s := coexist.Snapshot{
 		Links: []coexist.Link{
-			{Name: "tun0", Kind: "tun", Addrs: []netip.Prefix{pfx("10.100.0.1/24")}},
+			{Name: "veld0", Kind: "tun", Addrs: []netip.Prefix{pfx("10.100.0.1/24")}},
 			{Name: "eth0", Kind: "device"},
 		},
 	}
-	if got := coexist.DetectVPNs(s, "tun0"); len(got) != 0 {
+	if got := coexist.DetectVPNs(s, "veld0"); len(got) != 0 {
 		t.Errorf("own TUN must be ignored, got %+v", got)
 	}
 	if got := coexist.DetectVPNs(s, "eth0"); len(got) != 1 {
-		t.Errorf("tun0 without self-exclusion should be reported, got %+v", got)
+		t.Errorf("veld0 without self-exclusion should be reported, got %+v", got)
 	}
 }
 
@@ -57,7 +57,7 @@ func TestDetectNordVPN(t *testing.T) {
 			{Dst: pfx("0.0.0.0/0"), Gw: addr("10.8.0.1"), Iface: "nordlynx"},
 		},
 	}
-	vpns := coexist.DetectVPNs(s, "tun0")
+	vpns := coexist.DetectVPNs(s, "veld0")
 	if len(vpns) != 1 {
 		t.Fatalf("expected 1 finding, got %+v", vpns)
 	}
@@ -84,7 +84,7 @@ func TestDetectMullvadProtonSurfshark(t *testing.T) {
 			{Name: "surfshark-wg0", Kind: "wireguard"},
 		},
 	}
-	vpns := coexist.DetectVPNs(s, "tun0")
+	vpns := coexist.DetectVPNs(s, "veld0")
 	if len(vpns) != 3 {
 		t.Fatalf("expected 3 findings, got %+v", vpns)
 	}
@@ -138,7 +138,7 @@ func TestDetectGenericTunnel(t *testing.T) {
 	}
 	for _, tc := range cases {
 		s := coexist.Snapshot{Links: []coexist.Link{{Name: tc.name, Kind: tc.kind}}}
-		vpns := coexist.DetectVPNs(s, "eth0")
+		vpns := coexist.DetectVPNs(s, "veld0")
 		if len(vpns) != 1 {
 			t.Errorf("%s: expected generic tunnel finding, got %+v", tc.name, vpns)
 			continue
@@ -154,7 +154,7 @@ func TestDetectFullTunnelViaGenericTUN(t *testing.T) {
 		Links:  []coexist.Link{{Name: "tun0", Kind: "tun"}},
 		Routes: []coexist.RouteEntry{{Dst: pfx("0.0.0.0/0"), Iface: "tun0"}},
 	}
-	vpns := coexist.DetectVPNs(s, "eth0")
+	vpns := coexist.DetectVPNs(s, "veld0")
 	if len(vpns) != 1 || !vpns[0].FullTunnel {
 		t.Fatalf("expected full-tunnel finding on tun0, got %+v", vpns)
 	}
@@ -176,13 +176,40 @@ func TestDetectVPNsNoFullTunnelForPhysicalDefault(t *testing.T) {
 	}
 }
 
+// wg-quick, Mullvad, NordLynx and Tailscale install their routes in
+// dedicated policy-routing tables (wg-quick's default: 51820), not in the
+// main table. The analysis must consider such routes for both full-tunnel
+// detection and CIDR collision checks.
+func TestNonMainTableRoutesDriveAnalysis(t *testing.T) {
+	s := coexist.Snapshot{
+		Links: []coexist.Link{{Name: "wg0", Kind: "wireguard"}},
+		Routes: []coexist.RouteEntry{
+			{Dst: pfx("0.0.0.0/0"), Iface: "wg0", Table: 51820},
+			{Dst: pfx("10.100.0.0/24"), Iface: "wg0", Table: 51820},
+		},
+	}
+
+	vpns := coexist.DetectVPNs(s, "veld0")
+	if len(vpns) != 1 || !vpns[0].FullTunnel {
+		t.Fatalf("default route in table 51820 must be a full-tunnel finding, got %+v", vpns)
+	}
+
+	cs := coexist.FindCollisions(s, "veld0", pfx("10.100.0.0/24"))
+	if len(cs) != 1 || cs[0].Kind != coexist.CollisionEqual {
+		t.Fatalf("mesh-prefix claim in table 51820 must be an equal collision, got %+v", cs)
+	}
+	if cs[0].Iface != "wg0" {
+		t.Errorf("collision must name the owning interface, got %+v", cs[0])
+	}
+}
+
 // --- FindCollisions ---
 
 func TestFindCollisionsEqual(t *testing.T) {
 	s := coexist.Snapshot{
 		Routes: []coexist.RouteEntry{{Dst: pfx("10.100.0.0/24"), Iface: "nordlynx"}},
 	}
-	cs := coexist.FindCollisions(s, "tun0", pfx("10.100.0.0/24"))
+	cs := coexist.FindCollisions(s, "veld0", pfx("10.100.0.0/24"))
 	if len(cs) != 1 {
 		t.Fatalf("expected 1 collision, got %+v", cs)
 	}
@@ -237,6 +264,21 @@ func TestFindCollisionsSkipsSelfAndDefault(t *testing.T) {
 	}
 	if cs := coexist.FindCollisions(s, "veld0", pfx("10.100.0.0/24")); len(cs) != 0 {
 		t.Errorf("own routes and default routes must be skipped, got %+v", cs)
+	}
+}
+
+// The local table (255) holds a host route for every assigned address. An
+// address inside the mesh range is an assignment, not a routing decision an
+// operator could change — it must not be reported as a collision.
+func TestFindCollisionsSkipsLocalTable(t *testing.T) {
+	s := coexist.Snapshot{
+		Routes: []coexist.RouteEntry{
+			{Dst: pfx("10.100.0.7/32"), Iface: "eth0", Table: 255},
+			{Dst: pfx("192.168.1.0/24"), Iface: "eth0", Table: 254},
+		},
+	}
+	if cs := coexist.FindCollisions(s, "veld0", pfx("10.100.0.0/24")); len(cs) != 0 {
+		t.Errorf("local-table host routes must not be reported as collisions, got %+v", cs)
 	}
 }
 
@@ -416,7 +458,7 @@ func TestReportSkipsSelfAndSuggestsNothingWithoutVPNPrefix(t *testing.T) {
 	}
 }
 
-func TestReportEqualCollisionMentionsMetricPrecedence(t *testing.T) {
+func TestReportEqualCollisionExplainsReplaceAndMetric(t *testing.T) {
 	s := coexist.Snapshot{
 		Routes: []coexist.RouteEntry{{Dst: pfx("10.100.0.0/24"), Iface: "nordlynx"}},
 	}
@@ -428,7 +470,10 @@ func TestReportEqualCollisionMentionsMetricPrecedence(t *testing.T) {
 	if !strings.Contains(out, "10.100.0.0/24") {
 		t.Errorf("missing colliding prefix in output:\n%s", out)
 	}
+	if !strings.Contains(out, "replacing") {
+		t.Errorf("equal-collision guidance should explain the replace-on-conflict install:\n%s", out)
+	}
 	if !strings.Contains(out, "metric") {
-		t.Errorf("equal-collision guidance should explain metric precedence:\n%s", out)
+		t.Errorf("equal-collision guidance should mention the IPv4 metric advantage:\n%s", out)
 	}
 }

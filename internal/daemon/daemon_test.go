@@ -3,10 +3,13 @@
 package daemon
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 
+	"github.com/veldmesh/veld/internal/coexist"
 	"github.com/veldmesh/veld/internal/crypto"
 	"github.com/veldmesh/veld/internal/peer"
 	"github.com/veldmesh/veld/internal/tun"
@@ -64,5 +67,53 @@ func TestSelfInterfaceResolvesTUNAfterConstruction(t *testing.T) {
 
 	if got := d.selfInterface(); got != "veld1" {
 		t.Errorf("selfInterface() = %q, want veld1 after the TUN was created", got)
+	}
+}
+
+// --- resolveIfaceName (node.iface_name -> TUN name to create) ---
+
+func testPrintf(b *strings.Builder) coexist.Printf {
+	return func(format string, args ...any) (int, error) {
+		return fmt.Fprintf(b, format, args...)
+	}
+}
+
+// TestResolveIfaceNameEmptyUsesPlatformDefault: a config without an
+// explicit iface_name (what all new configs carry since the legacy tun0
+// default was dropped) resolves to the platform default, without logging.
+func TestResolveIfaceNameEmptyUsesPlatformDefault(t *testing.T) {
+	var b strings.Builder
+	if got := resolveIfaceName(testPrintf(&b), ""); got != tun.DefaultIfaceName() {
+		t.Errorf("empty iface_name must resolve to the platform default %q, got %q", tun.DefaultIfaceName(), got)
+	}
+	if b.Len() != 0 {
+		t.Errorf("empty iface_name must not log, got:\n%s", b.String())
+	}
+}
+
+// TestResolveIfaceNameMigratesLegacyTun0: a config written by an older veld
+// carries the legacy default "tun0". It must map to the platform default
+// with a one-line notice — veld can no longer create a TUN named tun0 next
+// to an OpenVPN-based VPN (TUNSETIFF fails with EEXIST).
+func TestResolveIfaceNameMigratesLegacyTun0(t *testing.T) {
+	var b strings.Builder
+	if got := resolveIfaceName(testPrintf(&b), legacyIfaceName); got != tun.DefaultIfaceName() {
+		t.Errorf("legacy iface_name must resolve to the platform default %q, got %q", tun.DefaultIfaceName(), got)
+	}
+	out := b.String()
+	if !strings.Contains(out, legacyIfaceName) || !strings.Contains(out, tun.DefaultIfaceName()) {
+		t.Errorf("migration must log one line naming the legacy value and the platform default, got:\n%s", out)
+	}
+}
+
+// TestResolveIfaceNameHonorsOverride: any other value is honored verbatim,
+// without logging.
+func TestResolveIfaceNameHonorsOverride(t *testing.T) {
+	var b strings.Builder
+	if got := resolveIfaceName(testPrintf(&b), "custom1"); got != "custom1" {
+		t.Errorf("iface_name custom1 must be honored verbatim, got %q", got)
+	}
+	if b.Len() != 0 {
+		t.Errorf("an explicit iface_name must not log, got:\n%s", b.String())
 	}
 }

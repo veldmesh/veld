@@ -13,27 +13,32 @@ import (
 )
 
 // TestObserveLinux verifies real netlink gathering on Linux: the loopback
-// link must be present and the main routing table must contain a default
-// route. Route and link dumps are unprivileged read-only operations, so this
-// runs everywhere Linux runs, including CI.
+// link must be present, the routing snapshot must span every table — main
+// (254) with a default route, and local (255) with loopback host routes —
+// because VPNs like wg-quick, Mullvad and NordLynx install their routes in
+// dedicated policy tables. Route and link dumps are unprivileged read-only
+// operations, so this runs everywhere Linux runs, including CI.
 func TestObserveLinux(t *testing.T) {
 	s, err := coexist.Observe()
 	if err != nil {
 		t.Fatalf("Observe: %v", err)
 	}
 
-	var lo, def bool
+	var lo, def, local bool
 	for _, l := range s.Links {
 		if l.Name == "lo" {
 			lo = true
 		}
 	}
 	for _, r := range s.Routes {
-		if r.Dst == netip.MustParsePrefix("0.0.0.0/0") {
+		if r.Dst == netip.MustParsePrefix("0.0.0.0/0") && r.Table != 255 {
 			def = true
 			if r.Iface == "" {
 				t.Errorf("default route should name an egress interface")
 			}
+		}
+		if r.Table == 255 {
+			local = true
 		}
 	}
 	if !lo {
@@ -41,6 +46,9 @@ func TestObserveLinux(t *testing.T) {
 	}
 	if !def {
 		t.Errorf("no IPv4 default route in snapshot: %+v", s.Routes)
+	}
+	if !local {
+		t.Errorf("no local-table (255) route in snapshot — all-tables dump broken: %+v", s.Routes)
 	}
 }
 
@@ -55,7 +63,9 @@ func TestCheckRouteRealState(t *testing.T) {
 
 	var conn *coexist.RouteEntry
 	for i, r := range s.Routes {
-		if r.Dst != netip.MustParsePrefix("0.0.0.0/0") && r.Iface != "" && r.Iface != "lo" {
+		// Local-table (255) host routes are skipped by collision checks;
+		// pick a real main-table route so the assertion below is meaningful.
+		if r.Dst != netip.MustParsePrefix("0.0.0.0/0") && r.Iface != "" && r.Iface != "lo" && r.Table != 255 {
 			conn = &s.Routes[i]
 			break
 		}

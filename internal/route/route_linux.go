@@ -14,10 +14,14 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-// DefaultRouteMetric is the kernel route metric Veldmesh installs on its
-// routes. Linux breaks equal-prefix ties by preferring the lowest metric, so
-// 0 keeps Veldmesh's mesh/subnet routes ahead of commercial VPN routes that
-// carry a higher metric — regardless of which side connected first.
+// DefaultRouteMetric is the metric Veldmesh asks the kernel for on its
+// routes. Linux prefers the lowest metric among distinct equal-prefix
+// routes, so on IPv4 metric 0 keeps Veldmesh's mesh/subnet routes ahead of
+// commercial VPN routes that carry a higher metric. IPv6 has no metric 0:
+// the kernel coerces it to 1024 (IP6_RT_PRIO_USER) on install, so veld has
+// no metric advantage there. Order-independence against a VPN claiming the
+// same prefix comes from the replace-on-conflict install in Add, not from
+// this metric.
 const DefaultRouteMetric = 0
 
 // routeHandle is the netlink write surface used by the manager. The seam
@@ -61,10 +65,12 @@ func (m *linuxManager) Add(prefix netip.Prefix, via netip.Addr) error {
 	// Replace, not add: if a commercial VPN already installed a route for
 	// this prefix (VPN connected first), veld takes the prefix over; if the
 	// VPN displaced veld's route later (veld connected first), the next
-	// Add — a peer rejoin or daemon restart — heals it. There is no
+	// Add — a peer rejoin or daemon restart — heals it. That
+	// replace-on-conflict is what makes the install order-independent.
+	// When both sides instead hold routes with different metrics, the lower
+	// metric wins — on IPv4 that is veld's metric-0 route. There is no
 	// background route watcher; restart veld if peers become unreachable
-	// after a VPN reconnects. The low metric wins equal-prefix ties in
-	// both directions.
+	// after a VPN reconnects.
 	if err := m.h.RouteReplace(&netlink.Route{Dst: dst, Gw: gw, Priority: DefaultRouteMetric}); err != nil {
 		return fmt.Errorf("route replace %s via %s: %w", prefix, via, err)
 	}

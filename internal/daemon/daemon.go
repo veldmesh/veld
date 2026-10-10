@@ -80,6 +80,31 @@ func New(
 	}
 }
 
+// legacyIfaceName is the interface name older veld versions baked into every
+// new config and used as the create-time default. It is kept only to
+// recognize such configs: a TUN named "tun0" cannot be created next to an
+// OpenVPN-based VPN anyway (TUNSETIFF fails with EEXIST), so the stored
+// value always migrates to the platform default.
+const legacyIfaceName = "tun0"
+
+// resolveIfaceName maps node.iface_name to the TUN name to create. The
+// empty string means "platform default" (tun.DefaultIfaceName: "veld0" on
+// Linux, "Veld" on Windows, "utun" on macOS). The legacy default "tun0"
+// maps to the platform default too, with a one-line notice — veld can no
+// longer honor a literal tun0 request, an accepted trade-off because that
+// name breaks next to OpenVPN. Any other value is honored verbatim.
+func resolveIfaceName(printf coexist.Printf, configured string) string {
+	switch configured {
+	case "":
+		return tun.DefaultIfaceName()
+	case legacyIfaceName:
+		_, _ = printf("veld: config node.iface_name %q is the legacy default; using the platform default %q instead (a dedicated name avoids clashing with OpenVPN's tun0)\n", legacyIfaceName, tun.DefaultIfaceName())
+		return tun.DefaultIfaceName()
+	default:
+		return configured
+	}
+}
+
 // NewFromConfig creates a Daemon with real OS TUN and UDP socket.
 // Requires CAP_NET_ADMIN on Linux.
 func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
@@ -119,10 +144,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 			if mtu == 0 {
 				mtu = 1420
 			}
-			ifaceName := cfg.Node.IfaceName
-			if ifaceName == "" {
-				ifaceName = "tun0"
-			}
+			ifaceName := resolveIfaceName(fmt.Printf, cfg.Node.IfaceName)
 
 			var err error
 			tunDev, err = tun.CreateTUN(ifaceName, vpnPrefix, mtu)
