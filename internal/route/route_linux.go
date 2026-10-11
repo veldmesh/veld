@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/vishvananda/netlink"
 )
@@ -24,11 +25,18 @@ import (
 // this metric.
 const DefaultRouteMetric = 0
 
+// healInterval is how often the background goroutine checks whether
+// Veldmesh routes are still present and correct. If a commercial VPN
+// displaces a route (e.g. on VPN reconnect), the next heal cycle will
+// reinstall it.
+const healInterval = 30 * time.Second
+
 // routeHandle is the netlink write surface used by the manager. The seam
 // exists so tests can verify exactly what veld asks the kernel to do.
 type routeHandle interface {
 	RouteReplace(route *netlink.Route) error
 	RouteDel(route *netlink.Route) error
+	RouteList(link netlink.Link, family int) ([]netlink.Route, error)
 }
 
 // systemHandle routes operations to the real netlink API.
@@ -36,6 +44,9 @@ type systemHandle struct{}
 
 func (systemHandle) RouteReplace(r *netlink.Route) error { return netlink.RouteReplace(r) }
 func (systemHandle) RouteDel(r *netlink.Route) error     { return netlink.RouteDel(r) }
+func (systemHandle) RouteList(link netlink.Link, family int) ([]netlink.Route, error) {
+	return netlink.RouteList(link, family)
+}
 
 // New returns a route manager backed by netlink on Linux.
 func New() Manager {
@@ -43,7 +54,12 @@ func New() Manager {
 }
 
 func newLinuxManager(h routeHandle) *linuxManager {
-	return &linuxManager{routes: make(map[netip.Prefix]struct{}), h: h}
+	return &linuxManager{
+		routes:    make(map[netip.Prefix]netip.Addr),
+		h:         h,
+		healStop:  make(chan struct{}),
+		healStart: sync.Once{},
+	}
 }
 
 // EnableIPForward writes "1" to /proc/sys/net/ipv4/ip_forward.
@@ -53,9 +69,11 @@ func EnableIPForward() error {
 }
 
 type linuxManager struct {
-	mu     sync.Mutex
-	routes map[netip.Prefix]struct{}
-	h      routeHandle
+	mu        sync.Mutex
+	routes    map[netip.Prefix]netip.Addr // prefix -> expected gateway
+	h         routeHandle
+	healStop  chan struct{}
+	healStart sync.Once
 }
 
 func (m *linuxManager) Add(prefix netip.Prefix, via netip.Addr) error {
@@ -68,16 +86,17 @@ func (m *linuxManager) Add(prefix netip.Prefix, via netip.Addr) error {
 	// Add — a peer rejoin or daemon restart — heals it. That
 	// replace-on-conflict is what makes the install order-independent.
 	// When both sides instead hold routes with different metrics, the lower
-	// metric wins — on IPv4 that is veld's metric-0 route. There is no
-	// background route watcher; restart veld if peers become unreachable
-	// after a VPN reconnects.
+	// metric wins — on IPv4 that is veld's metric-0 route.
 	if err := m.h.RouteReplace(&netlink.Route{Dst: dst, Gw: gw, Priority: DefaultRouteMetric}); err != nil {
 		return fmt.Errorf("route replace %s via %s: %w", prefix, via, err)
 	}
 
 	m.mu.Lock()
-	m.routes[prefix] = struct{}{}
+	m.routes[prefix] = via
 	m.mu.Unlock()
+
+	// Start the background heal loop on the first route added.
+	m.healStart.Do(m.startHeal)
 	return nil
 }
 
@@ -94,6 +113,9 @@ func (m *linuxManager) Remove(prefix netip.Prefix) error {
 }
 
 func (m *linuxManager) Close() error {
+	// Stop the heal loop.
+	close(m.healStop)
+
 	m.mu.Lock()
 	prefixes := make([]netip.Prefix, 0, len(m.routes))
 	for p := range m.routes {
@@ -108,6 +130,81 @@ func (m *linuxManager) Close() error {
 		}
 	}
 	return last
+}
+
+// startHeal launches the background goroutine that periodically verifies
+// Veldmesh routes are still present with the correct gateway and metric.
+func (m *linuxManager) startHeal() {
+	go m.healLoop()
+}
+
+func (m *linuxManager) healLoop() {
+	ticker := time.NewTicker(healInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.healStop:
+			return
+		case <-ticker.C:
+			m.heal()
+		}
+	}
+}
+
+// heal checks all tracked routes against the kernel's routing table and
+// reinstalls any that are missing or have the wrong gateway/metric.
+func (m *linuxManager) heal() {
+	m.mu.Lock()
+	// Snapshot the current tracked routes.
+	tracked := make(map[netip.Prefix]netip.Addr, len(m.routes))
+	for p, gw := range m.routes {
+		tracked[p] = gw
+	}
+	m.mu.Unlock()
+
+	if len(tracked) == 0 {
+		return
+	}
+
+	// Get all IPv4 routes from the kernel.
+	routes, err := m.h.RouteList(nil, netlink.FAMILY_V4)
+	if err != nil {
+		// Non-fatal: log and continue. The next cycle will retry.
+		return
+	}
+
+	// Build a map of kernel routes by destination prefix.
+	kernelRoutes := make(map[string]*netlink.Route)
+	for i := range routes {
+		if routes[i].Dst != nil {
+			kernelRoutes[routes[i].Dst.String()] = &routes[i]
+		}
+	}
+
+	// Check each tracked route.
+	for prefix, expectedGw := range tracked {
+		dstStr := prefix.String()
+		kr, ok := kernelRoutes[dstStr]
+		if !ok {
+			// Route is missing entirely — reinstall.
+			m.reinstall(prefix, expectedGw)
+			continue
+		}
+		// Route exists; verify gateway and metric.
+		if !kr.Gw.Equal(expectedGw.AsSlice()) || kr.Priority != DefaultRouteMetric {
+			m.reinstall(prefix, expectedGw)
+		}
+	}
+}
+
+func (m *linuxManager) reinstall(prefix netip.Prefix, via netip.Addr) {
+	dst := prefixToIPNet(prefix)
+	gw := net.IP(via.AsSlice())
+	if err := m.h.RouteReplace(&netlink.Route{Dst: dst, Gw: gw, Priority: DefaultRouteMetric}); err != nil {
+		// Non-fatal: the next heal cycle will retry.
+		return
+	}
 }
 
 func prefixToIPNet(p netip.Prefix) *net.IPNet {

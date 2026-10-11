@@ -22,6 +22,7 @@ type recordingHandle struct {
 	mu       sync.Mutex
 	replaced []*netlink.Route
 	deleted  []*netlink.Route
+	listed   []netlink.Route
 	err      error
 }
 
@@ -45,6 +46,18 @@ func (h *recordingHandle) RouteDel(r *netlink.Route) error {
 	clone := *r
 	h.deleted = append(h.deleted, &clone)
 	return nil
+}
+
+func (h *recordingHandle) RouteList(link netlink.Link, family int) ([]netlink.Route, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.err != nil {
+		return nil, h.err
+	}
+	// Return a copy of the pre-set routes for testing.
+	result := make([]netlink.Route, len(h.listed))
+	copy(result, h.listed)
+	return result, nil
 }
 
 func newTestManager(h *recordingHandle) *linuxManager {
