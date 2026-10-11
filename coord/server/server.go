@@ -232,7 +232,7 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 	if err := crypto.VerifyRegisterSignature(ed25519.PublicKey(ed25519Bytes), req.Signature, claims, now); err != nil {
 		// Log the detailed reason locally for debugging (e.g. clock skew),
 		// but return a uniform message to the client.
-		log.Printf("Register signature verification failed: %v (check system clock if timestamp error)", err)
+		log.Printf("Register verification failed: %v (check system clock if timestamp error)", err)
 		return nil, status.Error(codes.Unauthenticated, errRegisterAuth)
 	}
 
@@ -500,11 +500,11 @@ func (s *Server) Leave(ctx context.Context, req *coordv1.LeaveRequest) (*coordv1
 	s.hooks.OnPeerLeft(ctx, peer, net)
 
 	_ = s.audit.Log(ctx, coordcore.AuditEvent{
-		Kind:      coordcore.AuditPeerLeft,
-		AccountID: acc.ID,
-		NetworkID: removed.NetworkID,
-		PeerID:    removed.ID,
-		At:        time.Now(),
+	Kind:      coordcore.AuditPeerLeft,
+	AccountID: acc.ID,
+	NetworkID: removed.NetworkID,
+	PeerID:    removed.ID,
+	At:        time.Now(),
 	})
 
 	s.bus.DropPendingSignals(removed.ID)
