@@ -236,11 +236,14 @@ func TestOnVPNAddrAssigned_CIDRFromServer(t *testing.T) {
 		TLSInsecure: true,
 	})
 
+	var callbackMu sync.Mutex
 	var callbackVPNAddr netip.Addr
 	var callbackCIDR string
 	c.OnVPNAddrAssigned = func(vpnAddr netip.Addr, networkCIDR string) {
+		callbackMu.Lock()
 		callbackVPNAddr = vpnAddr
 		callbackCIDR = networkCIDR
+		callbackMu.Unlock()
 	}
 
 	c.Start()
@@ -250,14 +253,19 @@ func TestOnVPNAddrAssigned_CIDRFromServer(t *testing.T) {
 		t.Fatal("timeout: client did not register")
 	}
 
-	if !callbackVPNAddr.IsValid() {
+	callbackMu.Lock()
+	vpn := callbackVPNAddr
+	cidrStr := callbackCIDR
+	callbackMu.Unlock()
+
+	if !vpn.IsValid() {
 		t.Fatal("OnVPNAddrAssigned not called with valid VPN address")
 	}
-	if callbackCIDR != "10.50.0.0/24" {
-		t.Errorf("OnVPNAddrAssigned network CIDR: got %q, want 10.50.0.0/24", callbackCIDR)
+	if cidrStr != "10.50.0.0/24" {
+		t.Errorf("OnVPNAddrAssigned network CIDR: got %q, want 10.50.0.0/24", cidrStr)
 	}
-	if !cidr.Contains(callbackVPNAddr) {
-		t.Errorf("assigned VPN %s not in CIDR %s", callbackVPNAddr, cidr)
+	if !cidr.Contains(vpn) {
+		t.Errorf("assigned VPN %s not in CIDR %s", vpn, cidr)
 	}
 }
 

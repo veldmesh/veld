@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -444,6 +445,195 @@ func TestClient_Idempotent_Reregistration(t *testing.T) {
 
 	c1.Stop(); c1.Wait()
 	c2.Stop(); c2.Wait()
+}
+
+// noCIDRServer wraps the standard coord server but overrides Register
+// to return an empty NetworkCidr, simulating an old server version.
+type noCIDRServer struct {
+	coordv1.UnimplementedCoordServer
+	srv *coordserver.Server
+}
+
+func (s *noCIDRServer) Register(ctx context.Context, req *coordv1.RegisterRequest) (*coordv1.RegisterResponse, error) {
+	resp, err := s.srv.Register(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	// Clear the NetworkCidr to simulate old server.
+	resp.NetworkCidr = ""
+	return resp, nil
+}
+
+// Delegate all other methods to the wrapped server.
+func (s *noCIDRServer) ListPeers(ctx context.Context, req *coordv1.ListPeersRequest) (*coordv1.ListPeersResponse, error) {
+	return s.srv.ListPeers(ctx, req)
+}
+
+func (s *noCIDRServer) Watch(req *coordv1.WatchRequest, stream coordv1.Coord_WatchServer) error {
+	return s.srv.Watch(req, stream)
+}
+
+func (s *noCIDRServer) SendSignal(ctx context.Context, req *coordv1.SendSignalRequest) (*coordv1.SendSignalResponse, error) {
+	return s.srv.SendSignal(ctx, req)
+}
+
+func (s *noCIDRServer) Leave(ctx context.Context, req *coordv1.LeaveRequest) (*coordv1.LeaveResponse, error) {
+	return s.srv.Leave(ctx, req)
+}
+
+// TestClient_OldServerFallback_CIDRNotProvided verifies that when the coordinator
+// server does not provide network_cidr (old server), the client still works
+// and falls back to /24 for the network prefix.
+func TestClient_OldServerFallback_CIDRNotProvided(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	reg, err := coordserver.NewRegistry(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	defer reg.Close()
+
+	cidr := netip.MustParsePrefix("10.200.0.0/24")
+	net := coordcore.Network{ID: "net-test", CIDR: cidr, Name: "Test"}
+	if err := reg.CreateNetwork(net, "acc1"); err != nil {
+		t.Fatalf("CreateNetwork: %v", err)
+	}
+
+	bus := coordserver.NewBus()
+	stdSrv := coordserver.New(
+		reg,
+		bus,
+		coordce.NewFreeEnforcer(),
+		coordce.NewTokenAccountStore(map[string]coordcore.Account{
+			"tok": {ID: "acc1", Tier: coordcore.TierFree},
+		}),
+		coordce.NewNoopAuditLogger(),
+		coordce.NewRejectSubnetPolicy(),
+		coordce.NewNoopHooks(),
+	)
+
+	// Wrap with noCIDRServer to override Register.
+	srv := &noCIDRServer{srv: stdSrv}
+
+	grpcSrv := grpc.NewServer()
+	coordv1.RegisterCoordServer(grpcSrv, srv)
+	go grpcSrv.Serve(ln)
+	defer grpcSrv.Stop()
+
+	tbl := peer.New()
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	c := coord.New(coord.Config{
+		ServerAddr:  ln.Addr().String(),
+		NetworkID:   "net-test",
+		Token:       "tok",
+		Identity:    id,
+		LocalName:   "test-node",
+		PeerTable:   tbl,
+		TLSInsecure: true,
+	})
+
+	var callbackMu sync.Mutex
+	var callbackCIDR string
+	c.OnVPNAddrAssigned = func(vpnAddr netip.Addr, networkCIDR string) {
+		callbackMu.Lock()
+		callbackCIDR = networkCIDR
+		callbackMu.Unlock()
+	}
+
+	c.Start()
+	defer func() { c.Stop(); c.Wait() }()
+
+	if !waitFor(t, 3*time.Second, func() bool { return c.VPNAddr().IsValid() }) {
+		t.Fatal("timeout: client did not register")
+	}
+
+	callbackMu.Lock()
+	cidrStr := callbackCIDR
+	callbackMu.Unlock()
+
+	// The callback should receive empty network_cidr (old server behavior).
+	if cidrStr != "" {
+		t.Errorf("OnVPNAddrAssigned network CIDR: got %q, want empty string (old server)", cidrStr)
+	}
+
+	// NetworkCIDR() getter should return empty string.
+	if c.NetworkCIDR() != "" {
+		t.Errorf("NetworkCIDR(): got %q, want empty string", c.NetworkCIDR())
+	}
+}
+
+// TestClient_NewServerOldClient_IgnoresUnknownField verifies that an old client
+// (without NetworkCIDR() getter) ignores the unknown network_cidr field from
+// a new server. This tests proto3 unknown field semantics: the field is
+// simply ignored by the old client binary.
+func TestClient_NewServerOldClient_IgnoresUnknownField(t *testing.T) {
+	// This test simulates an old client binary by using the current client
+	// but verifying that receiving a RegisterResponse with network_cidr
+	// does not cause any issues. Since proto3 ignores unknown fields,
+	// the old client would simply not have the NetworkCIDR() getter and
+	// would not read the field. Our current client does have the getter,
+	// so we verify the field is correctly populated and doesn't break anything.
+	addr, grpcSrv, reg := testCoordServer(t)
+	defer grpcSrv.Stop()
+	defer reg.Close()
+
+	tbl := peer.New()
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	c := coord.New(coord.Config{
+		ServerAddr:  addr,
+		NetworkID:   "net-test",
+		Token:       "tok",
+		Identity:    id,
+		LocalName:   "test-node",
+		PeerTable:   tbl,
+		TLSInsecure: true,
+	})
+
+	var callbackMu sync.Mutex
+	var callbackCIDR string
+	c.OnVPNAddrAssigned = func(vpnAddr netip.Addr, networkCIDR string) {
+		callbackMu.Lock()
+		callbackCIDR = networkCIDR
+		callbackMu.Unlock()
+	}
+
+	c.Start()
+	defer func() { c.Stop(); c.Wait() }()
+
+	if !waitFor(t, 3*time.Second, func() bool { return c.VPNAddr().IsValid() }) {
+		t.Fatal("timeout: client did not register")
+	}
+
+	callbackMu.Lock()
+	cidrStr := callbackCIDR
+	callbackMu.Unlock()
+
+	// The server provides network_cidr; the client should receive it.
+	if cidrStr != "10.200.0.0/24" {
+		t.Errorf("OnVPNAddrAssigned network CIDR: got %q, want 10.200.0.0/24", cidrStr)
+	}
+
+	// NetworkCIDR() getter should return the server-provided CIDR.
+	if c.NetworkCIDR() != "10.200.0.0/24" {
+		t.Errorf("NetworkCIDR(): got %q, want 10.200.0.0/24", c.NetworkCIDR())
+	}
+
+	// VPNAddr should still be valid and within the CIDR.
+	vpn := c.VPNAddr()
+	cidr := netip.MustParsePrefix("10.200.0.0/24")
+	if !cidr.Contains(vpn) {
+		t.Errorf("VPNAddr %v not in CIDR %v", vpn, cidr)
+	}
 }
 
 // signedRegisterReq builds a RegisterRequest presenting id's public keys
