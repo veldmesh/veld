@@ -201,6 +201,7 @@ func (c *Client) registerAndWatch(ctx context.Context, gc coordv1.CoordClient) e
 	}
 	req.Signature = crypto.SignRegister(c.cfg.Identity.Ed25519Private, crypto.RegisterClaims{
 		NetworkID:     req.NetworkId,
+		Name:          req.Name,
 		Ed25519Public: req.Ed25519Public,
 		X25519Public:  req.X25519Public,
 		Endpoint:      req.Endpoint,

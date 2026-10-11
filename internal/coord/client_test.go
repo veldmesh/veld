@@ -462,6 +462,7 @@ func signedRegisterReq(t *testing.T, id *crypto.Identity, networkID, token, name
 	req.TimestampUnix = time.Now().Unix()
 	req.Signature = crypto.SignRegister(id.Ed25519Private, crypto.RegisterClaims{
 		NetworkID:     req.NetworkId,
+		Name:          req.Name,
 		Ed25519Public: req.Ed25519Public,
 		X25519Public:  req.X25519Public,
 		Endpoint:      req.Endpoint,

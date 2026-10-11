@@ -22,3 +22,23 @@ deployment coordination requirements are recorded here before they ship.
 
   Signed key rotation (an old-key → new-key handover) is deliberately out of
   scope for this change and is the planned follow-up.
+
+- **Coord: sign peer `name` in `Register` proof of possession.** The `name`
+  field is now covered by the Ed25519 signature (domain bumped to
+  `veld-coord-register-v2`), so a peer's displayed name cannot be tampered
+  with after registration. The golden test vector in
+  `internal/crypto/register_test.go` has been updated.
+
+- **Coord: uniform `Unauthenticated` errors for `Register`.** The server now
+  returns a single generic message (`"invalid register signature or timestamp"`)
+  for all signature and timestamp verification failures, avoiding leakage of
+  which check failed or the server's clock. Detailed reasons are still logged
+  server-side (including a "check system clock" hint for timestamp failures).
+  A new test (`TestServer_Register_UniformAuthError`) asserts the client-visible
+  message is identical for a stale timestamp and a bad signature.
+
+- **Docs: document `Register` replay window.** `docs/ARCHITECTURE.md` now notes
+  that a captured `Register` can be replayed within the ±120 s window (e.g.
+  to re-add a peer after it leaves), but this requires both the account token
+  and the captured request; the window is narrow enough to limit practical
+  risk while tolerating ordinary clock skew.
