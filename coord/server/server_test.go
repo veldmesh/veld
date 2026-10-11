@@ -164,6 +164,11 @@ func TestServer_Register_OK(t *testing.T) {
 	if resp.PeerId != hex.EncodeToString(id.Ed25519Public) {
 		t.Errorf("PeerId mismatch: got %s, want %s", resp.PeerId, hex.EncodeToString(id.Ed25519Public))
 	}
+
+	// Verify NetworkCidr is populated with the network's CIDR.
+	if resp.NetworkCidr != "10.99.0.0/24" {
+		t.Errorf("NetworkCidr: got %q, want 10.99.0.0/24", resp.NetworkCidr)
+	}
 }
 
 func TestServer_Register_InvalidToken(t *testing.T) {
@@ -671,6 +676,9 @@ func TestServer_Register_Idempotent(t *testing.T) {
 	}
 	if resp1.PeerId != resp2.PeerId {
 		t.Errorf("PeerId changed on idempotent register: first %s, second %s", resp1.PeerId, resp2.PeerId)
+	}
+	if resp1.NetworkCidr != resp2.NetworkCidr {
+		t.Errorf("NetworkCidr changed on idempotent register: first %s, second %s", resp1.NetworkCidr, resp2.NetworkCidr)
 	}
 }
 
@@ -1368,5 +1376,35 @@ func TestServer_Register_TimestampWindowEdge(t *testing.T) {
 	}
 	if resp.VpnAddr != "10.99.0.1" {
 		t.Errorf("VPN address: got %q, want 10.99.0.1", resp.VpnAddr)
+	}
+}
+
+// TestServer_Register_NetworkCidrInResponse verifies that the RegisterResponse
+// includes the network CIDR prefix (NetworkCidr field).
+func TestServer_Register_NetworkCidrInResponse(t *testing.T) {
+	srv, reg := testServer(t)
+	defer reg.Close()
+
+	id := newRegisterIdentity(t)
+	req := newRegisterRequest(id, "test-net", "test-token", "peer1", "192.168.1.1:51820", nil)
+	signRegisterReq(t, id, req)
+
+	resp, err := srv.Register(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Verify NetworkCidr is populated with the network's CIDR.
+	if resp.NetworkCidr != "10.99.0.0/24" {
+		t.Errorf("NetworkCidr: got %q, want 10.99.0.0/24", resp.NetworkCidr)
+	}
+
+	// Verify NetworkCidr matches the network record.
+	net, _, err := reg.GetNetwork("test-net")
+	if err != nil {
+		t.Fatalf("GetNetwork: %v", err)
+	}
+	if resp.NetworkCidr != net.CIDR.String() {
+		t.Errorf("NetworkCidr %q does not match network CIDR %q", resp.NetworkCidr, net.CIDR.String())
 	}
 }
