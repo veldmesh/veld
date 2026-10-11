@@ -1,10 +1,21 @@
-.PHONY: build build-all tray proto test lint docker clean
+.PHONY: build build-all veld-relay relay-identity tray proto test lint docker clean
 
 build:
 	go build -o bin/veld-daemon ./cmd/veld-daemon
 	go build -o bin/veld-coord ./cmd/veld-coord
 	go build -o bin/veld-relay ./cmd/veld-relay
 	go build -o bin/veld ./cmd/veld
+
+# Build only the relay binary (all binaries: `make build`).
+veld-relay:
+	go build -o bin/veld-relay ./cmd/veld-relay
+
+# Provision the veld-relay identity keystore at /etc/veld/relay-identity.json
+# (must run as root: `sudo make relay-identity`). Generates the keystore if
+# missing, sets owner veld-relay / mode 0600, prints the X25519 public key.
+# Idempotent. See docs/RELAY.md.
+relay-identity:
+	scripts/relay-identity.sh
 
 # tray requires CGO and platform libraries — built separately from the pure-Go targets.
 tray:

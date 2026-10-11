@@ -8,11 +8,17 @@
 //
 // Usage:
 //
-//	veld-relay -listen :41820 -identity ~/.config/veld/relay.json
+//	veld-relay -listen :41820 -identity /etc/veld/relay-identity.json
 //
 // On first start it generates an identity and prints its X25519 public key;
 // configure peers with that key as coord.relay_x25519 and this host's address
 // as coord.relay_addr.
+//
+// The -gen-identity flag loads or generates the keystore, prints the base64
+// X25519 public key, and exits without listening. It is idempotent — an
+// existing keystore is loaded, never rotated — and is what deploy tooling
+// (make relay-identity, scripts/relay-identity.sh) uses to provision the
+// identity before the service starts.
 //
 // By default only startup output is printed; no per-connection events
 // (channel IDs, client addresses) are logged. The -verbose flag re-enables
@@ -37,6 +43,7 @@ import (
 func main() {
 	listen := flag.String("listen", ":41820", "TCP address to listen on")
 	identity := flag.String("identity", "relay-identity.json", "path to identity keystore (created on first run)")
+	genIdentity := flag.Bool("gen-identity", false, "load or generate the identity keystore, print its X25519 public key (base64), and exit")
 	verbose := flag.Bool("verbose", false, "log per-connection events (channel IDs, truncated client addresses); for local debugging only, not for production")
 	flag.Parse()
 
@@ -44,6 +51,13 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "veld-relay: identity: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *genIdentity {
+		// Bare key on its own line so deploy tooling can capture stdout
+		// without parsing labels.
+		fmt.Println(base64.StdEncoding.EncodeToString(id.X25519Public[:]))
+		return
 	}
 
 	ln, err := net.Listen("tcp", *listen)
