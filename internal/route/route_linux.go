@@ -6,6 +6,7 @@ package route
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // DefaultRouteMetric is the metric Veldmesh asks the kernel for on its
@@ -37,6 +39,7 @@ type routeHandle interface {
 	RouteReplace(route *netlink.Route) error
 	RouteDel(route *netlink.Route) error
 	RouteList(link netlink.Link, family int) ([]netlink.Route, error)
+	RouteListFiltered(family int, filter *netlink.Route, filterMask uint64) ([]netlink.Route, error)
 }
 
 // systemHandle routes operations to the real netlink API.
@@ -46,6 +49,9 @@ func (systemHandle) RouteReplace(r *netlink.Route) error { return netlink.RouteR
 func (systemHandle) RouteDel(r *netlink.Route) error     { return netlink.RouteDel(r) }
 func (systemHandle) RouteList(link netlink.Link, family int) ([]netlink.Route, error) {
 	return netlink.RouteList(link, family)
+}
+func (systemHandle) RouteListFiltered(family int, filter *netlink.Route, filterMask uint64) ([]netlink.Route, error) {
+	return netlink.RouteListFiltered(family, filter, filterMask)
 }
 
 // New returns a route manager backed by netlink on Linux.
@@ -154,6 +160,9 @@ func (m *linuxManager) healLoop() {
 
 // heal checks all tracked routes against the kernel's routing table and
 // reinstalls any that are missing or have the wrong gateway/metric.
+// It checks both IPv4 and IPv6 routes from ALL routing tables (like Observe does),
+// not just the main table, because VPNs like wg-quick, Mullvad, NordLynx,
+// and Tailscale install routes in dedicated policy tables.
 func (m *linuxManager) heal() {
 	m.mu.Lock()
 	// Snapshot the current tracked routes.
@@ -167,12 +176,20 @@ func (m *linuxManager) heal() {
 		return
 	}
 
-	// Get all IPv4 routes from the kernel.
-	routes, err := m.h.RouteList(nil, netlink.FAMILY_V4)
+	// Get all routes from all tables for both IPv4 and IPv6.
+	// Use RT_TABLE_UNSPEC to dump every table (not just main).
+	filter := &netlink.Route{Table: unix.RT_TABLE_UNSPEC}
+	routesV4, err := m.h.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_TABLE)
 	if err != nil {
-		// Non-fatal: log and continue. The next cycle will retry.
+		log.Printf("veld: route heal: failed to list IPv4 routes: %v", err)
 		return
 	}
+	routesV6, err := m.h.RouteListFiltered(netlink.FAMILY_V6, filter, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		log.Printf("veld: route heal: failed to list IPv6 routes: %v", err)
+		return
+	}
+	routes := append(routesV4, routesV6...)
 
 	// Build a map of kernel routes by destination prefix.
 	kernelRoutes := make(map[string]*netlink.Route)
@@ -202,9 +219,10 @@ func (m *linuxManager) reinstall(prefix netip.Prefix, via netip.Addr) {
 	dst := prefixToIPNet(prefix)
 	gw := net.IP(via.AsSlice())
 	if err := m.h.RouteReplace(&netlink.Route{Dst: dst, Gw: gw, Priority: DefaultRouteMetric}); err != nil {
-		// Non-fatal: the next heal cycle will retry.
+		log.Printf("veld: route heal: failed to reinstall %s via %s: %v", prefix, via, err)
 		return
 	}
+	log.Printf("veld: coexist: healed route %s (was displaced by VPN)", prefix)
 }
 
 func prefixToIPNet(p netip.Prefix) *net.IPNet {

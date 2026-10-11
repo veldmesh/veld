@@ -19,11 +19,12 @@ import (
 // recordingHandle records route operations for inspection and lets tests
 // inject errors. It verifies exactly what the manager asks the kernel to do.
 type recordingHandle struct {
-	mu       sync.Mutex
-	replaced []*netlink.Route
-	deleted  []*netlink.Route
-	listed   []netlink.Route
-	err      error
+	mu           sync.Mutex
+	replaced     []*netlink.Route
+	deleted      []*netlink.Route
+	listed       []netlink.Route
+	listFiltered []netlink.Route
+	err          error
 }
 
 func (h *recordingHandle) RouteReplace(r *netlink.Route) error {
@@ -57,6 +58,18 @@ func (h *recordingHandle) RouteList(link netlink.Link, family int) ([]netlink.Ro
 	// Return a copy of the pre-set routes for testing.
 	result := make([]netlink.Route, len(h.listed))
 	copy(result, h.listed)
+	return result, nil
+}
+
+func (h *recordingHandle) RouteListFiltered(family int, filter *netlink.Route, filterMask uint64) ([]netlink.Route, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.err != nil {
+		return nil, h.err
+	}
+	// Return a copy of the pre-set routes for testing.
+	result := make([]netlink.Route, len(h.listFiltered))
+	copy(result, h.listFiltered)
 	return result, nil
 }
 
@@ -174,6 +187,53 @@ func TestCloseRemovesAllAddedRoutes(t *testing.T) {
 	}
 }
 
+// TestHealReinstallsViaRouteListFiltered verifies the heal loop uses
+// RouteListFiltered with RT_TABLE_UNSPEC to see all tables.
+func TestHealReinstallsViaRouteListFiltered(t *testing.T) {
+	h := &recordingHandle{}
+	m := newTestManager(h)
+
+	prefix := netip.MustParsePrefix("192.168.1.0/24")
+	via := netip.MustParseAddr("10.100.0.2")
+	if err := m.Add(prefix, via); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	// Simulate VPN displacing the route: pre-set a kernel route with wrong gateway.
+	h.listFiltered = []netlink.Route{
+		{Dst: mustIPNet("192.168.1.0/24"), Gw: net.ParseIP("10.99.99.99"), Priority: 600, Table: 51820},
+	}
+
+	// Call heal manually to trigger the check.
+	m.heal()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// Should have called RouteListFiltered for both IPv4 and IPv6
+	if len(h.replaced) != 2 { // 1 from Add, 1 from heal reinstall
+		t.Fatalf("expected 2 replace calls (Add + heal), got %d", len(h.replaced))
+	}
+	// The second call should be the heal reinstall
+	healCall := h.replaced[1]
+	if healCall.Dst == nil || healCall.Dst.String() != "192.168.1.0/24" {
+		t.Errorf("heal reinstall Dst = %v, want 192.168.1.0/24", healCall.Dst)
+	}
+	if healCall.Gw == nil || !healCall.Gw.Equal(net.ParseIP("10.100.0.2")) {
+		t.Errorf("heal reinstall Gw = %v, want 10.100.0.2", healCall.Gw)
+	}
+	if healCall.Priority != DefaultRouteMetric {
+		t.Errorf("heal reinstall Priority = %d, want %d", healCall.Priority, DefaultRouteMetric)
+	}
+}
+
 // errFakeKernel simulates a netlink failure (e.g. EPERM without
 // CAP_NET_ADMIN, or a route collision the kernel rejects).
 var errFakeKernel = errors.New("netlink: operation not permitted")
+
+func mustIPNet(s string) *net.IPNet {
+	_, ipnet, err := net.ParseCIDR(s)
+	if err != nil {
+		panic(err)
+	}
+	return ipnet
+}

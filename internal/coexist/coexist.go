@@ -19,6 +19,7 @@ package coexist
 
 import (
 	"fmt"
+	"log"
 	"net/netip"
 	"regexp"
 )
@@ -405,10 +406,12 @@ func Report(printf Printf, selfIface string, vpnPrefix netip.Prefix, prefixes ..
 
 // CheckRoute gathers a fresh snapshot and returns collisions for a single
 // Veldmesh prefix. Returns nil when gathering fails: a failed check must not
-// block the route installation itself.
+// block the route installation itself. Errors are logged so operators can
+// diagnose missed collision checks.
 func CheckRoute(pfx netip.Prefix, selfIface string) []Collision {
 	s, err := Observe()
 	if err != nil {
+		log.Printf("veld: coexist: CheckRoute snapshot failed for %s: %v", pfx, err)
 		return nil
 	}
 	return FindCollisions(s, selfIface, pfx)
