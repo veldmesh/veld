@@ -15,6 +15,7 @@ import (
 	coordserver "github.com/veldmesh/veld/coord/server"
 	coordce "github.com/veldmesh/veld/coord/ce"
 	coordcore "github.com/veldmesh/veld/coord/core"
+	intconfig "github.com/veldmesh/veld/internal/config"
 	"github.com/veldmesh/veld/internal/coord"
 	"github.com/veldmesh/veld/internal/crypto"
 	"github.com/veldmesh/veld/internal/dataplane"
@@ -394,5 +395,198 @@ func TestDaemon_selfInterface(t *testing.T) {
 	d2 := New(id, networkID, memTun, conn, peerTbl)
 	if d2.selfInterface() != "tun-test" {
 		t.Errorf("selfInterface() should return TUN name, got %q", d2.selfInterface())
+	}
+}
+
+// TestDeriveMeshPrefix_CIDRFromServer tests that the prefix is derived
+// from the server-provided network CIDR with the assigned VPN address.
+func TestDeriveMeshPrefix_CIDRFromServer(t *testing.T) {
+	vpnAddr := netip.MustParseAddr("10.50.0.5")
+	prefix := deriveMeshPrefix(vpnAddr, "10.50.0.0/24")
+	want := netip.PrefixFrom(vpnAddr, 24)
+	if prefix != want {
+		t.Errorf("deriveMeshPrefix: got %s, want %s", prefix, want)
+	}
+}
+
+// TestDeriveMeshPrefix_MissingCIDRFallback tests that when the server
+// does not provide a network CIDR, the prefix falls back to /24.
+func TestDeriveMeshPrefix_MissingCIDRFallback(t *testing.T) {
+	vpnAddr := netip.MustParseAddr("10.100.0.7")
+	prefix := deriveMeshPrefix(vpnAddr, "")
+	want := netip.PrefixFrom(vpnAddr, 24)
+	if prefix != want {
+		t.Errorf("deriveMeshPrefix: got %s, want %s", prefix, want)
+	}
+}
+
+// TestDeriveMeshPrefix_InvalidCIDRFallback tests that an invalid CIDR
+// from the server falls back to /24.
+func TestDeriveMeshPrefix_InvalidCIDRFallback(t *testing.T) {
+	vpnAddr := netip.MustParseAddr("192.168.1.3")
+	prefix := deriveMeshPrefix(vpnAddr, "not-a-valid-cidr")
+	want := netip.PrefixFrom(vpnAddr, 24)
+	if prefix != want {
+		t.Errorf("deriveMeshPrefix: got %s, want %s", prefix, want)
+	}
+}
+
+// TestOnVPNAddrAssigned_Callback_CreateTUNFailure tests that when TUN
+// creation fails (e.g., no /dev/net/tun), the daemon logs and keeps
+// running without a data plane. The callback must not panic.
+func TestOnVPNAddrAssigned_Callback_CreateTUNFailure(t *testing.T) {
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	var networkID [16]byte
+	copy(networkID[:], []byte("babe000000000000000000000000cafe"))
+
+	peerTbl := peer.New()
+	conn := newFakeConn()
+
+	cfg := &intconfig.Config{
+		Node: intconfig.NodeConfig{
+			IfaceName: "vel-test",
+			MTU:       1420,
+		},
+	}
+
+	d := New(id, networkID, nil, conn, peerTbl)
+
+	// Call the callback directly. In an environment without /dev/net/tun
+	// CreateTUN fails; the callback must log and return, not panic.
+	cb := d.onVPNAddrAssigned(cfg)
+	cb(netip.MustParseAddr("10.10.0.1"), "10.10.0.0/24")
+
+	// The TUN should still be nil (creation failed in this container).
+	d.mu.Lock()
+	tunDev := d.tunDev
+	d.mu.Unlock()
+	if tunDev != nil {
+		// If CreateTUN unexpectedly succeeded (privileged host), the TUN
+		// exists — also acceptable. Close it.
+		defer tunDev.Close()
+	}
+}
+
+// TestOnVPNAddrAssigned_Callback_SameAddress_NoOp tests that if the
+// callback is invoked with the same VPN address as the existing TUN,
+// the TUN is left untouched.
+func TestOnVPNAddrAssigned_Callback_SameAddress_NoOp(t *testing.T) {
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	var networkID [16]byte
+	copy(networkID[:], []byte("babe000000000000000000000000cafe"))
+
+	peerTbl := peer.New()
+	conn := newFakeConn()
+
+	cfg := &intconfig.Config{
+		Node: intconfig.NodeConfig{
+			IfaceName: "vel-test",
+			MTU:       1420,
+		},
+	}
+
+	d := New(id, networkID, nil, conn, peerTbl)
+
+	// Pre-populate with a MemTUN at address 10.0.0.1/24.
+	existing := tun.NewMemTUN("vel-test", netip.MustParsePrefix("10.0.0.1/24"), 1420)
+	d.mu.Lock()
+	d.tunDev = existing
+	d.mu.Unlock()
+
+	// Call callback with the SAME address: no-op.
+	cb := d.onVPNAddrAssigned(cfg)
+	cb(netip.MustParseAddr("10.0.0.1"), "10.0.0.0/24")
+
+	// The TUN must be the same object and still open.
+	d.mu.Lock()
+	tunDev := d.tunDev
+	d.mu.Unlock()
+	if tunDev != existing {
+		t.Fatalf("expected the same TUN object after same-address callback")
+	}
+	if _, err := existing.Inject([]byte{0x45}); err != nil {
+		t.Errorf("existing TUN should still be open after no-op, got %v", err)
+	}
+}
+
+// TestOnVPNAddrAssigned_Callback_AddressChange_RecreatesTUN tests that
+// a re-registration assigning a different VPN address closes the old
+// TUN and attempts to create a new one with the new address.
+func TestOnVPNAddrAssigned_Callback_AddressChange_RecreatesTUN(t *testing.T) {
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	var networkID [16]byte
+	copy(networkID[:], []byte("babe000000000000000000000000cafe"))
+
+	peerTbl := peer.New()
+	conn := newFakeConn()
+
+	cfg := &intconfig.Config{
+		Node: intconfig.NodeConfig{
+			IfaceName: "vel-test",
+			MTU:       1420,
+		},
+	}
+
+	d := New(id, networkID, nil, conn, peerTbl)
+
+	// Pre-populate with a MemTUN at address 10.0.0.1/24.
+	existing := tun.NewMemTUN("vel-test", netip.MustParsePrefix("10.0.0.1/24"), 1420)
+	d.mu.Lock()
+	d.tunDev = existing
+	d.mu.Unlock()
+
+	// Call callback with a DIFFERENT address (10.0.0.2).
+	cb := d.onVPNAddrAssigned(cfg)
+	cb(netip.MustParseAddr("10.0.0.2"), "10.0.0.0/24")
+
+	// The old TUN must be closed.
+	if _, err := existing.Inject([]byte{0x45}); err != tun.ErrClosed {
+		t.Errorf("old TUN should be closed after address change, got %v", err)
+	}
+
+	// The daemon's tunDev reflects the CreateTUN outcome: nil on failure
+	// (this container), or a new device with the new address on a
+	// privileged host.
+	d.mu.Lock()
+	newTun := d.tunDev
+	d.mu.Unlock()
+	if newTun != nil {
+		defer newTun.Close()
+		if newTun == existing {
+			t.Errorf("tunDev should not be the old TUN after address change")
+		}
+		if newTun.Addr().Addr() != netip.MustParseAddr("10.0.0.2") {
+			t.Errorf("new TUN address: got %s, want 10.0.0.2", newTun.Addr().Addr())
+		}
+	}
+}
+
+// TestOnVPNAddrAssigned_Callback_SelfInterfaceVisible verifies the
+// assigned TUN is visible via selfInterface() once set.
+func TestOnVPNAddrAssigned_Callback_SelfInterfaceVisible(t *testing.T) {
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	var networkID [16]byte
+	copy(networkID[:], []byte("babe000000000000000000000000cafe"))
+
+	peerTbl := peer.New()
+	conn := newFakeConn()
+
+	memTun := tun.NewMemTUN("vel0", netip.MustParsePrefix("10.100.0.1/24"), 1420)
+	d := New(id, networkID, memTun, conn, peerTbl)
+
+	if got := d.selfInterface(); got != "vel0" {
+		t.Errorf("selfInterface() = %q, want %q", got, "vel0")
 	}
 }
