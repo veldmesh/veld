@@ -360,6 +360,9 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 			tunDev, err := tun.CreateTUN(ifaceName, prefix, mtu)
 			if err != nil {
 				log.Printf("warning: failed to create TUN in coord mode: %v (data plane disabled)", err)
+				// The coordinator still assigned a valid VPN address, so
+				// surface it in veld status even without a data plane.
+				d.updateIPCStatus()
 				return
 			}
 

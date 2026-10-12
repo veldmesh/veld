@@ -310,10 +310,10 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 	})
 
 	return &coordv1.RegisterResponse{
-		VpnAddr:      vpnAddr.String(),
-		PeerId:       peerID,
-		NetworkId:    req.NetworkId,
-		NetworkCidr:  net.CIDR.String(),
+		VpnAddr:     vpnAddr.String(),
+		PeerId:      peerID,
+		NetworkId:   req.NetworkId,
+		NetworkCidr: net.CIDR.String(),
 	}, nil
 }
 
