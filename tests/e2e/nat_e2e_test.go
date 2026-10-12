@@ -72,8 +72,8 @@ func TestNATTraversal_TwoPeersViaCoord(t *testing.T) {
 	tblA := peer.New()
 	tblB := peer.New()
 
-	mgrA := nat.New(connA, portA, "" /*no STUN in tests*/, idA)
-	mgrB := nat.New(connB, portB, "" /*no STUN in tests*/, idB)
+	mgrA := nat.New(connA, portA, "" /*no STUN in tests*/, idA, tblA)
+	mgrB := nat.New(connB, portB, "" /*no STUN in tests*/, idB, tblB)
 
 	discoveredByA := make(chan netip.AddrPort, 2)
 	discoveredByB := make(chan netip.AddrPort, 2)
