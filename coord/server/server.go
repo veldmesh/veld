@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"log"
 	"net/netip"
 	"sync"
 	"time"
@@ -24,6 +25,11 @@ import (
 // peer's LastSeen in the registry, so a long-lived connected daemon is never
 // considered stale by the TTL sweep.
 const watchLastSeenRefresh = time.Minute
+
+// errRegisterAuth is the single error returned to clients for any Register
+// signature or timestamp verification failure. It leaks no detail about
+// which check failed or the server's clock.
+const errRegisterAuth = "invalid register signature or timestamp"
 
 // Server implements coordv1.CoordServer.
 type Server struct {
@@ -213,15 +219,21 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 	// addresses the peer plus a fresh timestamp, and this check runs
 	// before any registry write, so a rejected registration changes
 	// nothing.
-	if err := crypto.VerifyRegisterSignature(ed25519.PublicKey(ed25519Bytes), req.Signature, crypto.RegisterClaims{
+	now := time.Now().Unix()
+	claims := crypto.RegisterClaims{
 		NetworkID:     req.NetworkId,
+		Name:          req.Name,
 		Ed25519Public: req.Ed25519Public,
 		X25519Public:  req.X25519Public,
 		Endpoint:      req.Endpoint,
 		SubnetRoutes:  req.SubnetRoutes,
 		TimestampUnix: req.TimestampUnix,
-	}, time.Now().Unix()); err != nil {
-		return nil, status.Errorf(codes.Unauthenticated, "%v", err)
+	}
+	if err := crypto.VerifyRegisterSignature(ed25519.PublicKey(ed25519Bytes), req.Signature, claims, now); err != nil {
+		// Log the detailed reason locally for debugging (e.g. clock skew),
+		// but return a uniform message to the client.
+		log.Printf("Register verification failed: %v (check system clock if timestamp error)", err)
+		return nil, status.Error(codes.Unauthenticated, errRegisterAuth)
 	}
 
 	// Validate and policy-check each advertised subnet route.
@@ -488,11 +500,11 @@ func (s *Server) Leave(ctx context.Context, req *coordv1.LeaveRequest) (*coordv1
 	s.hooks.OnPeerLeft(ctx, peer, net)
 
 	_ = s.audit.Log(ctx, coordcore.AuditEvent{
-		Kind:      coordcore.AuditPeerLeft,
-		AccountID: acc.ID,
-		NetworkID: removed.NetworkID,
-		PeerID:    removed.ID,
-		At:        time.Now(),
+	Kind:      coordcore.AuditPeerLeft,
+	AccountID: acc.ID,
+	NetworkID: removed.NetworkID,
+	PeerID:    removed.ID,
+	At:        time.Now(),
 	})
 
 	s.bus.DropPendingSignals(removed.ID)

@@ -81,7 +81,11 @@ Veld runs in three operating modes:
   key matching `ed25519_public` (fields `timestamp_unix` + `signature`, ±120 s
   window) and the server verifies before any write — nobody can register or
   update a peer but the holder of its key. The signed message is specified in
-  [`DEVELOPMENT.md`](DEVELOPMENT.md).
+  [`DEVELOPMENT.md`](DEVELOPMENT.md). A captured `Register` request can be
+  replayed within the ±120 s timestamp window (e.g. to re-add a peer right after
+  it leaves), but this requires both the account token and the captured request;
+  the window is narrow enough to limit the practical risk while tolerating
+  ordinary clock skew.
 - **Network isolation:** `ListPeers`/`Watch` are scoped by `network_id`. Peers in network
   A can never query network B.
 - **Auth:** a network `token` resolves to an account; the daemon presents it on every RPC.

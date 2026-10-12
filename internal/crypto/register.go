@@ -12,10 +12,10 @@ import (
 
 // RegisterSignatureDomain is the domain-separation prefix of the message a
 // daemon signs to prove possession of its Ed25519 private key when
-// registering with the coord server: "veld-coord-register-v1" followed by a
+// registering with the coord server: "veld-coord-register-v2" followed by a
 // NUL byte. It ensures a Register signature is never a valid signature for
 // any other protocol message, even one signed by the same key.
-const RegisterSignatureDomain = "veld-coord-register-v1\x00"
+const RegisterSignatureDomain = "veld-coord-register-v2\x00"
 
 // RegisterTimestampWindow bounds the client clock carried in a Register
 // signature: |now - timestamp_unix| must not exceed this many seconds, so a
@@ -26,6 +26,7 @@ const RegisterTimestampWindow = 120 // seconds
 // proof-of-possession signature, plus the client timestamp.
 type RegisterClaims struct {
 	NetworkID     string   // network_id
+	Name          string   // name
 	Ed25519Public string   // ed25519_public, base64, exactly as sent on the wire
 	X25519Public  string   // x25519_public, base64, exactly as sent on the wire
 	Endpoint      string   // endpoint, "ip:port" or ""
@@ -35,8 +36,8 @@ type RegisterClaims struct {
 
 // RegisterSignedMessage returns the deterministic message signed for a
 // Register proof of key possession: the domain prefix, then length-prefixed
-// network_id, ed25519_public, x25519_public and endpoint, then the sorted
-// subnet routes as a length-prefixed list, then the timestamp as a
+// network_id, name, ed25519_public, x25519_public and endpoint, then the
+// sorted subnet routes as a length-prefixed list, then the timestamp as a
 // big-endian uint64. This is the single encoding shared by the coord client
 // (which signs it) and the coord server (which verifies it); its golden
 // test vector lives in register_test.go.
@@ -47,11 +48,12 @@ func RegisterSignedMessage(claims RegisterClaims) []byte {
 	copy(routes, claims.SubnetRoutes)
 	sort.Strings(routes)
 
-	buf := make([]byte, 0, len(RegisterSignatureDomain)+4*4+8+
-		len(claims.NetworkID)+len(claims.Ed25519Public)+len(claims.X25519Public)+len(claims.Endpoint)+
+	buf := make([]byte, 0, len(RegisterSignatureDomain)+5*4+8+
+		len(claims.NetworkID)+len(claims.Name)+len(claims.Ed25519Public)+len(claims.X25519Public)+len(claims.Endpoint)+
 		len(routes)*36)
 	buf = append(buf, RegisterSignatureDomain...)
 	buf = appendPrefixedString(buf, claims.NetworkID)
+	buf = appendPrefixedString(buf, claims.Name)
 	buf = appendPrefixedString(buf, claims.Ed25519Public)
 	buf = appendPrefixedString(buf, claims.X25519Public)
 	buf = appendPrefixedString(buf, claims.Endpoint)
