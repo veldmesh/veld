@@ -43,7 +43,6 @@ func buildRelayBinary(t *testing.T) string {
 // identity keystore on first run, prints the X25519 public key as a single
 // base64 line, writes the keystore mode 0600, and is idempotent — a second
 // run against an existing keystore prints the same key without regenerating.
-// scripts/relay-identity.sh relies on all of this.
 func TestRelayBinary_GenIdentity(t *testing.T) {
 	if testing.Short() {
 		t.Skip("binary tests skipped with -short")
@@ -108,7 +107,7 @@ func TestRelayBinary_Serve(t *testing.T) {
 	dir := t.TempDir()
 	idPath := filepath.Join(dir, "relay-identity.json")
 
-	// Generate the keystore up front, exactly like make relay-identity does.
+	// Generate the keystore up front, exactly like the provisioning step does.
 	genOut, err := exec.Command(relayBin, "-gen-identity", "-identity", idPath).CombinedOutput()
 	if err != nil {
 		t.Fatalf("veld-relay -gen-identity: %v\n%s", err, genOut)

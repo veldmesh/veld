@@ -8,7 +8,7 @@
 //
 // Usage:
 //
-//	veld-relay -listen :41820 -identity /etc/veld/relay-identity.json
+//	veld-relay -listen :41820 -identity /etc/veld-relay/identity.json
 //
 // On first start it generates an identity and prints its X25519 public key;
 // configure peers with that key as coord.relay_x25519 and this host's address
@@ -17,8 +17,7 @@
 // The -gen-identity flag loads or generates the keystore, prints the base64
 // X25519 public key, and exits without listening. It is idempotent — an
 // existing keystore is loaded, never rotated — and is what deploy tooling
-// (make relay-identity, scripts/relay-identity.sh) uses to provision the
-// identity before the service starts.
+// uses to provision the identity before the service starts.
 //
 // By default only startup output is printed; no per-connection events
 // (channel IDs, client addresses) are logged. The -verbose flag re-enables

@@ -61,7 +61,7 @@ make veld-relay     # → bin/veld-relay
 It takes a TCP listen address and a path to an identity keystore:
 
 ```sh
-veld-relay -listen :41820 -identity /etc/veld/relay-identity.json
+veld-relay -listen :41820 -identity /etc/veld-relay/identity.json
 ```
 
 On first run the relay **generates an identity** and **prints its X25519
@@ -71,7 +71,7 @@ which loads an existing keystore or creates one, prints the public key, and
 exits. It never rotates an existing identity, so it is safe to re-run:
 
 ```sh
-veld-relay -gen-identity -identity /etc/veld/relay-identity.json
+veld-relay -gen-identity -identity /etc/veld-relay/identity.json
 ```
 
 The operator then shares two values with every peer that should use the
@@ -93,10 +93,12 @@ The repo ships a unit at [`deploy/veld-relay.service`](../deploy/veld-relay.serv
 # 1. Install the binary.
 install -m 0755 veld-relay /usr/local/bin/veld-relay
 
-# 2. Provision the identity (creates the dedicated veld-relay user,
-#    generates /etc/veld/relay-identity.json with mode 0600 owned by
-#    veld-relay, prints the public key).
-sudo make relay-identity     # or: sudo scripts/relay-identity.sh
+# 2. Create the dedicated veld-relay user and provision the identity.
+#    Run the provisioning step as the veld-relay user so the directory
+#    (/etc/veld-relay, mode 0700) and keystore (identity.json, mode 0600)
+#    are owned by veld-relay and readable by the service.
+sudo useradd --system --no-create-home --shell /sbin/nologin veld-relay
+sudo -u veld-relay /usr/local/bin/veld-relay -gen-identity -identity /etc/veld-relay/identity.json
 
 # 3. Install and start the service.
 sudo cp deploy/veld-relay.service /etc/systemd/system/
@@ -114,15 +116,21 @@ an unprivileged port, so no `CAP_NET_BIND_SERVICE` is needed; if you change
 `-listen` to a port below 1024, uncomment the `AmbientCapabilities` line in
 the unit.
 
-Without a source checkout, run the same provisioning steps by hand before
-the first start — the service expects a readable keystore to already exist:
+### Manual provisioning (without systemd)
+
+If you run the relay outside systemd, create the user and directory with the
+correct ownership, then run the binary. The `-gen-identity` flag handles
+creating the directory (mode 0700) and keystore (mode 0600) with the right
+owner if you run it as the `veld-relay` user:
 
 ```sh
 sudo useradd --system --no-create-home --shell /sbin/nologin veld-relay
-sudo mkdir -p /etc/veld && sudo chmod 0755 /etc/veld
-sudo /usr/local/bin/veld-relay -gen-identity -identity /etc/veld/relay-identity.json
-sudo chown veld-relay:veld-relay /etc/veld/relay-identity.json
-sudo chmod 0600 /etc/veld/relay-identity.json
+sudo -u veld-relay /usr/local/bin/veld-relay -gen-identity -identity /etc/veld-relay/identity.json
+```
+
+Then run the service as that user:
+```sh
+sudo -u veld-relay /usr/local/bin/veld-relay -listen :41820 -identity /etc/veld-relay/identity.json
 ```
 
 ### Logging and privacy
@@ -191,22 +199,23 @@ redundancy; peers pin one relay per config today.
 
 ## Key management
 
-The relay's identity lives in `/etc/veld/relay-identity.json` (mode 0600,
+The relay's identity lives in `/etc/veld-relay/identity.json` (mode 0600,
 owned by the `veld-relay` user). It **must persist across restarts, service
 upgrades, and redeploys**: peers pin `relay_x25519` and `relay_addr` in their
 own configs, and the coord server does not distribute them — so a rotated
 identity silently breaks every peer's relay fallback until each one is
 updated.
 
-- **Back up** `/etc/veld/relay-identity.json` **off the VM** (it is a single
-  small JSON file). Treat it like a TLS private key: anyone who obtains it
-  can impersonate the relay to peers that pin it.
+- **Backup** `/etc/veld-relay/identity.json` **off the VM** at your
+  discretion. Treat it like a TLS private key: anyone who obtains it can
+  impersonate the relay to peers that pin it.
 - **If the identity is lost**, regenerate it with
-  `veld-relay --gen-identity` (or `sudo make relay-identity`), which prints
-  the new X25519 public key — then distribute the new `relay_x25519` and
-  `relay_addr` to **all peers** and update their `config.toml`.
-- The provisioning script is idempotent: re-running `sudo make relay-identity`
-  never rotates an existing key; it only prints the current public key.
+  `veld-relay -gen-identity -identity /etc/veld-relay/identity.json`, which
+  prints the new X25519 public key — then distribute the new
+  `relay_x25519` and `relay_addr` to **all peers** and update their
+  `config.toml`.
+- The `-gen-identity` flag is idempotent: re-running it never rotates an
+  existing key; it only prints the current public key.
 
 ---
 
