@@ -443,8 +443,10 @@ func TestClient_Idempotent_Reregistration(t *testing.T) {
 		t.Errorf("machine count: got %d, want 1", count)
 	}
 
-	c1.Stop(); c1.Wait()
-	c2.Stop(); c2.Wait()
+	c1.Stop()
+	c1.Wait()
+	c2.Stop()
+	c2.Wait()
 }
 
 // noCIDRServer wraps the standard coord server but overrides Register

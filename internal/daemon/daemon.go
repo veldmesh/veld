@@ -360,9 +360,9 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	}
 
 	// Wire up mDNS LAN discovery if enabled and we have a VPN address.
-	// Requires a known VPN address at startup, so this is static-mode only;
-	// coord mode assigns the address after registration, when it is too late
-	// to start discovery here.
+	// mDNS needs a VPN address; in coord mode the address arrives after
+	// registration (see onVPNAddrAssigned), so discovery is not wired
+	// there yet — a follow-up could start it once the TUN exists.
 	if cfg.MDNS.Enabled && vpnPrefix.IsValid() {
 		mdnsName := cfg.MDNS.Name
 		if mdnsName == "" {

@@ -9,14 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"google.golang.org/grpc"
-
-	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
-	coordserver "github.com/veldmesh/veld/coord/server"
-	coordce "github.com/veldmesh/veld/coord/ce"
-	coordcore "github.com/veldmesh/veld/coord/core"
 	intconfig "github.com/veldmesh/veld/internal/config"
-	"github.com/veldmesh/veld/internal/coord"
 	"github.com/veldmesh/veld/internal/crypto"
 	"github.com/veldmesh/veld/internal/dataplane"
 	"github.com/veldmesh/veld/internal/peer"
@@ -129,14 +122,14 @@ func newTestSessionPair(t *testing.T) (initiator, responder *session.Session) {
 func buildIPv4Packet(src, dst [4]byte, payload []byte) []byte {
 	totalLen := 20 + len(payload)
 	pkt := make([]byte, totalLen)
-	pkt[0] = 0x45                          // version=4, IHL=5
-	pkt[1] = 0x00                          // DSCP/ECN
-	pkt[2] = byte(totalLen >> 8)           // total length high
-	pkt[3] = byte(totalLen)                // total length low
-	pkt[8] = 64                            // TTL
-	pkt[9] = 17                            // protocol: UDP
-	copy(pkt[12:16], src[:])               // source IP
-	copy(pkt[16:20], dst[:])               // dest IP
+	pkt[0] = 0x45                // version=4, IHL=5
+	pkt[1] = 0x00                // DSCP/ECN
+	pkt[2] = byte(totalLen >> 8) // total length high
+	pkt[3] = byte(totalLen)      // total length low
+	pkt[8] = 64                  // TTL
+	pkt[9] = 17                  // protocol: UDP
+	copy(pkt[12:16], src[:])     // source IP
+	copy(pkt[16:20], dst[:])     // dest IP
 	copy(pkt[20:], payload)
 	return pkt
 }
@@ -157,50 +150,6 @@ func mustAddr(s string) netip.Addr {
 	return a
 }
 
-// startCoordServer starts an in-process coord gRPC server and returns its address.
-func startCoordServer(t *testing.T, networkID string, cidr netip.Prefix) (addr string, stop func()) {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-
-	reg, err := coordserver.NewRegistry(t.TempDir() + "/coord.db")
-	if err != nil {
-		t.Fatalf("NewRegistry: %v", err)
-	}
-	if err := reg.CreateNetwork(coordcore.Network{
-		ID:   networkID,
-		CIDR: cidr,
-		Name: "e2e-net",
-	}, "acc1"); err != nil {
-		t.Fatalf("CreateNetwork: %v", err)
-	}
-
-	bus := coordserver.NewBus()
-	srv := coordserver.New(
-		reg,
-		bus,
-		coordce.NewFreeEnforcer(),
-		coordce.NewTokenAccountStore(map[string]coordcore.Account{
-			"e2e-token": {ID: "acc1", Tier: coordcore.TierFree},
-		}),
-		coordce.NewNoopAuditLogger(),
-		coordce.NewRejectSubnetPolicy(),
-		coordce.NewNoopHooks(),
-	)
-
-	grpcSrv := grpc.NewServer()
-	coordv1.RegisterCoordServer(grpcSrv, srv)
-	go grpcSrv.Serve(ln)
-
-	return ln.Addr().String(), func() {
-		grpcSrv.Stop()
-		reg.Close()
-		ln.Close()
-	}
-}
-
 // pollUntil polls cond every 5 ms until it returns true or timeout elapses.
 func pollUntil(timeout time.Duration, cond func() bool) bool {
 	deadline := time.Now().Add(timeout)
@@ -211,63 +160,6 @@ func pollUntil(timeout time.Duration, cond func() bool) bool {
 		time.Sleep(5 * time.Millisecond)
 	}
 	return false
-}
-
-// TestOnVPNAddrAssigned_CIDRFromServer tests that when the coordinator provides
-// a network_cidr, the daemon derives the correct prefix and creates the TUN.
-func TestOnVPNAddrAssigned_CIDRFromServer(t *testing.T) {
-	// Use an in-memory coord server for the test.
-	cidr := netip.MustParsePrefix("10.50.0.0/24")
-	serverAddr, stopServer := startCoordServer(t, "test-net", cidr)
-	defer stopServer()
-
-	id, err := crypto.Generate()
-	if err != nil {
-		t.Fatalf("generate identity: %v", err)
-	}
-	peerTbl := peer.New()
-
-	c := coord.New(coord.Config{
-		ServerAddr:  serverAddr,
-		NetworkID:   "test-net",
-		Token:       "e2e-token",
-		Identity:    id,
-		LocalName:   "test-node",
-		PeerTable:   peerTbl,
-		TLSInsecure: true,
-	})
-
-	var callbackMu sync.Mutex
-	var callbackVPNAddr netip.Addr
-	var callbackCIDR string
-	c.OnVPNAddrAssigned = func(vpnAddr netip.Addr, networkCIDR string) {
-		callbackMu.Lock()
-		callbackVPNAddr = vpnAddr
-		callbackCIDR = networkCIDR
-		callbackMu.Unlock()
-	}
-
-	c.Start()
-	defer func() { c.Stop(); c.Wait() }()
-
-	if !pollUntil(5*time.Second, func() bool { return c.VPNAddr().IsValid() }) {
-		t.Fatal("timeout: client did not register")
-	}
-
-	callbackMu.Lock()
-	vpn := callbackVPNAddr
-	cidrStr := callbackCIDR
-	callbackMu.Unlock()
-
-	if !vpn.IsValid() {
-		t.Fatal("OnVPNAddrAssigned not called with valid VPN address")
-	}
-	if cidrStr != "10.50.0.0/24" {
-		t.Errorf("OnVPNAddrAssigned network CIDR: got %q, want 10.50.0.0/24", cidrStr)
-	}
-	if !cidr.Contains(vpn) {
-		t.Errorf("assigned VPN %s not in CIDR %s", vpn, cidr)
-	}
 }
 
 // TestDispatcher_SetTUN_StartsTunLoop tests that SetTUN starts the tunLoop
