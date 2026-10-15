@@ -42,7 +42,7 @@ type NodeConfig struct {
 	VPNAddr      string   `toml:"vpn_addr"`      // e.g. "10.100.0.1/24"
 	ListenAddr   string   `toml:"listen_addr"`   // e.g. "0.0.0.0:51820"
 	NetworkID    string   `toml:"network_id"`    // 32 lowercase hex chars (16 bytes)
-	IfaceName    string   `toml:"iface_name"`    // TUN interface name; default "tun0"
+	IfaceName    string   `toml:"iface_name"`    // TUN interface name; empty = platform default ("veld0" Linux, "Veld" Windows, "utun" macOS)
 	MTU          int      `toml:"mtu"`           // 0 → default 1420
 	SubnetRoutes []string `toml:"subnet_routes"` // CIDR prefixes this node advertises
 }

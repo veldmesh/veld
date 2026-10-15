@@ -11,6 +11,13 @@ import (
 	"github.com/veldmesh/veld/internal/tun"
 )
 
+// TestDefaultIfaceName_Windows pins the default Wintun adapter name.
+func TestDefaultIfaceName_Windows(t *testing.T) {
+	if got := tun.DefaultIfaceName(); got != "Veld" {
+		t.Errorf("DefaultIfaceName() = %q, want Veld", got)
+	}
+}
+
 func TestCreateTUN_Windows(t *testing.T) {
 	prefix, err := netip.ParsePrefix("10.100.99.1/24")
 	if err != nil {
