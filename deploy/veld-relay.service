@@ -31,6 +31,13 @@ Type=simple
 # Dedicated unprivileged user (create with: sudo useradd --system --no-create-home --shell /sbin/nologin veld-relay)
 User=veld-relay
 
+# Ensure /etc/veld-relay exists with mode 0700 owned by veld-relay.
+# The identity keystore is provisioned before first start (see comments above);
+# this directive guarantees the directory exists with correct permissions
+# even if the service is started without prior provisioning.
+ConfigurationDirectory=veld-relay
+ConfigurationDirectoryMode=0700
+
 ExecStart=/usr/local/bin/veld-relay \
     -listen :41820 \
     -identity /etc/veld-relay/identity.json
