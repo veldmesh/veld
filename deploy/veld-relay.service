@@ -31,9 +31,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 
-# Dedicated unprivileged user/group (create with: sudo groupadd --system veld-relay && sudo useradd --system --no-create-home --shell /sbin/nologin -g veld-relay veld-relay)
+# Dedicated unprivileged user (create with: sudo groupadd --system veld-relay && sudo useradd --system --no-create-home --shell /sbin/nologin -g veld-relay veld-relay)
 User=veld-relay
-Group=veld-relay
 
 # Ensure /etc/veld-relay exists with mode 0700 owned by veld-relay.
 # The identity keystore is provisioned before first start (see comments above);
