@@ -12,6 +12,14 @@ import (
 	"github.com/veldmesh/veld/internal/tun"
 )
 
+// TestDefaultIfaceName_Darwin pins the default TUN name request: the kernel
+// assigns the real utunN name, veld only passes the prefix.
+func TestDefaultIfaceName_Darwin(t *testing.T) {
+	if got := tun.DefaultIfaceName(); got != "utun" {
+		t.Errorf("DefaultIfaceName() = %q, want utun", got)
+	}
+}
+
 func TestCreateTUN_Darwin(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("requires root")
@@ -22,7 +30,7 @@ func TestCreateTUN_Darwin(t *testing.T) {
 		t.Fatalf("parse prefix: %v", err)
 	}
 
-	dev, err := tun.CreateTUN("utun", prefix, 1420)
+	dev, err := tun.CreateTUN(tun.DefaultIfaceName(), prefix, 1420)
 	if err != nil {
 		t.Fatalf("CreateTUN: %v", err)
 	}
@@ -49,7 +57,7 @@ func TestCreateTUN_Darwin_WriteRead(t *testing.T) {
 		t.Fatalf("parse prefix: %v", err)
 	}
 
-	dev, err := tun.CreateTUN("utun", prefix, 1420)
+	dev, err := tun.CreateTUN(tun.DefaultIfaceName(), prefix, 1420)
 	if err != nil {
 		t.Fatalf("CreateTUN: %v", err)
 	}

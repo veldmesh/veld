@@ -14,9 +14,36 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// DefaultRouteMetric is the metric Veldmesh asks the kernel for on its
+// routes. Linux prefers the lowest metric among distinct equal-prefix
+// routes, so on IPv4 metric 0 keeps Veldmesh's mesh/subnet routes ahead of
+// commercial VPN routes that carry a higher metric. IPv6 has no metric 0:
+// the kernel coerces it to 1024 (IP6_RT_PRIO_USER) on install, so veld has
+// no metric advantage there. Order-independence against a VPN claiming the
+// same prefix comes from the replace-on-conflict install in Add, not from
+// this metric.
+const DefaultRouteMetric = 0
+
+// routeHandle is the netlink write surface used by the manager. The seam
+// exists so tests can verify exactly what veld asks the kernel to do.
+type routeHandle interface {
+	RouteReplace(route *netlink.Route) error
+	RouteDel(route *netlink.Route) error
+}
+
+// systemHandle routes operations to the real netlink API.
+type systemHandle struct{}
+
+func (systemHandle) RouteReplace(r *netlink.Route) error { return netlink.RouteReplace(r) }
+func (systemHandle) RouteDel(r *netlink.Route) error     { return netlink.RouteDel(r) }
+
 // New returns a route manager backed by netlink on Linux.
 func New() Manager {
-	return &linuxManager{routes: make(map[netip.Prefix]struct{})}
+	return newLinuxManager(systemHandle{})
+}
+
+func newLinuxManager(h routeHandle) *linuxManager {
+	return &linuxManager{routes: make(map[netip.Prefix]struct{}), h: h}
 }
 
 // EnableIPForward writes "1" to /proc/sys/net/ipv4/ip_forward.
@@ -28,22 +55,24 @@ func EnableIPForward() error {
 type linuxManager struct {
 	mu     sync.Mutex
 	routes map[netip.Prefix]struct{}
+	h      routeHandle
 }
 
 func (m *linuxManager) Add(prefix netip.Prefix, via netip.Addr) error {
 	dst := prefixToIPNet(prefix)
 	gw := net.IP(via.AsSlice())
 
-	if err := netlink.RouteAdd(&netlink.Route{Dst: dst, Gw: gw}); err != nil {
-		// EEXIST is benign: route already present (e.g., from a previous run).
-		if isExist(err) {
-			// Replace the existing route to update the gateway.
-			if rerr := netlink.RouteReplace(&netlink.Route{Dst: dst, Gw: gw}); rerr != nil {
-				return fmt.Errorf("route replace %s via %s: %w", prefix, via, rerr)
-			}
-		} else {
-			return fmt.Errorf("route add %s via %s: %w", prefix, via, err)
-		}
+	// Replace, not add: if a commercial VPN already installed a route for
+	// this prefix (VPN connected first), veld takes the prefix over; if the
+	// VPN displaced veld's route later (veld connected first), the next
+	// Add — a peer rejoin or daemon restart — heals it. That
+	// replace-on-conflict is what makes the install order-independent.
+	// When both sides instead hold routes with different metrics, the lower
+	// metric wins — on IPv4 that is veld's metric-0 route. There is no
+	// background route watcher; restart veld if peers become unreachable
+	// after a VPN reconnects.
+	if err := m.h.RouteReplace(&netlink.Route{Dst: dst, Gw: gw, Priority: DefaultRouteMetric}); err != nil {
+		return fmt.Errorf("route replace %s via %s: %w", prefix, via, err)
 	}
 
 	m.mu.Lock()
@@ -54,7 +83,7 @@ func (m *linuxManager) Add(prefix netip.Prefix, via netip.Addr) error {
 
 func (m *linuxManager) Remove(prefix netip.Prefix) error {
 	dst := prefixToIPNet(prefix)
-	if err := netlink.RouteDel(&netlink.Route{Dst: dst}); err != nil && !isNotExist(err) {
+	if err := m.h.RouteDel(&netlink.Route{Dst: dst}); err != nil && !isNotExist(err) {
 		return fmt.Errorf("route del %s: %w", prefix, err)
 	}
 
@@ -93,10 +122,6 @@ func prefixToIPNet(p netip.Prefix) *net.IPNet {
 	b16 := addr.As16()
 	ip = b16[:]
 	return &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, 128)}
-}
-
-func isExist(err error) bool {
-	return err != nil && err.Error() == "file exists"
 }
 
 func isNotExist(err error) bool {
