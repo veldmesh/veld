@@ -9,13 +9,14 @@
 # configs — the coord server does NOT distribute them — so a new identity
 # invalidates every peer's configuration until they are all updated.
 #
-# Provision the identity (and the dedicated veld-relay user) BEFORE the
+# Provision the identity (and the dedicated veld-relay user/group) BEFORE the
 # first start. The directory /etc/veld-relay must be created by root first,
 # then the provisioning step runs as the veld-relay user so the directory
 # (mode 0700) and keystore (identity.json, mode 0600) are owned by
 # veld-relay and readable by the service:
-#          sudo useradd --system --no-create-home --shell /sbin/nologin veld-relay
-#          sudo install -d -m 0700 -o veld-relay /etc/veld-relay
+#          sudo groupadd --system veld-relay
+#          sudo useradd --system --no-create-home --shell /sbin/nologin -g veld-relay veld-relay
+#          sudo install -d -m 0700 -o veld-relay -g veld-relay /etc/veld-relay
 #          sudo -u veld-relay /usr/local/bin/veld-relay -gen-identity -identity /etc/veld-relay/identity.json
 # The keystore is created with mode 0600 owned by veld-relay and the relay's
 # X25519 public key is printed to stdout. See docs/RELAY.md for the full
@@ -30,8 +31,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 
-# Dedicated unprivileged user (create with: sudo useradd --system --no-create-home --shell /sbin/nologin veld-relay)
+# Dedicated unprivileged user/group (create with: sudo groupadd --system veld-relay && sudo useradd --system --no-create-home --shell /sbin/nologin -g veld-relay veld-relay)
 User=veld-relay
+Group=veld-relay
 
 # Ensure /etc/veld-relay exists with mode 0700 owned by veld-relay.
 # The identity keystore is provisioned before first start (see comments above);

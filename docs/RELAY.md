@@ -85,7 +85,7 @@ Peers pin both values in their own config; the coord server does **not**
 hand them out (see [Key management](#key-management) for why they must never
 silently change).
 
-### Running under systemd (Ubuntu 24.04)
+### Running under systemd
 
 The repo ships a unit at [`deploy/veld-relay.service`](../deploy/veld-relay.service):
 
@@ -93,13 +93,14 @@ The repo ships a unit at [`deploy/veld-relay.service`](../deploy/veld-relay.serv
 # 1. Install the binary.
 install -m 0755 veld-relay /usr/local/bin/veld-relay
 
-# 2. Create the dedicated veld-relay user and provision the identity.
+# 2. Create the dedicated veld-relay user/group and provision the identity.
 #    The directory /etc/veld-relay must be created by root first,
 #    then the provisioning step runs as the veld-relay user so the
 #    directory (mode 0700) and keystore (identity.json, mode 0600) are
 #    owned by veld-relay and readable by the service.
-sudo useradd --system --no-create-home --shell /sbin/nologin veld-relay
-sudo install -d -m 0700 -o veld-relay /etc/veld-relay
+sudo groupadd --system veld-relay
+sudo useradd --system --no-create-home --shell /sbin/nologin -g veld-relay veld-relay
+sudo install -d -m 0700 -o veld-relay -g veld-relay /etc/veld-relay
 sudo -u veld-relay /usr/local/bin/veld-relay -gen-identity -identity /etc/veld-relay/identity.json
 
 # 3. Install and start the service.
@@ -126,8 +127,9 @@ creating the keystore (mode 0600) with the right owner if you run it as the
 `veld-relay` user. The directory must be created by root first:
 
 ```sh
-sudo useradd --system --no-create-home --shell /sbin/nologin veld-relay
-sudo install -d -m 0700 -o veld-relay /etc/veld-relay
+sudo groupadd --system veld-relay
+sudo useradd --system --no-create-home --shell /sbin/nologin -g veld-relay veld-relay
+sudo install -d -m 0700 -o veld-relay -g veld-relay /etc/veld-relay
 sudo -u veld-relay /usr/local/bin/veld-relay -gen-identity -identity /etc/veld-relay/identity.json
 ```
 
@@ -198,6 +200,12 @@ all that matters is that both peers of a failing NAT pair can reach it over
 TCP. Run more than one relay (with different identities and addresses) for
 redundancy; peers pin one relay per config today.
 
+**Note on connection limits:** The current implementation does not enforce
+global or per-client connection caps. This is a known limitation and will be
+addressed in a future release. Operators exposing relays to untrusted networks
+should consider external mitigations (e.g., firewall connection limits,
+reverse proxy with rate limiting).
+
 ---
 
 ## Key management
@@ -209,9 +217,10 @@ own configs, and the coord server does not distribute them — so a rotated
 identity silently breaks every peer's relay fallback until each one is
 updated.
 
-- **Backup** `/etc/veld-relay/identity.json` **off the VM** at your
-  discretion. Treat it like a TLS private key: anyone who obtains it can
-  impersonate the relay to peers that pin it.
+- **Backup** `/etc/veld-relay/identity.json` **off the VM** if you wish to
+  protect against disk loss. Treat it like a TLS private key: anyone who
+  obtains it can impersonate the relay to peers that pin it. Whether and how
+  to back up the key is the operator's choice.
 - **If the identity is lost**, regenerate it with
   `veld-relay -gen-identity -identity /etc/veld-relay/identity.json`, which
   prints the new X25519 public key — then distribute the new
