@@ -88,8 +88,8 @@ func (b *Bus) Unsubscribe(networkID string, ch <-chan *coordv1.PeerEvent) {
 // Non-blocking: drops if subscriber channel is full.
 func (b *Bus) Publish(networkID string, ev *coordv1.PeerEvent) {
 	b.mu.RLock()
+	defer b.mu.RUnlock()
 	subs := b.subscribers[networkID]
-	b.mu.RUnlock()
 	for _, ch := range subs {
 		select {
 		case ch <- ev:
@@ -144,11 +144,17 @@ func (b *Bus) UnsubscribeSignals(peerID string, ch <-chan signalMsg) {
 // is dropped, as before.
 func (b *Bus) SendSignal(from, to string, payload []byte, hold bool) {
 	msg := signalMsg{FromPeerID: from, ToPeerID: to, Payload: payload}
-	b.mu.Lock()
-	defer b.mu.Unlock()
+
+	// Race fix: hold RLock for the subscriber iteration to prevent
+	// UnsubscribeSignals from closing a channel while we're sending on it.
+	// Only upgrade to Lock if we need to hold the signal (no subscribers).
+	b.mu.RLock()
 	sigs := b.signals[to]
 	if len(sigs) == 0 {
+		b.mu.RUnlock()
 		if hold {
+			b.mu.Lock()
+			defer b.mu.Unlock()
 			b.holdLocked(msg)
 		}
 		return
@@ -159,6 +165,7 @@ func (b *Bus) SendSignal(from, to string, payload []byte, hold bool) {
 		default:
 		}
 	}
+	b.mu.RUnlock()
 }
 
 // holdLocked queues msg for a recipient that is not subscribed. b.mu must be held.

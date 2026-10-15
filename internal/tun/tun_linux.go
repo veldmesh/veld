@@ -20,6 +20,15 @@ type linuxTUN struct {
 	mtu  int
 }
 
+// DefaultIfaceName is the default Linux TUN interface name. A dedicated
+// name instead of the generic "tun0" matters for two reasons: TUNSETIFF
+// with an already-taken name fails with EEXIST, so veld could not even
+// start next to an OpenVPN-based VPN that owns tun0; and "veld0" does not
+// match the generic tun|tap|utun|wg patterns used to spot VPN tunnels, so
+// self-exclusion in coexistence checks is trivial and operators get a
+// stable interface to reference in split-tunnel and firewall rules.
+func DefaultIfaceName() string { return "veld0" }
+
 // CreateTUN creates a Linux TUN device with the given name, assigns ip to it, and brings it up.
 // Requires CAP_NET_ADMIN or root.
 func CreateTUN(name string, ip netip.Prefix, mtu int) (TUN, error) {

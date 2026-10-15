@@ -17,4 +17,4 @@ type noopManager struct{}
 
 func (m *noopManager) Add(prefix netip.Prefix, via netip.Addr) error { return nil }
 func (m *noopManager) Remove(prefix netip.Prefix) error              { return nil }
-func (m *noopManager) Close() error                                   { return nil }
+func (m *noopManager) Close() error                                  { return nil }
