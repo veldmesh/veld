@@ -41,7 +41,7 @@ import (
 
 func main() {
 	listen := flag.String("listen", ":41820", "TCP address to listen on")
-	identity := flag.String("identity", "relay-identity.json", "path to identity keystore (created on first run)")
+	identity := flag.String("identity", "/etc/veld-relay/identity.json", "path to identity keystore (created on first run)")
 	genIdentity := flag.Bool("gen-identity", false, "load or generate the identity keystore, print its X25519 public key (base64), and exit")
 	verbose := flag.Bool("verbose", false, "log per-connection events (channel IDs, truncated client addresses); for local debugging only, not for production")
 	flag.Parse()

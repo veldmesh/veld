@@ -94,10 +94,12 @@ The repo ships a unit at [`deploy/veld-relay.service`](../deploy/veld-relay.serv
 install -m 0755 veld-relay /usr/local/bin/veld-relay
 
 # 2. Create the dedicated veld-relay user and provision the identity.
-#    Run the provisioning step as the veld-relay user so the directory
-#    (/etc/veld-relay, mode 0700) and keystore (identity.json, mode 0600)
-#    are owned by veld-relay and readable by the service.
+#    The directory /etc/veld-relay must be created by root first,
+#    then the provisioning step runs as the veld-relay user so the
+#    directory (mode 0700) and keystore (identity.json, mode 0600) are
+#    owned by veld-relay and readable by the service.
 sudo useradd --system --no-create-home --shell /sbin/nologin veld-relay
+sudo install -d -m 0700 -o veld-relay /etc/veld-relay
 sudo -u veld-relay /usr/local/bin/veld-relay -gen-identity -identity /etc/veld-relay/identity.json
 
 # 3. Install and start the service.
@@ -120,11 +122,12 @@ the unit.
 
 If you run the relay outside systemd, create the user and directory with the
 correct ownership, then run the binary. The `-gen-identity` flag handles
-creating the directory (mode 0700) and keystore (mode 0600) with the right
-owner if you run it as the `veld-relay` user:
+creating the keystore (mode 0600) with the right owner if you run it as the
+`veld-relay` user. The directory must be created by root first:
 
 ```sh
 sudo useradd --system --no-create-home --shell /sbin/nologin veld-relay
+sudo install -d -m 0700 -o veld-relay /etc/veld-relay
 sudo -u veld-relay /usr/local/bin/veld-relay -gen-identity -identity /etc/veld-relay/identity.json
 ```
 
