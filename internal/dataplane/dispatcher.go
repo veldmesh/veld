@@ -24,6 +24,7 @@ type Dispatcher struct {
 	tun   tun.TUN
 	conn  net.PacketConn
 	peers *peer.Table
+	tunMu sync.RWMutex
 
 	// OnHandshakeRequired is called when a TUN packet is destined for a peer
 	// that has no active session. The packet is already in the peer's hold queue.
@@ -66,13 +67,27 @@ func (d *Dispatcher) Start() {
 	go d.udpLoop()
 }
 
+// SetTUN sets the TUN device. If the dispatcher was started with a nil TUN
+// (coord mode before VPN address assignment), this starts the tunLoop goroutine.
+func (d *Dispatcher) SetTUN(t tun.TUN) {
+	d.tunMu.Lock()
+	d.tun = t
+	d.tunMu.Unlock()
+	if t != nil {
+		d.wg.Add(1)
+		go d.tunLoop()
+	}
+}
+
 // Stop closes the TUN and UDP conn, causing both loops to exit.
 // Safe to call multiple times.
 func (d *Dispatcher) Stop() {
 	d.stopOnce.Do(func() {
+		d.tunMu.Lock()
 		if d.tun != nil {
 			_ = d.tun.Close()
 		}
+		d.tunMu.Unlock()
 		_ = d.conn.Close()
 	})
 }
@@ -106,13 +121,16 @@ func (d *Dispatcher) FlushHoldQueue(entry *peer.Entry) {
 // If TUN is nil (coord mode before VPN address assignment), the loop exits immediately.
 func (d *Dispatcher) tunLoop() {
 	defer d.wg.Done()
-	if d.tun == nil {
+	d.tunMu.RLock()
+	t := d.tun
+	d.tunMu.RUnlock()
+	if t == nil {
 		return
 	}
 	plainBuf := make([]byte, maxMTU)
 
 	for {
-		n, err := d.tun.Read(plainBuf)
+		n, err := t.Read(plainBuf)
 		if err != nil {
 			return
 		}
@@ -203,8 +221,11 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 			return
 		}
 		entry.Touch()
-		if d.tun != nil {
-			if _, err := d.tun.Write(plain); err != nil {
+		d.tunMu.RLock()
+		t := d.tun
+		d.tunMu.RUnlock()
+		if t != nil {
+			if _, err := t.Write(plain); err != nil {
 				// TODO: log err before stopping — Dispatcher has no logger yet
 				d.Stop()
 				return

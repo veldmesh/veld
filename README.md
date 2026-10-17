@@ -34,7 +34,16 @@ Traffic flows directly between your devices. When direct connection isn't possib
 
 ## Quick start — managed service
 
-Install and log in with one command. See [veldmesh.io](https://veldmesh.io) for setup instructions.
+Install and log in with one command. The daemon connects to the coordinator, receives a VPN address, and creates a TUN interface for mesh traffic.
+
+```sh
+# On each machine
+curl -fsSL https://get.veldmesh.io/install.sh | sh   # or download from releases
+veld login                    # opens browser for auth
+veld up                       # connects to the coordinator
+```
+
+The coordinator assigns a VPN address (e.g., `10.100.0.1`); the daemon then creates a TUN interface with that address and routes mesh traffic through it. The coordinator never sees packet contents. Data-plane forwarding in this mode is exercised by automated tests but has not yet been verified end-to-end on real hosts.
 
 ---
 

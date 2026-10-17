@@ -404,6 +404,27 @@ socket_path = %q
 		t.Errorf("expected 'Running: true' in status output; got:\n%s", out)
 	}
 
+	// 5b. The daemon must surface the VPN address the coordinator
+	// assigned in its status — including when TUN creation fails
+	// (e.g. in a container without /dev/net/tun), so the node never
+	// reports an address-less status.
+	vpnInStatus := false
+	statusDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(statusDeadline) {
+		out, err = exec.Command(cliBin, "--socket", sockPath, "status").CombinedOutput()
+		if err != nil {
+			t.Fatalf("veld status: %v\n%s", err, out)
+		}
+		if strings.Contains(string(out), "VPN Address: 10.97.0.") {
+			vpnInStatus = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !vpnInStatus {
+		t.Errorf("expected 'VPN Address: 10.97.0.x' in status output; got:\n%s", out)
+	}
+
 	// 6. Verify coord registered the daemon as a peer.
 	conn, err := grpc.NewClient(coordAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),

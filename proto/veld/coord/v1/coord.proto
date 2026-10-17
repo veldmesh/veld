@@ -32,9 +32,10 @@ message RegisterRequest {
 }
 
 message RegisterResponse {
-  string vpn_addr   = 1;  // assigned VPN IP, e.g. "10.100.0.1"
-  string peer_id    = 2;  // Ed25519 hex ID
-  string network_id = 3;  // echoed from request
+  string vpn_addr     = 1;  // assigned VPN IP, e.g. "10.100.0.1"
+  string peer_id      = 2;  // Ed25519 hex ID
+  string network_id   = 3;  // echoed from request
+  string network_cidr = 4;  // network CIDR prefix, e.g. "10.100.0.0/24"
 }
 
 message ListPeersRequest {
