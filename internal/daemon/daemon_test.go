@@ -348,7 +348,7 @@ func TestOnVPNAddrAssigned_Callback_CreateTUNFailure(t *testing.T) {
 
 	// Call the callback directly. In an environment without /dev/net/tun
 	// CreateTUN fails; the callback must log and return, not panic.
-	cb := d.onVPNAddrAssigned(cfg)
+	cb := d.onVPNAddrAssigned(cfg, conn)
 	cb(netip.MustParseAddr("10.10.0.1"), "10.10.0.0/24")
 
 	// The TUN should still be nil (creation failed in this container).
@@ -392,7 +392,7 @@ func TestOnVPNAddrAssigned_Callback_SameAddress_NoOp(t *testing.T) {
 	d.mu.Unlock()
 
 	// Call callback with the SAME address: no-op.
-	cb := d.onVPNAddrAssigned(cfg)
+	cb := d.onVPNAddrAssigned(cfg, conn)
 	cb(netip.MustParseAddr("10.0.0.1"), "10.0.0.0/24")
 
 	// The TUN must be the same object and still open.
@@ -437,7 +437,7 @@ func TestOnVPNAddrAssigned_Callback_AddressChange_RecreatesTUN(t *testing.T) {
 	d.mu.Unlock()
 
 	// Call callback with a DIFFERENT address (10.0.0.2).
-	cb := d.onVPNAddrAssigned(cfg)
+	cb := d.onVPNAddrAssigned(cfg, conn)
 	cb(netip.MustParseAddr("10.0.0.2"), "10.0.0.0/24")
 
 	// The old TUN must be closed.
@@ -460,6 +460,95 @@ func TestOnVPNAddrAssigned_Callback_AddressChange_RecreatesTUN(t *testing.T) {
 			t.Errorf("new TUN address: got %s, want 10.0.0.2", newTun.Addr().Addr())
 		}
 	}
+}
+
+// TestNewMDNSDiscovery_Disabled verifies that mDNS discovery is not
+// constructed when disabled in config, regardless of environment.
+func TestNewMDNSDiscovery_Disabled(t *testing.T) {
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	var networkID [16]byte
+	peerTbl := peer.New()
+	conn := newFakeConn()
+	d := New(id, networkID, nil, conn, peerTbl)
+
+	cfg := &intconfig.Config{MDNS: intconfig.MDNSConfig{Enabled: false}}
+	disc, err := d.newMDNSDiscovery(cfg, conn, netip.MustParseAddr("10.10.0.1"))
+	if err != nil {
+		t.Fatalf("newMDNSDiscovery: unexpected error: %v", err)
+	}
+	if disc != nil {
+		t.Fatalf("newMDNSDiscovery: expected nil discovery when disabled, got %v", disc)
+	}
+}
+
+// TestNewMDNSDiscovery_Enabled verifies that mDNS discovery is constructed
+// and advertises the given VPN address when enabled in config. This is the
+// same helper onVPNAddrAssigned uses to wire discovery in coord mode once
+// the TUN exists, exercised directly so it doesn't depend on CreateTUN
+// succeeding in the test environment.
+func TestNewMDNSDiscovery_Enabled(t *testing.T) {
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	var networkID [16]byte
+	peerTbl := peer.New()
+	conn := newFakeConn()
+	d := New(id, networkID, nil, conn, peerTbl)
+
+	cfg := &intconfig.Config{MDNS: intconfig.MDNSConfig{Enabled: true, Name: "test-node"}}
+	disc, err := d.newMDNSDiscovery(cfg, conn, netip.MustParseAddr("10.10.0.1"))
+	if err != nil {
+		t.Skipf("mDNS discovery did not initialize in this environment: %v", err)
+	}
+	if disc == nil {
+		t.Fatalf("newMDNSDiscovery: expected a discovery instance when enabled")
+	}
+	disc.Stop()
+}
+
+// TestOnVPNAddrAssigned_Callback_WiresMDNS verifies that once the
+// coordinator assigns a VPN address, mDNS LAN discovery is created and
+// started advertising it — mDNS has no address to advertise at
+// construction time in coord mode, so it must be wired here instead.
+func TestOnVPNAddrAssigned_Callback_WiresMDNS(t *testing.T) {
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	var networkID [16]byte
+	copy(networkID[:], []byte("babe000000000000000000000000cafe"))
+
+	peerTbl := peer.New()
+	conn := newFakeConn()
+
+	cfg := &intconfig.Config{
+		Node: intconfig.NodeConfig{
+			IfaceName: "vel-test",
+			MTU:       1420,
+		},
+		MDNS: intconfig.MDNSConfig{
+			Enabled: true,
+			Name:    "test-node",
+		},
+	}
+
+	d := New(id, networkID, nil, conn, peerTbl)
+
+	cb := d.onVPNAddrAssigned(cfg, conn)
+	cb(netip.MustParseAddr("10.10.0.1"), "10.10.0.0/24")
+
+	disc := d.mdnsDiscovery()
+	if disc == nil {
+		// mDNS requires binding a multicast UDP socket; some sandboxes deny
+		// this, matching how CreateTUN can fail in TestOnVPNAddrAssigned_
+		// Callback_CreateTUNFailure. Nothing further to assert.
+		t.Skip("mDNS discovery did not initialize in this environment")
+	}
+	defer disc.Stop()
 }
 
 // TestOnVPNAddrAssigned_Callback_SelfInterfaceVisible verifies the

@@ -332,7 +332,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 
 		// When the coordinator assigns a VPN address, create the TUN so the
 		// data plane comes up. Extracted for direct testability.
-		d.coordCli.OnVPNAddrAssigned = d.onVPNAddrAssigned(cfg)
+		d.coordCli.OnVPNAddrAssigned = d.onVPNAddrAssigned(cfg, conn)
 	}
 
 	// Wire up IPC server
@@ -361,34 +361,13 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 
 	// Wire up mDNS LAN discovery if enabled and we have a VPN address.
 	// mDNS needs a VPN address; in coord mode the address arrives after
-	// registration (see onVPNAddrAssigned), so discovery is not wired
-	// there yet — a follow-up could start it once the TUN exists.
-	if cfg.MDNS.Enabled && vpnPrefix.IsValid() {
-		mdnsName := cfg.MDNS.Name
-		if mdnsName == "" {
-			if h, err := os.Hostname(); err == nil {
-				mdnsName = h
-			} else {
-				mdnsName = "veld"
-			}
-		}
-
-		var dataPort uint16
-		if laddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
-			dataPort = uint16(laddr.Port)
-		}
-
-		disc, err := mdns.New(localID, mdnsName, vpnPrefix.Addr(), dataPort,
-			func(e *peer.Entry, ep netip.AddrPort) {
-				if ep.IsValid() {
-					e.SetEndpoint(ep)
-				}
-				peerTbl.Upsert(e)
-				d.hsMgr.Initiate(e)
-			})
+	// registration, so discovery is wired there instead (see
+	// onVPNAddrAssigned).
+	if vpnPrefix.IsValid() {
+		disc, err := d.newMDNSDiscovery(cfg, conn, vpnPrefix.Addr())
 		if err != nil {
 			fmt.Printf("warning: mDNS discovery failed to initialize: %v\n", err)
-		} else {
+		} else if disc != nil {
 			d.mdnsDisco = disc
 		}
 	}
@@ -396,18 +375,56 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	return d, nil
 }
 
+// newMDNSDiscovery builds the mDNS discovery service advertising vpnAddr and
+// the data-plane UDP port, wired to upsert discovered LAN peers and initiate
+// a handshake with them. Returns (nil, nil) if mDNS is disabled in cfg.
+// Shared by the static-mode setup in NewFromConfig and the coord-mode
+// onVPNAddrAssigned callback, since both need to build the same service once
+// a VPN address is known.
+func (d *Daemon) newMDNSDiscovery(cfg *intconfig.Config, conn net.PacketConn, vpnAddr netip.Addr) (*mdns.Discovery, error) {
+	if !cfg.MDNS.Enabled {
+		return nil, nil
+	}
+
+	mdnsName := cfg.MDNS.Name
+	if mdnsName == "" {
+		if h, err := os.Hostname(); err == nil {
+			mdnsName = h
+		} else {
+			mdnsName = "veld"
+		}
+	}
+
+	var dataPort uint16
+	if laddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		dataPort = uint16(laddr.Port)
+	}
+
+	return mdns.New(d.localID, mdnsName, vpnAddr, dataPort,
+		func(e *peer.Entry, ep netip.AddrPort) {
+			if ep.IsValid() {
+				e.SetEndpoint(ep)
+			}
+			d.peerTbl.Upsert(e)
+			d.hsMgr.Initiate(e)
+		})
+}
+
 // onVPNAddrAssigned returns the callback invoked when the coordinator
 // assigns this daemon a VPN address. It derives the network prefix from the
 // server-provided network CIDR (falling back to /24 with a warning), creates
-// the TUN, and wires it into the dispatcher. A re-registration that assigns
-// a different address replaces the TUN; the same address is a no-op.
-// TUN creation failure is non-fatal: the daemon keeps running without a
-// data plane and still reports the assigned address in its status.
-func (d *Daemon) onVPNAddrAssigned(cfg *intconfig.Config) func(vpnAddr netip.Addr, networkCIDR string) {
+// the TUN, wires it into the dispatcher, and (if enabled) starts mDNS LAN
+// discovery advertising the assigned address. A re-registration that assigns
+// a different address replaces the TUN and the mDNS advertisement; the same
+// address is a no-op. TUN creation failure is non-fatal: the daemon keeps
+// running without a data plane and still reports the assigned address in
+// its status.
+func (d *Daemon) onVPNAddrAssigned(cfg *intconfig.Config, conn net.PacketConn) func(vpnAddr netip.Addr, networkCIDR string) {
 	return func(vpnAddr netip.Addr, networkCIDR string) {
 		// Same address and TUN already up: nothing to do.
 		d.mu.Lock()
 		existing := d.tunDev
+		oldDisco := d.mdnsDisco
 		d.mu.Unlock()
 		if existing != nil && existing.Addr().Addr() == vpnAddr {
 			return
@@ -423,6 +440,14 @@ func (d *Daemon) onVPNAddrAssigned(cfg *intconfig.Config) func(vpnAddr netip.Add
 			_ = existing.Close()
 			d.mu.Lock()
 			d.tunDev = nil
+			d.mu.Unlock()
+		}
+		if oldDisco != nil {
+			// The old advertisement names a stale VPN address; drop it so
+			// the replacement below advertises the new one instead.
+			oldDisco.Stop()
+			d.mu.Lock()
+			d.mdnsDisco = nil
 			d.mu.Unlock()
 		}
 
@@ -441,6 +466,18 @@ func (d *Daemon) onVPNAddrAssigned(cfg *intconfig.Config) func(vpnAddr netip.Add
 
 		// Wire the new TUN into the dispatcher.
 		d.disp.SetTUN(tunDev)
+
+		// Now that we have a VPN address, start mDNS LAN discovery: it was
+		// not wired at construction time since coord mode has no address
+		// until registration completes.
+		if disc, err := d.newMDNSDiscovery(cfg, conn, vpnAddr); err != nil {
+			log.Printf("warning: mDNS discovery failed to initialize: %v", err)
+		} else if disc != nil {
+			d.mu.Lock()
+			d.mdnsDisco = disc
+			d.mu.Unlock()
+			disc.Start()
+		}
 
 		// Update IPC status now that we have a VPN address.
 		d.updateIPCStatus()
@@ -517,14 +554,23 @@ func (d *Daemon) selfInterface() string {
 	return t.Name()
 }
 
+// mdnsDiscovery returns the current mDNS discovery instance, if any. It may
+// be set after construction in coord mode, once the coordinator assigns a
+// VPN address (see onVPNAddrAssigned), so reads must go through the lock.
+func (d *Daemon) mdnsDiscovery() *mdns.Discovery {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.mdnsDisco
+}
+
 // Start launches the dispatcher, coord client, mDNS discovery, and IPC server goroutines.
 func (d *Daemon) Start() {
 	d.disp.Start()
 	if d.coordCli != nil {
 		d.coordCli.Start()
 	}
-	if d.mdnsDisco != nil {
-		d.mdnsDisco.Start()
+	if disc := d.mdnsDiscovery(); disc != nil {
+		disc.Start()
 	}
 	if d.ipcSrv != nil {
 		if err := d.ipcSrv.Start(); err != nil {
@@ -537,15 +583,13 @@ func (d *Daemon) Start() {
 
 // Stop signals all components to exit.
 func (d *Daemon) Stop() {
+	// disp.Stop() already closes the TUN (it's the same device wired in via
+	// SetTUN/New); just drop our reference here, don't close it again.
 	d.disp.Stop()
 	d.mu.Lock()
 	proxies := d.relayProxies
 	d.relayProxies = nil
-	// Close our TUN if we created one.
-	if d.tunDev != nil {
-		_ = d.tunDev.Close()
-		d.tunDev = nil
-	}
+	d.tunDev = nil
 	d.mu.Unlock()
 	for _, p := range proxies {
 		_ = p.Close()
@@ -556,8 +600,8 @@ func (d *Daemon) Stop() {
 	if d.dnsSrv != nil {
 		d.dnsSrv.Stop()
 	}
-	if d.mdnsDisco != nil {
-		d.mdnsDisco.Stop()
+	if disc := d.mdnsDiscovery(); disc != nil {
+		disc.Stop()
 	}
 	if d.routeMgr != nil {
 		_ = d.routeMgr.Close()
