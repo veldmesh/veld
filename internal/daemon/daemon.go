@@ -441,8 +441,14 @@ func (d *Daemon) onVPNAddrAssigned(cfg *intconfig.Config, conn net.PacketConn) f
 		newTun, err := createTUN(resolveIfaceName(cfg), prefix, resolveTunMTU(cfg))
 		if err != nil {
 			log.Printf("warning: failed to create TUN in coord mode: %v (data plane disabled)", err)
-			// The coordinator still assigned a valid VPN address, so
-			// surface it in veld status even without a data plane.
+			if existing != nil {
+				// Address change failed: the old TUN is still running with
+				// the old address. Report that address instead of the new
+				// coordinator-assigned one to avoid IPC status discrepancy.
+				d.mu.Lock()
+				d.vpnAddr = existing.Addr().Addr()
+				d.mu.Unlock()
+			}
 			d.updateIPCStatus()
 			return
 		}
@@ -631,10 +637,15 @@ func (d *Daemon) updateIPCStatus() {
 	vpnAddr := d.vpnAddr
 	peerID := d.peerID
 	coordAddr := d.coordAddr
+	tun := d.tunDev
 	d.mu.Unlock()
 
-	// If coord is running, get the assigned VPN address
-	if d.coordCli != nil {
+	// Prefer the actual data-plane TUN address if available. This avoids
+	// reporting a coordinator-assigned address when the TUN creation for
+	// that address failed (e.g., during a failed address change).
+	if tun != nil {
+		vpnAddr = tun.Addr().Addr()
+	} else if d.coordCli != nil {
 		vpnAddr = d.coordCli.VPNAddr()
 		peerID = d.coordCli.PeerID()
 	}
