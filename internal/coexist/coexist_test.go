@@ -479,7 +479,7 @@ func TestReportSkipsSelfAndSuggestsNothingWithoutVPNPrefix(t *testing.T) {
 	}
 }
 
-func TestReportEqualCollisionExplainsReplaceAndMetric(t *testing.T) {
+func TestReportEqualCollisionExplainsReplace(t *testing.T) {
 	s := coexist.Snapshot{
 		Routes: []coexist.RouteEntry{{Dst: pfx("10.100.0.0/24"), Iface: "nordlynx"}},
 	}
@@ -493,8 +493,5 @@ func TestReportEqualCollisionExplainsReplaceAndMetric(t *testing.T) {
 	}
 	if !strings.Contains(out, "replacing") {
 		t.Errorf("equal-collision guidance should explain the replace-on-conflict install:\n%s", out)
-	}
-	if !strings.Contains(out, "metric") {
-		t.Errorf("equal-collision guidance should mention the IPv4 metric advantage:\n%s", out)
 	}
 }

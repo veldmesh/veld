@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	intconfig "github.com/veldmesh/veld/internal/config"
 	"github.com/veldmesh/veld/internal/coexist"
+	intconfig "github.com/veldmesh/veld/internal/config"
 	"github.com/veldmesh/veld/internal/crypto"
 	"github.com/veldmesh/veld/internal/dataplane"
 	"github.com/veldmesh/veld/internal/peer"

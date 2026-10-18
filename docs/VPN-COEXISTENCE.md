@@ -27,13 +27,11 @@ semantics (netlink `RTM_NEWROUTE` with `NLM_F_REPLACE`):
   of failing with "file exists" — and if the VPN displaces veld's route
   later (veld connected first), the next veld start or peer rejoin claims
   it back. This is what makes the install order-independent.
-- **Lowest metric on IPv4.** Veldmesh requests metric 0 — the metric the
+- **Explicit default metric.** Veldmesh requests metric 0 — the metric the
   kernel would use anyway for an unqualified route add, made explicit.
-  When routes for the same prefix coexist *with different metrics*, the
-  lower one wins, so on IPv4 veld's route beats higher-metric VPN routes.
-  IPv6 gets no such advantage: the kernel raises metric 0 to 1024
-  (`IP6_RT_PRIO_USER`) on install, and same-prefix IPv6 conflicts are
-  handled by the replace alone.
+  It is not a coexistence advantage; the replace-on-conflict above is the
+  sole order-independence mechanism. (On IPv6 the kernel raises metric 0
+  to 1024, `IP6_RT_PRIO_USER`, on install.)
 
 **Platform support for route management.** Subnet route installation,
 replacement, and removal are implemented only on Linux (via netlink).
@@ -67,7 +65,7 @@ time.
 | `veld: coexist: NordVPN detected (interface nordlynx): ...` | A known provider's tunnel is up. | Nothing, unless peers fail to connect — then follow the advice (add veld to the VPN's split tunneling, or disable its kill switch, and restart veld). |
 | `... full-tunnel — the default route passes through it ...` | All traffic, including veld's UDP hole-punching, is routed through the VPN. Direct peer connections may fail; relay fallback (if configured) usually still works. | Enable split tunneling for veld in the VPN, or configure a relay. |
 | `veld: coexist: mesh prefix 10.100.0.0/24: route 10.0.0.0/8 via tun0 covers ... but Veldmesh's more-specific route takes precedence` | A broader route covers the mesh prefix. Informational: longest-prefix match keeps mesh traffic on veld's route. | Nothing. |
-| `... conflicts with 10.100.0.0/24 via tun0: ... exact conflict; Veldmesh installs its route by replacing any same-prefix route ...` | Another interface claims the exact same prefix. Each side's (re)install claims the prefix in turn; on IPv4 veld's metric-0 route also wins while a higher-metric route coexists. | Prefer moving one side to a different CIDR; the log suggests one (`consider using 10.109.0.0/24 instead`). |
+| `... conflicts with 10.100.0.0/24 via tun0: ... exact conflict; Veldmesh installs its route by replacing any same-prefix route ...` | Another interface claims the exact same prefix. Each side's (re)install claims the prefix in turn. | Prefer moving one side to a different CIDR; the log suggests one (`consider using 10.109.0.0/24 instead`). |
 | `... conflicts with 10.100.0.128/25 via tun0: ... more specific ... never reaches the mesh` | A more-specific route carves destinations out of the mesh. Those destinations will not work over the mesh. | Change the mesh CIDR (the log suggests an alternative) or remove the other route. |
 
 Suggestions are same-size CIDRs inside RFC 1918 private space (`10.0.0.0/8`,

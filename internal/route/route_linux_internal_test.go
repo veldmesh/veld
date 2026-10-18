@@ -52,18 +52,15 @@ func newTestManager(h *recordingHandle) *linuxManager {
 }
 
 // TestAddReplacesWithExplicitMetric verifies what Add asks the kernel for on
-// Linux, the two commercial-VPN coexistence properties of the install:
+// Linux, the two properties of the install:
 //
 //  1. The route is installed via replace, not add — a conflicting route a
 //     commercial VPN installed *before* veld started is taken over, and a
 //     route a VPN installs *later* is healed by the next Add (peer rejoin
 //     or daemon restart). This replace-on-conflict is the
 //     order-independence mechanism.
-//  2. The route carries metric DefaultRouteMetric — the explicit lowest
-//     metric, which on IPv4 keeps veld's route ahead of higher-metric
-//     routes when both sides hold distinct routes for the same prefix.
-//     (On IPv6 the kernel raises metric 0 to 1024, so there is no such
-//     advantage; same-prefix claims are handled by the replace instead.)
+//  2. The route carries metric DefaultRouteMetric — the metric the kernel
+//     would use for an unqualified route add, made explicit.
 func TestAddReplacesWithExplicitMetric(t *testing.T) {
 	h := &recordingHandle{}
 	m := newTestManager(h)
@@ -87,7 +84,7 @@ func TestAddReplacesWithExplicitMetric(t *testing.T) {
 		t.Errorf("Gw = %v, want 10.100.0.2", r.Gw)
 	}
 	if r.Priority != DefaultRouteMetric {
-		t.Errorf("Priority = %d, want %d (explicit lowest metric for the IPv4 coexistence advantage)", r.Priority, DefaultRouteMetric)
+		t.Errorf("Priority = %d, want %d (the explicit default metric)", r.Priority, DefaultRouteMetric)
 	}
 }
 
