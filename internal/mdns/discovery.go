@@ -90,16 +90,25 @@ func (d *Discovery) Start() {
 	go d.browseLoop()
 }
 
-// Stop shuts down the browse loop and the mDNS advertisement server.
+// Stop shuts down the mDNS advertisement server and the browse loop.
+// Shutting down the server first interrupts any ongoing query, making
+// shutdown faster and more reliable on platforms where Query may block.
 func (d *Discovery) Stop() {
+	_ = d.server.Shutdown()
 	close(d.stopCh)
 	d.wg.Wait()
-	_ = d.server.Shutdown()
 }
 
 func (d *Discovery) browseLoop() {
 	defer d.wg.Done()
-	d.browse()
+
+	// Check for stop before the initial browse.
+	select {
+	case <-d.stopCh:
+		return
+	default:
+		d.browse()
+	}
 
 	t := time.NewTicker(browsePeriod)
 	defer t.Stop()
@@ -109,7 +118,12 @@ func (d *Discovery) browseLoop() {
 		case <-d.stopCh:
 			return
 		case <-t.C:
-			d.browse()
+			select {
+			case <-d.stopCh:
+				return
+			default:
+				d.browse()
+			}
 		}
 	}
 }

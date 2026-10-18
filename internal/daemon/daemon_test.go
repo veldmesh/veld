@@ -629,7 +629,19 @@ func TestOnVPNAddrAssigned_Callback_WiresMDNS(t *testing.T) {
 		// Callback_CreateTUNFailure. Nothing further to assert.
 		t.Skip("mDNS discovery did not initialize in this environment")
 	}
-	defer disc.Stop()
+
+	// Stop with a timeout to avoid hanging on platforms where mDNS shutdown
+	// may block (e.g., Windows multicast socket cleanup).
+	stopped := make(chan struct{})
+	go func() {
+		disc.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("disc.Stop() timed out")
+	}
 }
 
 // TestOnVPNAddrAssigned_Callback_SelfInterfaceVisible verifies the
