@@ -16,8 +16,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
 	coordcore "github.com/veldmesh/veld/coord/core"
+	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
 	"github.com/veldmesh/veld/internal/crypto"
 )
 
@@ -501,11 +501,11 @@ func (s *Server) Leave(ctx context.Context, req *coordv1.LeaveRequest) (*coordv1
 	s.hooks.OnPeerLeft(ctx, peer, net)
 
 	_ = s.audit.Log(ctx, coordcore.AuditEvent{
-	Kind:      coordcore.AuditPeerLeft,
-	AccountID: acc.ID,
-	NetworkID: removed.NetworkID,
-	PeerID:    removed.ID,
-	At:        time.Now(),
+		Kind:      coordcore.AuditPeerLeft,
+		AccountID: acc.ID,
+		NetworkID: removed.NetworkID,
+		PeerID:    removed.ID,
+		At:        time.Now(),
 	})
 
 	s.bus.DropPendingSignals(removed.ID)

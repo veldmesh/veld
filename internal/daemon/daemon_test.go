@@ -409,7 +409,8 @@ func TestOnVPNAddrAssigned_Callback_SameAddress_NoOp(t *testing.T) {
 
 // TestOnVPNAddrAssigned_Callback_AddressChange_RecreatesTUN tests that
 // a re-registration assigning a different VPN address closes the old
-// TUN and attempts to create a new one with the new address.
+// TUN and creates a new one with the new address. Uses the createTUN seam
+// to simulate successful TUN creation.
 func TestOnVPNAddrAssigned_Callback_AddressChange_RecreatesTUN(t *testing.T) {
 	id, err := crypto.Generate()
 	if err != nil {
@@ -436,6 +437,17 @@ func TestOnVPNAddrAssigned_Callback_AddressChange_RecreatesTUN(t *testing.T) {
 	d.tunDev = existing
 	d.mu.Unlock()
 
+	// Override createTUN to return a new MemTUN with the new address.
+	originalCreateTUN := createTUN
+	newTun := tun.NewMemTUN("vel-test", netip.MustParsePrefix("10.0.0.2/24"), 1420)
+	createTUN = func(iface string, prefix netip.Prefix, mtu int) (tun.TUN, error) {
+		if prefix.Addr() == netip.MustParseAddr("10.0.0.2") {
+			return newTun, nil
+		}
+		return originalCreateTUN(iface, prefix, mtu)
+	}
+	defer func() { createTUN = originalCreateTUN }()
+
 	// Call callback with a DIFFERENT address (10.0.0.2).
 	cb := d.onVPNAddrAssigned(cfg, conn)
 	cb(netip.MustParseAddr("10.0.0.2"), "10.0.0.0/24")
@@ -445,22 +457,83 @@ func TestOnVPNAddrAssigned_Callback_AddressChange_RecreatesTUN(t *testing.T) {
 		t.Errorf("old TUN should be closed after address change, got %v", err)
 	}
 
-	// The daemon's tunDev reflects the CreateTUN outcome: nil on failure
-	// (this container), or a new device with the new address on a
-	// privileged host.
+	// The daemon's tunDev should now be the new TUN with the new address.
 	d.mu.Lock()
-	newTun := d.tunDev
+	newTunDev := d.tunDev
 	d.mu.Unlock()
-	if newTun != nil {
-		defer newTun.Close()
-		if newTun == existing {
-			t.Errorf("tunDev should not be the old TUN after address change")
-		}
-		if newTun.Addr().Addr() != netip.MustParseAddr("10.0.0.2") {
-			t.Errorf("new TUN address: got %s, want 10.0.0.2", newTun.Addr().Addr())
-		}
+	if newTunDev == nil {
+		t.Fatal("expected new TUN after successful address change")
+	}
+	defer newTunDev.Close()
+	if newTunDev == existing {
+		t.Errorf("tunDev should not be the old TUN after address change")
+	}
+	if newTunDev.Addr().Addr() != netip.MustParseAddr("10.0.0.2") {
+		t.Errorf("new TUN address: got %s, want 10.0.0.2", newTunDev.Addr().Addr())
 	}
 }
+
+// TestOnVPNAddrAssigned_Callback_CreateTUNFailure_KeepsOldTUN tests that
+// when TUN creation fails during an address change, the old TUN is kept
+// open and the daemon continues running with the old address.
+func TestOnVPNAddrAssigned_Callback_CreateTUNFailure_KeepsOldTUN(t *testing.T) {
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	var networkID [16]byte
+	copy(networkID[:], []byte("babe000000000000000000000000cafe"))
+
+	peerTbl := peer.New()
+	conn := newFakeConn()
+
+	cfg := &intconfig.Config{
+		Node: intconfig.NodeConfig{
+			IfaceName: "vel-test",
+			MTU:       1420,
+		},
+	}
+
+	d := New(id, networkID, nil, conn, peerTbl)
+
+	// Pre-populate with a MemTUN at address 10.0.0.1/24.
+	existing := tun.NewMemTUN("vel-test", netip.MustParsePrefix("10.0.0.1/24"), 1420)
+	d.mu.Lock()
+	d.tunDev = existing
+	d.mu.Unlock()
+
+	// Override createTUN to fail for the new address.
+	originalCreateTUN := createTUN
+	createTUN = func(iface string, prefix netip.Prefix, mtu int) (tun.TUN, error) {
+		if prefix.Addr() == netip.MustParseAddr("10.0.0.2") {
+			return nil, &tunErr{"simulated failure"}
+		}
+		return originalCreateTUN(iface, prefix, mtu)
+	}
+	defer func() { createTUN = originalCreateTUN }()
+
+	// Call callback with a DIFFERENT address (10.0.0.2) — creation should fail.
+	cb := d.onVPNAddrAssigned(cfg, conn)
+	cb(netip.MustParseAddr("10.0.0.2"), "10.0.0.0/24")
+
+	// The old TUN must still be open.
+	if _, err := existing.Inject([]byte{0x45}); err != nil {
+		t.Errorf("old TUN should still be open after failed address change, got %v", err)
+	}
+
+	// The daemon's tunDev should still be the old TUN.
+	d.mu.Lock()
+	tunDev := d.tunDev
+	d.mu.Unlock()
+	if tunDev != existing {
+		t.Errorf("tunDev should still be the old TUN after failed address change, got %v", tunDev)
+	}
+}
+
+// tunErr is a simple error type for test injection.
+type tunErr struct{ msg string }
+
+func (e *tunErr) Error() string { return e.msg }
 
 // TestNewMDNSDiscovery_Disabled verifies that mDNS discovery is not
 // constructed when disabled in config, regardless of environment.
@@ -537,6 +610,14 @@ func TestOnVPNAddrAssigned_Callback_WiresMDNS(t *testing.T) {
 	}
 
 	d := New(id, networkID, nil, conn, peerTbl)
+
+	// Override createTUN to succeed so we can test mDNS wiring.
+	originalCreateTUN := createTUN
+	newTun := tun.NewMemTUN("vel-test", netip.MustParsePrefix("10.10.0.1/24"), 1420)
+	createTUN = func(iface string, prefix netip.Prefix, mtu int) (tun.TUN, error) {
+		return newTun, nil
+	}
+	defer func() { createTUN = originalCreateTUN }()
 
 	cb := d.onVPNAddrAssigned(cfg, conn)
 	cb(netip.MustParseAddr("10.10.0.1"), "10.10.0.0/24")
