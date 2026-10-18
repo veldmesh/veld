@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	bolt "go.etcd.io/bbolt"
 	coordcore "github.com/veldmesh/veld/coord/core"
+	bolt "go.etcd.io/bbolt"
 )
 
 // Registry is a bbolt-backed persistent store for networks and peers.
@@ -45,14 +45,14 @@ type networkRecord struct {
 
 // peerRecord is the on-disk representation of a peer.
 type peerRecord struct {
-	ID            string   `json:"id"`    // Ed25519 hex
+	ID            string   `json:"id"` // Ed25519 hex
 	NetworkID     string   `json:"network_id"`
 	Name          string   `json:"name"`
 	VPNAddr       string   `json:"vpn_addr"`
 	Ed25519Public string   `json:"ed25519_public"` // base64
 	X25519Public  string   `json:"x25519_public"`  // base64
 	Endpoint      string   `json:"endpoint"`       // "ip:port"; in-memory only, persisted as ""
-	SubnetRoutes  []string `json:"subnet_routes"` // CIDR prefixes; nil = none
+	SubnetRoutes  []string `json:"subnet_routes"`  // CIDR prefixes; nil = none
 	LastSeen      int64    `json:"last_seen"`      // unix seconds, rounded to the hour on disk
 	RegisteredAt  int64    `json:"registered_at"`
 }

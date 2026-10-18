@@ -16,9 +16,9 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
-	coordcore "github.com/veldmesh/veld/coord/core"
 	"github.com/veldmesh/veld/coord/ce"
+	coordcore "github.com/veldmesh/veld/coord/core"
+	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
 	"github.com/veldmesh/veld/internal/crypto"
 )
 
@@ -38,11 +38,11 @@ func (f *fakeWatchStream) Context() context.Context {
 	return f.ctx
 }
 
-func (f *fakeWatchStream) SetHeader(metadata.MD) error      { return nil }
-func (f *fakeWatchStream) SendHeader(metadata.MD) error     { return nil }
-func (f *fakeWatchStream) SetTrailer(metadata.MD)           {}
-func (f *fakeWatchStream) SendMsg(m interface{}) error      { return nil }
-func (f *fakeWatchStream) RecvMsg(m interface{}) error      { return nil }
+func (f *fakeWatchStream) SetHeader(metadata.MD) error  { return nil }
+func (f *fakeWatchStream) SendHeader(metadata.MD) error { return nil }
+func (f *fakeWatchStream) SetTrailer(metadata.MD)       {}
+func (f *fakeWatchStream) SendMsg(m interface{}) error  { return nil }
+func (f *fakeWatchStream) RecvMsg(m interface{}) error  { return nil }
 
 func newFakeWatchStream() *fakeWatchStream {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1009,10 +1009,10 @@ type scopedFixture struct {
 	netB   string
 	tokenA string
 	tokenB string
-	peerA1 string // peer in netA  (account A)
-	peerA2 string // peer in netA  (account A)
-	peerA3 string // peer in netA2 (account A)
-	peerB1 string // peer in netB  (account B)
+	peerA1 string           // peer in netA  (account A)
+	peerA2 string           // peer in netA  (account A)
+	peerA3 string           // peer in netA2 (account A)
+	peerB1 string           // peer in netB  (account B)
 	idA1   *crypto.Identity // identity behind peerA1
 
 	// newPeerID carries the peer ID registered by the most recent call
@@ -1697,6 +1697,7 @@ func TestServer_Register_TimestampWindowEdge(t *testing.T) {
 		t.Errorf("VPN address: got %q, want 10.99.0.1", resp.VpnAddr)
 	}
 }
+
 // TestServer_Register_UniformAuthError verifies that the client-visible
 // error message is identical for different signature verification failures
 // (stale timestamp vs bad signature) to avoid leaking which check failed or

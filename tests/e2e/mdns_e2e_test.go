@@ -31,7 +31,19 @@ func TestMDNS_StartStop(t *testing.T) {
 
 	disc.Start()
 	time.Sleep(50 * time.Millisecond)
-	disc.Stop() // must not hang or panic
+
+	// Stop with a timeout to avoid hanging on platforms where mDNS shutdown
+	// may block (e.g., Windows multicast socket cleanup).
+	stopped := make(chan struct{})
+	go func() {
+		disc.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("disc.Stop() timed out")
+	}
 }
 
 // TestMDNS_NilCallbackSafe verifies that a nil onPeer callback does not panic.
@@ -50,5 +62,17 @@ func TestMDNS_NilCallbackSafe(t *testing.T) {
 		t.Skipf("mdns.New: %v", err)
 	}
 	disc.Start()
-	disc.Stop()
+
+	// Stop with a timeout to avoid hanging on platforms where mDNS shutdown
+	// may block (e.g., Windows multicast socket cleanup).
+	stopped := make(chan struct{})
+	go func() {
+		disc.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("disc.Stop() timed out")
+	}
 }

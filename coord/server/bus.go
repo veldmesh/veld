@@ -45,8 +45,8 @@ type pendingSignal struct {
 type Bus struct {
 	mu          sync.RWMutex
 	subscribers map[string][]chan *coordv1.PeerEvent // key: networkID
-	signals     map[string][]chan signalMsg           // key: peerID (recipient)
-	pending     map[string][]pendingSignal            // key: peerID (recipient, not subscribed yet)
+	signals     map[string][]chan signalMsg          // key: peerID (recipient)
+	pending     map[string][]pendingSignal           // key: peerID (recipient, not subscribed yet)
 	now         func() time.Time
 }
 

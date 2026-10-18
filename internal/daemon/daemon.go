@@ -30,6 +30,10 @@ import (
 	"github.com/veldmesh/veld/internal/tun"
 )
 
+// createTUN is the function used to create a TUN device. It is a package-level
+// variable so tests can inject a failing implementation.
+var createTUN = tun.CreateTUN
+
 // Daemon wires together TUN, UDP conn, peer table, dispatcher, handshake manager,
 // optional coord client, optional NAT manager, and IPC server.
 type Daemon struct {
@@ -132,7 +136,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	// If running in static mode (no coord), create TUN now
 	if cfg.Coord.Addr == "" {
 		if vpnPrefix.IsValid() {
-			tunDev, err = tun.CreateTUN(resolveIfaceName(cfg), vpnPrefix, resolveTunMTU(cfg))
+			tunDev, err = createTUN(resolveIfaceName(cfg), vpnPrefix, resolveTunMTU(cfg))
 			if err != nil {
 				return nil, fmt.Errorf("create tun: %w", err)
 			}
@@ -432,15 +436,31 @@ func (d *Daemon) onVPNAddrAssigned(cfg *intconfig.Config, conn net.PacketConn) f
 
 		prefix := deriveMeshPrefix(vpnAddr, networkCIDR)
 
+		// Create the new TUN first. If creation fails, keep the old TUN
+		// running (the old address keeps working until the next re-registration).
+		newTun, err := createTUN(resolveIfaceName(cfg), prefix, resolveTunMTU(cfg))
+		if err != nil {
+			log.Printf("warning: failed to create TUN in coord mode: %v (data plane disabled)", err)
+			if existing != nil {
+				// Address change failed: the old TUN is still running with
+				// the old address. Report that address instead of the new
+				// coordinator-assigned one to avoid IPC status discrepancy.
+				d.mu.Lock()
+				d.vpnAddr = existing.Addr().Addr()
+				d.mu.Unlock()
+			}
+			d.updateIPCStatus()
+			return
+		}
+
+		// Wire the new TUN into the dispatcher before closing the old one.
+		d.disp.SetTUN(newTun)
+
 		if existing != nil {
-			// Address changed on re-registration: drop the old TUN and
-			// recreate with the new address.
+			// Address changed on re-registration: drop the old TUN.
 			log.Printf("coord re-assigned VPN address %s (was %s); recreating TUN",
 				vpnAddr, existing.Addr().Addr())
 			_ = existing.Close()
-			d.mu.Lock()
-			d.tunDev = nil
-			d.mu.Unlock()
 		}
 		if oldDisco != nil {
 			// The old advertisement names a stale VPN address; drop it so
@@ -451,21 +471,9 @@ func (d *Daemon) onVPNAddrAssigned(cfg *intconfig.Config, conn net.PacketConn) f
 			d.mu.Unlock()
 		}
 
-		tunDev, err := tun.CreateTUN(resolveIfaceName(cfg), prefix, resolveTunMTU(cfg))
-		if err != nil {
-			log.Printf("warning: failed to create TUN in coord mode: %v (data plane disabled)", err)
-			// The coordinator still assigned a valid VPN address, so
-			// surface it in veld status even without a data plane.
-			d.updateIPCStatus()
-			return
-		}
-
 		d.mu.Lock()
-		d.tunDev = tunDev
+		d.tunDev = newTun
 		d.mu.Unlock()
-
-		// Wire the new TUN into the dispatcher.
-		d.disp.SetTUN(tunDev)
 
 		// Now that we have a VPN address, start mDNS LAN discovery: it was
 		// not wired at construction time since coord mode has no address
@@ -583,8 +591,8 @@ func (d *Daemon) Start() {
 
 // Stop signals all components to exit.
 func (d *Daemon) Stop() {
-	// disp.Stop() already closes the TUN (it's the same device wired in via
-	// SetTUN/New); just drop our reference here, don't close it again.
+	// The dispatcher owns the TUN once SetTUN/Start has it. Daemon.Stop()
+	// only nils its reference; it does not close the TUN again.
 	d.disp.Stop()
 	d.mu.Lock()
 	proxies := d.relayProxies
@@ -629,10 +637,15 @@ func (d *Daemon) updateIPCStatus() {
 	vpnAddr := d.vpnAddr
 	peerID := d.peerID
 	coordAddr := d.coordAddr
+	tun := d.tunDev
 	d.mu.Unlock()
 
-	// If coord is running, get the assigned VPN address
-	if d.coordCli != nil {
+	// Prefer the actual data-plane TUN address if available. This avoids
+	// reporting a coordinator-assigned address when the TUN creation for
+	// that address failed (e.g., during a failed address change).
+	if tun != nil {
+		vpnAddr = tun.Addr().Addr()
+	} else if d.coordCli != nil {
 		vpnAddr = d.coordCli.VPNAddr()
 		peerID = d.coordCli.PeerID()
 	}
