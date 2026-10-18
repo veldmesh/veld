@@ -5,6 +5,7 @@ package mdns
 import (
 	"encoding/base64"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"strings"
@@ -93,10 +94,26 @@ func (d *Discovery) Start() {
 // Stop shuts down the mDNS advertisement server and the browse loop.
 // Shutting down the server first interrupts any ongoing query, making
 // shutdown faster and more reliable on platforms where Query may block.
+// A timeout guards against platforms where multicast socket cleanup may
+// block indefinitely (e.g., Windows).
 func (d *Discovery) Stop() {
 	_ = d.server.Shutdown()
 	close(d.stopCh)
-	d.wg.Wait()
+
+	// Wait for the browse loop with a timeout to avoid hanging on
+	// platforms where multicast socket cleanup may block.
+	done := make(chan struct{})
+	go func() {
+		d.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		// Log and continue; the browse loop will exit when the query
+		// timeout fires or the socket is closed by the OS.
+		log.Printf("warning: mDNS browse loop did not exit within timeout")
+	}
 }
 
 func (d *Discovery) browseLoop() {
