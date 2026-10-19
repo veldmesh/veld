@@ -202,3 +202,70 @@ func TestBus_DropPendingSignals(t *testing.T) {
 	default:
 	}
 }
+
+func TestBus_PublishUnsubscribeRace(t *testing.T) {
+	bus := NewBus()
+	const iterations = 1000
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < iterations; i++ {
+			ch := bus.Subscribe("net1")
+			bus.Unsubscribe("net1", ch)
+		}
+		close(done)
+	}()
+
+	event := &coordv1.PeerEvent{
+		Type: coordv1.EventType_JOIN,
+		Peer: &coordv1.Peer{Id: "peer1", Name: "Test Peer"},
+	}
+
+	for i := 0; i < iterations; i++ {
+		bus.Publish("net1", event)
+	}
+
+	<-done
+}
+
+func TestBus_SendSignalUnsubscribeSignalsRace(t *testing.T) {
+	bus := NewBus()
+	const iterations = 1000
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < iterations; i++ {
+			ch := bus.SubscribeSignals("peer1")
+			bus.UnsubscribeSignals("peer1", ch)
+		}
+		close(done)
+	}()
+
+	payload := []byte("test signal")
+	for i := 0; i < iterations; i++ {
+		bus.SendSignal("peer2", "peer1", payload, false)
+	}
+
+	<-done
+}
+
+func TestBus_SendSignalRLockUpgradeRace(t *testing.T) {
+	bus := NewBus()
+	const iterations = 500
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < iterations; i++ {
+			ch := bus.SubscribeSignals("peer1")
+			bus.UnsubscribeSignals("peer1", ch)
+		}
+		close(done)
+	}()
+
+	payload := []byte("test signal")
+	for i := 0; i < iterations; i++ {
+		bus.SendSignal("peer2", "peer1", payload, true)
+	}
+
+	<-done
+}
