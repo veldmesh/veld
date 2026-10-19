@@ -12,9 +12,30 @@ import (
 	"github.com/veldmesh/veld/internal/tun"
 )
 
+// hasTunDevice reports whether the kernel TUN device exists. Privileged
+// containers can run as root yet lack /dev/net/tun, in which case device
+// creation cannot work and the test must skip rather than fail.
+func hasTunDevice() bool {
+	_, err := os.Stat("/dev/net/tun")
+	return err == nil
+}
+
+// TestDefaultIfaceName_Linux pins the default Linux TUN name. "veld0" is a
+// dedicated name: TUNSETIFF with an already-taken name (OpenVPN's tun0)
+// fails with EEXIST, and the name must not match the generic tun|tap|utun|wg
+// patterns so self-exclusion in VPN detection stays trivial.
+func TestDefaultIfaceName_Linux(t *testing.T) {
+	if got := tun.DefaultIfaceName(); got != "veld0" {
+		t.Errorf("DefaultIfaceName() = %q, want veld0", got)
+	}
+}
+
 func TestCreateTUN_Linux(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("requires root (CAP_NET_ADMIN)")
+	}
+	if !hasTunDevice() {
+		t.Skip("requires /dev/net/tun")
 	}
 
 	prefix, err := netip.ParsePrefix("10.100.99.1/24")
@@ -42,6 +63,9 @@ func TestCreateTUN_Linux(t *testing.T) {
 func TestCreateTUN_Linux_WriteRead(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("requires root (CAP_NET_ADMIN)")
+	}
+	if !hasTunDevice() {
+		t.Skip("requires /dev/net/tun")
 	}
 
 	prefix, err := netip.ParsePrefix("10.100.98.1/24")
