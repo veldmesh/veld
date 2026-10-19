@@ -526,12 +526,12 @@ func deriveMeshPrefix(vpnAddr netip.Addr, networkCIDR string) netip.Prefix {
 		log.Printf("warning: coordinator did not provide network_cidr; assuming /24")
 		return netip.PrefixFrom(vpnAddr, 24)
 	}
-	_, err := netip.ParsePrefix(networkCIDR)
+	netCIDR, err := netip.ParsePrefix(networkCIDR)
 	if err != nil {
 		log.Printf("warning: invalid network_cidr from coord %q: %v; falling back to /24", networkCIDR, err)
 		return netip.PrefixFrom(vpnAddr, 24)
 	}
-	return netip.PrefixFrom(vpnAddr, 24)
+	return netip.PrefixFrom(vpnAddr, netCIDR.Bits())
 }
 
 // selfInterface returns the name of veld's own TUN interface, or "" while

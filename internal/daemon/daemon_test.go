@@ -388,6 +388,18 @@ func TestDeriveMeshPrefix_CIDRFromServer(t *testing.T) {
 	}
 }
 
+// TestDeriveMeshPrefix_Non24CIDRFromServer tests that a non-/24 server-
+// provided network CIDR (e.g., /16) is respected — the TUN prefix length
+// must match the server CIDR, not fall back to /24.
+func TestDeriveMeshPrefix_Non24CIDRFromServer(t *testing.T) {
+	vpnAddr := netip.MustParseAddr("10.50.5.5")
+	prefix := deriveMeshPrefix(vpnAddr, "10.50.0.0/16")
+	want := netip.PrefixFrom(vpnAddr, 16)
+	if prefix != want {
+		t.Errorf("deriveMeshPrefix: got %s, want %s (server CIDR /16 must be honored)", prefix, want)
+	}
+}
+
 // TestDeriveMeshPrefix_MissingCIDRFallback tests that when the server
 // does not provide a network CIDR, the prefix falls back to /24.
 func TestDeriveMeshPrefix_MissingCIDRFallback(t *testing.T) {
