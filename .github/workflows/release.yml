@@ -139,14 +139,15 @@ jobs:
           OUTDIR="${{ steps.vars.outputs.outdir }}"
           EXT="${{ steps.vars.outputs.ext }}"
           if [ "${{ matrix.goos }}" = "windows" ]; then
-            (cd "$OUTDIR" && zip -q "../veld-${{ github.ref_name }}-${PLATFORM}.zip" \
-              "veld${EXT}" "veld-daemon${EXT}" "veld-coord${EXT}" \
-              wintun.dll wintun-LICENSE.txt)
+            zip -q "$GITHUB_WORKSPACE/veld-${{ github.ref_name }}-${PLATFORM}.zip" \
+              -j "$OUTDIR/veld${EXT}" "$OUTDIR/veld-daemon${EXT}" "$OUTDIR/veld-coord${EXT}" \
+              "$OUTDIR/wintun.dll" "$OUTDIR/wintun-LICENSE.txt"
           else
             tar -czf "veld-${{ github.ref_name }}-${PLATFORM}.tar.gz" \
               -C "$OUTDIR" \
               "veld${EXT}" "veld-daemon${EXT}" "veld-coord${EXT}"
           fi
+          test -f "veld-${{ github.ref_name }}-${PLATFORM}.${{ steps.vars.outputs.archive_ext }}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -157,6 +158,7 @@ jobs:
             ${{ steps.vars.outputs.outdir }}/sbom.spdx.json
             ${{ steps.vars.outputs.outdir }}/*.bundle
           retention-days: 1
+          if-no-files-found: error
 
   release:
     name: Create GitHub Release
