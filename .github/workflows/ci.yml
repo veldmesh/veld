@@ -9,6 +9,29 @@ permissions:
   contents: read
 
 jobs:
+  toolchain-check:
+    name: Check Go toolchain >= 1.26.10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: true
+      - name: Verify toolchain version
+        run: |
+          # go version reports the toolchain in use (e.g. "go version go1.26.10 linux/amd64")
+          VERSION=$(go version | awk '{print $3}' | sed 's/go//')
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
+          if [ "$MAJOR" -lt 1 ] || [ "$MINOR" -lt 26 ] || { [ "$MAJOR" -eq 1 ] && [ "$MINOR" -eq 26 ] && [ "$PATCH" -lt 10 ]; }; then
+            echo "::error::Go toolchain $VERSION is below required minimum 1.26.10"
+            exit 1
+          fi
+          echo "Go toolchain $VERSION meets minimum 1.26.10"
+
   test:
     name: Test & Vet (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

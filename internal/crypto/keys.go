@@ -65,7 +65,63 @@ func Generate() (*Identity, error) {
 		X25519Sig:      sigArray,
 	}
 
+	// Self-test: verify the generated identity is internally consistent
+	if err := id.selfTest(); err != nil {
+		return nil, fmt.Errorf("identity self-test failed: %w", err)
+	}
+
 	return id, nil
+}
+
+// selfTest validates the generated identity is internally consistent.
+// This mirrors the checks in config.Load() and catches any RNG or logic bugs.
+func (id *Identity) selfTest() error {
+	// 1. Ed25519 private key must be the correct size
+	if len(id.Ed25519Private) != ed25519.PrivateKeySize {
+		return fmt.Errorf("Ed25519 private key size mismatch: got %d, want %d", len(id.Ed25519Private), ed25519.PrivateKeySize)
+	}
+
+	// 2. Ed25519 public key must match the private key
+	if !id.Ed25519Public.Equal(id.Ed25519Private.Public().(ed25519.PublicKey)) {
+		return fmt.Errorf("Ed25519 public key does not match private key")
+	}
+
+	// 3. Ed25519 sign/verify self-test
+	testMsg := []byte("veld-keystore-self-test")
+	sig := ed25519.Sign(id.Ed25519Private, testMsg)
+	if !ed25519.Verify(id.Ed25519Public, testMsg, sig) {
+		return fmt.Errorf("Ed25519 sign/verify self-test failed")
+	}
+
+	// 4. X25519 private key must not be all zeros
+	allZero := true
+	for _, b := range id.X25519Private {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return fmt.Errorf("X25519 private key is all zeros")
+	}
+
+	// 5. X25519 public key must derive correctly from private key
+	derivedPub, err := curve25519.X25519(id.X25519Private[:], curve25519.Basepoint)
+	if err != nil {
+		return fmt.Errorf("failed to derive X25519 public key: %w", err)
+	}
+	var derivedPubArray [32]byte
+	copy(derivedPubArray[:], derivedPub)
+	if derivedPubArray != id.X25519Public {
+		return fmt.Errorf("X25519 public key does not match private key derivation")
+	}
+
+	// 6. X25519Sig must be a valid Ed25519 signature over X25519Public
+	if !ed25519.Verify(id.Ed25519Public, id.X25519Public[:], id.X25519Sig[:]) {
+		return fmt.Errorf("X25519Sig is not a valid Ed25519 signature over X25519Public")
+	}
+
+	return nil
 }
 
 // Fingerprint returns a hex-encoded SHA-256 of the Ed25519 public key.

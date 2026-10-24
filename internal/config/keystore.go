@@ -72,8 +72,21 @@ func Load(path string) (*crypto.Identity, error) {
 		return nil, fmt.Errorf("failed to decode Ed25519 private key: %w", err)
 	}
 
+	// Validate Ed25519 private key length (must be 64 bytes = seed + public)
+	if len(ed25519PrivBytes) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("invalid Ed25519 private key length: got %d, want %d", len(ed25519PrivBytes), ed25519.PrivateKeySize)
+	}
+
 	ed25519Priv := ed25519.PrivateKey(ed25519PrivBytes)
 	ed25519Pub := ed25519Priv.Public().(ed25519.PublicKey)
+
+	// Self-test: sign/verify with the loaded Ed25519 key
+	// This validates that the seed (first 32 bytes) correctly derives the public key (last 32 bytes)
+	testMsg := []byte("veld-keystore-self-test")
+	sig := ed25519.Sign(ed25519Priv, testMsg)
+	if !ed25519.Verify(ed25519Pub, testMsg, sig) {
+		return nil, fmt.Errorf("Ed25519 sign/verify self-test failed: seed does not match public key")
+	}
 
 	// Decode X25519 private key
 	x25519PrivBytes, err := base64.StdEncoding.DecodeString(ksf.X25519Private)
@@ -87,6 +100,11 @@ func Load(path string) (*crypto.Identity, error) {
 
 	var x25519Priv [32]byte
 	copy(x25519Priv[:], x25519PrivBytes)
+
+	// Reject all-zero X25519 private key
+	if isAllZero(x25519Priv[:]) {
+		return nil, fmt.Errorf("X25519 private key is all zeros")
+	}
 
 	// Derive X25519 public key
 	x25519PubBytes, err := curve25519.X25519(x25519Priv[:], curve25519.Basepoint)
@@ -112,6 +130,16 @@ func Load(path string) (*crypto.Identity, error) {
 	}
 
 	return id, nil
+}
+
+// isAllZero returns true if all bytes in the slice are zero.
+func isAllZero(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // Save serialises and writes an identity to path (creates parent dirs, mode 0600).
