@@ -128,11 +128,15 @@ Run `veld-daemon` from an elevated terminal (Run as administrator): creating the
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design: crypto stack, handshake format, packet format, extension point interfaces, and NAT traversal flow.
 
+### Coord TLS and the host CA store
+
+The daemon's gRPC connection to the coordination server uses standard TLS and verifies the server certificate against the **host's system CA store** (not an embedded bundle). This means hosts — including OpenWrt routers — must have a current `ca-certificates` package installed. After industry-wide distrust of weak CA keys (e.g. the eMudhra roots removed by Go 1.26.10, Mozilla NSS, and major distros), stale trust stores can cause spurious TLS failures or, worse, accept distrusted roots. On OpenWrt, run `opkg update && opkg upgrade ca-certificates` to stay current.
+
 ---
 
 ## Building from source
 
-**Prerequisites:** Go 1.22+, `protoc`, `protoc-gen-go`, `protoc-gen-go-grpc`
+**Prerequisites:** Go 1.26.10+, `protoc`, `protoc-gen-go`, `protoc-gen-go-grpc`
 
 ```sh
 make proto      # regenerate gen/ from proto/
