@@ -3,9 +3,9 @@ CLAUDE.md
 .claude/
 
 # Binaries
-./veld-daemon
-./veld-coord
-./veld
+/veld
+/veld-coord
+/veld-daemon
 *.exe
 
 # Build output

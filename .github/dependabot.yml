@@ -1,0 +1,31 @@
+# Dependabot configuration for automated dependency updates
+# This keeps the Docker base image and GitHub Actions up to date.
+
+version: 2
+updates:
+  # Docker base image (golang) - check weekly for new patches
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+    labels:
+      - "dependencies"
+      - "docker"
+    # Pin to golang:1.26.x - only patch updates within 1.26
+    allow:
+      - dependency-type: "direct"
+        dependency-name: "golang"
+        update-type: "version-update:semver-patch"
+
+  # GitHub Actions - check weekly for updates to pinned actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+    labels:
+      - "dependencies"
+      - "github-actions"

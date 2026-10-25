@@ -222,3 +222,117 @@ func TestX25519SigBinding(t *testing.T) {
 	}
 }
 
+// TestIdentitySelfTest verifies that Generate() produces an identity
+// that passes the internal selfTest() checks.
+func TestIdentitySelfTest(t *testing.T) {
+	for i := 0; i < 10; i++ {
+		id, err := Generate()
+		if err != nil {
+			t.Fatalf("iteration %d: Generate failed: %v", i, err)
+		}
+
+		// The selfTest is called internally by Generate, but we can also
+		// call it explicitly to verify the identity is valid
+		if err := id.selfTest(); err != nil {
+			t.Errorf("iteration %d: selfTest failed: %v", i, err)
+		}
+	}
+}
+
+// TestIdentitySelfTest_Ed25519Size checks that selfTest catches wrong Ed25519 key size.
+func TestIdentitySelfTest_Ed25519Size(t *testing.T) {
+	id, err := Generate()
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	// Corrupt Ed25519 private key size
+	id.Ed25519Private = id.Ed25519Private[:32] // too short
+
+	err = id.selfTest()
+	if err == nil {
+		t.Error("selfTest should have failed with short Ed25519 private key")
+	}
+}
+
+// TestIdentitySelfTest_Ed25519Mismatch checks that selfTest catches Ed25519 public/private mismatch.
+func TestIdentitySelfTest_Ed25519Mismatch(t *testing.T) {
+	id, err := Generate()
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	// Corrupt Ed25519 public key
+	id.Ed25519Public[0] ^= 0xFF
+
+	err = id.selfTest()
+	if err == nil {
+		t.Error("selfTest should have failed with mismatched Ed25519 public key")
+	}
+}
+
+// TestIdentitySelfTest_Ed25519SignVerify checks that selfTest catches Ed25519 sign/verify failure.
+func TestIdentitySelfTest_Ed25519SignVerify(t *testing.T) {
+	id, err := Generate()
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	// Corrupt Ed25519 private key (but keep size correct)
+	id.Ed25519Private[0] ^= 0xFF
+
+	err = id.selfTest()
+	if err == nil {
+		t.Error("selfTest should have failed with corrupted Ed25519 private key")
+	}
+}
+
+// TestIdentitySelfTest_X25519AllZero checks that selfTest catches all-zero X25519 private key.
+func TestIdentitySelfTest_X25519AllZero(t *testing.T) {
+	id, err := Generate()
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	// Set X25519 private key to all zeros
+	for i := range id.X25519Private {
+		id.X25519Private[i] = 0
+	}
+
+	err = id.selfTest()
+	if err == nil {
+		t.Error("selfTest should have failed with all-zero X25519 private key")
+	}
+}
+
+// TestIdentitySelfTest_X25519Derivation checks that selfTest catches X25519 public/private mismatch.
+func TestIdentitySelfTest_X25519Derivation(t *testing.T) {
+	id, err := Generate()
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	// Corrupt X25519 public key
+	id.X25519Public[0] ^= 0xFF
+
+	err = id.selfTest()
+	if err == nil {
+		t.Error("selfTest should have failed with mismatched X25519 public key")
+	}
+}
+
+// TestIdentitySelfTest_X25519Sig checks that selfTest catches invalid X25519Sig.
+func TestIdentitySelfTest_X25519Sig(t *testing.T) {
+	id, err := Generate()
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	// Corrupt X25519Sig
+	id.X25519Sig[0] ^= 0xFF
+
+	err = id.selfTest()
+	if err == nil {
+		t.Error("selfTest should have failed with corrupted X25519Sig")
+	}
+}
