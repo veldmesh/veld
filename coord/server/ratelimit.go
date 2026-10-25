@@ -5,6 +5,8 @@ package server
 import (
 	"context"
 	"net"
+	"net/netip"
+	"sort"
 	"sync"
 	"time"
 
@@ -14,8 +16,14 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const (
+	// maxRateLimiterEntries caps the number of tracked IPs to prevent unbounded growth.
+	maxRateLimiterEntries = 10000
+)
+
 // IPRateLimiter limits requests per source IP using a token-bucket algorithm.
-// Stale entries are pruned every 10 minutes so the map stays bounded.
+// IPv6 addresses are aggregated by /64 prefix. Stale entries are pruned every
+// 10 minutes and the map size is capped at maxRateLimiterEntries.
 type IPRateLimiter struct {
 	mu      sync.Mutex
 	entries map[string]*ipBucket
@@ -29,7 +37,7 @@ type ipBucket struct {
 }
 
 // NewIPRateLimiter creates a limiter allowing burst requests immediately and
-// then ratePerSec requests per second, tracked per source IP.
+// then ratePerSec requests per second, tracked per source IP (with IPv6 /64 aggregation).
 func NewIPRateLimiter(ratePerSec, burst float64) *IPRateLimiter {
 	rl := &IPRateLimiter{
 		entries: make(map[string]*ipBucket),
@@ -40,14 +48,35 @@ func NewIPRateLimiter(ratePerSec, burst float64) *IPRateLimiter {
 	return rl
 }
 
+// normalizeIP aggregates IPv6 addresses to their /64 prefix.
+// IPv4 addresses are used as-is.
+func normalizeIP(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip // fallback: use as-is
+	}
+	if addr.Is6() {
+		// Mask to /64 by creating a /64 prefix and getting its address.
+		prefix := netip.PrefixFrom(addr, 64)
+		return prefix.Masked().String()
+	}
+	return addr.String()
+}
+
 // Allow returns true when the IP is within its rate limit.
 func (rl *IPRateLimiter) Allow(ip string) bool {
+	normIP := normalizeIP(ip)
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	now := time.Now()
-	b, ok := rl.entries[ip]
+	b, ok := rl.entries[normIP]
 	if !ok {
-		rl.entries[ip] = &ipBucket{tokens: rl.burst - 1, lastFill: now}
+		// Cap the map size: if at capacity, evict a random stale entry.
+		// We use a simple strategy: if at capacity, clear 10% of oldest entries.
+		if len(rl.entries) >= maxRateLimiterEntries {
+			rl.evictOldest(now, maxRateLimiterEntries/10)
+		}
+		rl.entries[normIP] = &ipBucket{tokens: rl.burst - 1, lastFill: now}
 		return true
 	}
 	b.tokens += now.Sub(b.lastFill).Seconds() * rl.rate
@@ -62,6 +91,30 @@ func (rl *IPRateLimiter) Allow(ip string) bool {
 	return false
 }
 
+// evictOldest removes up to n oldest entries (called with lock held).
+func (rl *IPRateLimiter) evictOldest(now time.Time, n int) {
+	if n <= 0 || len(rl.entries) == 0 {
+		return
+	}
+	// Find the n oldest entries by lastFill time.
+	type entry struct {
+		key string
+		t   time.Time
+	}
+	oldest := make([]entry, 0, len(rl.entries))
+	for k, b := range rl.entries {
+		oldest = append(oldest, entry{key: k, t: b.lastFill})
+	}
+	// Sort by time (oldest first)
+	sort.Slice(oldest, func(i, j int) bool {
+		return oldest[i].t.Before(oldest[j].t)
+	})
+	// Remove up to n oldest
+	for i := 0; i < n && i < len(oldest); i++ {
+		delete(rl.entries, oldest[i].key)
+	}
+}
+
 func (rl *IPRateLimiter) gc() {
 	t := time.NewTicker(10 * time.Minute)
 	defer t.Stop()
@@ -72,6 +125,10 @@ func (rl *IPRateLimiter) gc() {
 			if b.lastFill.Before(cutoff) {
 				delete(rl.entries, ip)
 			}
+		}
+		// Hard cap: if still over limit after GC, evict oldest.
+		if len(rl.entries) > maxRateLimiterEntries {
+			rl.evictOldest(time.Now(), len(rl.entries)-maxRateLimiterEntries)
 		}
 		rl.mu.Unlock()
 	}

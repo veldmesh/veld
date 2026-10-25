@@ -188,3 +188,45 @@ func TestSession_ID(t *testing.T) {
 		t.Errorf("session IDs don't match: initiator %v, responder %v", idA, idB)
 	}
 }
+
+func TestSession_RekeyTimeLimit(t *testing.T) {
+	sA, _ := newTestSessionPair(t)
+
+	// Fresh session should not need rekey.
+	if sA.NeedsRekey() {
+		t.Error("fresh session should not need rekey")
+	}
+
+	// Simulate an old session by setting createdAt to the past (lowered threshold for testing).
+	sA.createdAt = time.Now().Add(-RekeyTimeLimit - time.Second)
+
+	// Old session should need rekey.
+	if !sA.NeedsRekey() {
+		t.Error("session older than RekeyTimeLimit should need rekey")
+	}
+}
+
+func TestSession_NeedsRekey_NonceThreshold(t *testing.T) {
+	sA, _ := newTestSessionPair(t)
+
+	// Fresh session should not need rekey.
+	if sA.NeedsRekey() {
+		t.Error("fresh session should not need rekey")
+	}
+
+	// Set sendNonce to just below the threshold.
+	sA.sendNonce = RekeyThreshold - 1
+
+	// Should not need rekey yet.
+	if sA.NeedsRekey() {
+		t.Error("session at threshold-1 should not need rekey yet")
+	}
+
+	// Set sendNonce to the threshold.
+	sA.sendNonce = RekeyThreshold
+
+	// Should need rekey.
+	if !sA.NeedsRekey() {
+		t.Error("session at nonce threshold should need rekey")
+	}
+}

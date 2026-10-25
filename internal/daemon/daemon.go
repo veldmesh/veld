@@ -71,6 +71,7 @@ func New(
 	hsMgr := handshake.New(localID, networkID, peerTbl, conn)
 
 	disp.OnHandshakeRequired = hsMgr.Initiate
+	disp.OnRekeyRequired = hsMgr.Initiate
 	disp.OnHandshakePacket = hsMgr.HandlePacket
 	hsMgr.OnSessionEstablished = disp.FlushHoldQueue
 

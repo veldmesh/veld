@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"math/rand/v2"
 	"net/netip"
 	"sync"
 	"time"
@@ -42,7 +43,7 @@ type Config struct {
 
 // Client maintains a live connection to the coord server, registers the local
 // daemon, and keeps the peer table in sync with Join/Leave/EndpointUpdate events.
-// Reconnects automatically with exponential backoff on transient errors.
+// Reconnects automatically with exponential backoff and jitter on transient errors.
 type Client struct {
 	cfg Config
 
@@ -175,10 +176,12 @@ func (c *Client) run(ctx context.Context) {
 		if err := c.registerAndWatch(ctx, gc); err == nil {
 			break // nil means ctx was cancelled — normal shutdown
 		}
-		// Transient error: wait then retry.
+		// Transient error: wait with jitter then retry.
+		// Use full jitter: random value in [0, backoff].
+		jitter := time.Duration(rand.Float64() * float64(backoff))
 		select {
 		case <-ctx.Done():
-		case <-time.After(backoff):
+		case <-time.After(jitter):
 		}
 		if backoff < retryMax {
 			backoff *= 2

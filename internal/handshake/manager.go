@@ -22,9 +22,18 @@ const (
 	headerSize               = 16 // same as dataplane.HeaderSize
 )
 
+// handshakeRetryTimeout is the time after which a pending handshake is considered
+// expired and a new one may be initiated. Matches WireGuard's REKEY_TIMEOUT.
+const handshakeRetryTimeout = 5 * time.Second
+
+// maxHandshakeRetries bounds the number of retries for a single handshake attempt.
+const maxHandshakeRetries = 3
+
 type pendingHS struct {
-	hs     *crypto.InitiatorHS
-	peerID [32]byte
+	hs         *crypto.InitiatorHS
+	peerID     [32]byte
+	createdAt  time.Time
+	retries    int
 }
 
 // Manager handles Noise IK handshake initiation and response over a shared UDP conn.
@@ -40,10 +49,14 @@ type Manager struct {
 	OnSessionEstablished func(entry *peer.Entry)
 
 	// TOFUCheck is called after each successful handshake to enforce Trust-On-First-Use
-	// fingerprint pinning. peerKey is the peer's VPN address string; pub is the Ed25519
+	// fingerprint pinning. vpnAddr is the peer's VPN address string; pub is the Ed25519
 	// public key seen in the handshake. If TOFUCheck returns an error the session is
 	// silently discarded. If nil, TOFU pinning is disabled.
-	TOFUCheck func(peerKey string, pub ed25519.PublicKey) error
+	TOFUCheck func(vpnAddr string, pub ed25519.PublicKey) error
+
+	// initTimestamps tracks the greatest accepted Init timestamp per peer ID.
+	// Used to reject replayed handshake initiations.
+	initTimestamps map[[32]byte]int64
 
 	mu      sync.Mutex
 	pending map[[32]byte]*pendingHS
@@ -52,29 +65,45 @@ type Manager struct {
 // New creates a Manager.
 func New(localID *crypto.Identity, networkID [16]byte, peers *peer.Table, conn net.PacketConn) *Manager {
 	return &Manager{
-		localID:   localID,
-		networkID: networkID,
-		peers:     peers,
-		conn:      conn,
-		pending:   make(map[[32]byte]*pendingHS),
+		localID:        localID,
+		networkID:      networkID,
+		peers:          peers,
+		conn:           conn,
+		pending:        make(map[[32]byte]*pendingHS),
+		initTimestamps: make(map[[32]byte]int64),
 	}
 }
 
-// Initiate starts a Noise IK handshake with entry if none is already pending.
+// Initiate starts a Noise IK handshake with entry if none is already pending,
+// or if the pending handshake has expired (older than handshakeRetryTimeout).
 // This is wired as dispatcher.OnHandshakeRequired.
 func (m *Manager) Initiate(entry *peer.Entry) {
 	m.mu.Lock()
-	if _, exists := m.pending[entry.ID]; exists {
-		m.mu.Unlock()
-		return
+	phs, exists := m.pending[entry.ID]
+	if exists {
+		if time.Since(phs.createdAt) < handshakeRetryTimeout {
+			m.mu.Unlock()
+			return
+		}
+		// Expired: allow retry, but bound total retries.
+		if phs.retries >= maxHandshakeRetries {
+			m.mu.Unlock()
+			return
+		}
+		phs.retries++
+		phs.createdAt = time.Now()
 	}
 
 	hs, err := crypto.NewInitiatorHS(m.localID, entry.X25519Pub, m.networkID)
 	if err != nil {
+		if exists {
+			// Restore previous state on failure.
+			phs.retries--
+		}
 		m.mu.Unlock()
 		return
 	}
-	m.pending[entry.ID] = &pendingHS{hs: hs, peerID: entry.ID}
+	m.pending[entry.ID] = &pendingHS{hs: hs, peerID: entry.ID, createdAt: time.Now(), retries: 0}
 	m.mu.Unlock()
 
 	entry.SetState(peer.StateHandshaking)
@@ -137,6 +166,21 @@ func (m *Manager) handleInit(noiseMsg []byte, addr net.Addr) {
 	if !ok {
 		return
 	}
+
+	// Replay protection: reject Init if its timestamp is not strictly greater
+	// than the greatest timestamp we've accepted from this peer.
+	// The timestamp is at payload offset 112 (8 bytes, big-endian uint64 seconds).
+	ts := extractInitTimestamp(noiseMsg)
+	if ts == 0 {
+		return // malformed
+	}
+	m.mu.Lock()
+	if lastTS, ok := m.initTimestamps[peerID]; ok && ts <= lastTS {
+		m.mu.Unlock()
+		return // replayed or stale Init
+	}
+	m.initTimestamps[peerID] = ts
+	m.mu.Unlock()
 
 	// TOFU check: verify the initiator's fingerprint matches prior connections.
 	if m.TOFUCheck != nil {
@@ -205,6 +249,19 @@ func (m *Manager) handleResp(noiseMsg []byte, addr net.Addr) {
 	if m.OnSessionEstablished != nil {
 		m.OnSessionEstablished(entry)
 	}
+}
+
+// extractInitTimestamp extracts the Unix timestamp (seconds) from an encrypted
+// Noise IK Message1 payload. The payload is 120 bytes:
+//   ed25519_pub [32]
+//   sig         [64]
+//   network_id  [16]
+//   timestamp   [ 8]  (big-endian uint64 seconds)
+func extractInitTimestamp(payload []byte) int64 {
+	if len(payload) < 120 {
+		return 0
+	}
+	return int64(binary.BigEndian.Uint64(payload[112:120]))
 }
 
 // buildPacket assembles a wire-format handshake UDP payload.
