@@ -52,6 +52,7 @@ func TestNormalizeIP_Invalid(t *testing.T) {
 
 func TestIPRateLimiter_Basic(t *testing.T) {
 	rl := NewIPRateLimiter(10, 5)
+	defer rl.Stop()
 
 	for i := 0; i < 5; i++ {
 		if !rl.Allow("1.2.3.4") {
@@ -66,6 +67,7 @@ func TestIPRateLimiter_Basic(t *testing.T) {
 
 func TestIPRateLimiter_Refill(t *testing.T) {
 	rl := NewIPRateLimiter(100, 2)
+	defer rl.Stop()
 
 	if !rl.Allow("1.2.3.4") {
 		t.Fatal("first request should be allowed")
@@ -77,7 +79,7 @@ func TestIPRateLimiter_Refill(t *testing.T) {
 		t.Fatal("third request should be denied")
 	}
 
-	time.Sleep(15 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 
 	if !rl.Allow("1.2.3.4") {
 		t.Error("request after refill should be allowed")
@@ -86,6 +88,7 @@ func TestIPRateLimiter_Refill(t *testing.T) {
 
 func TestIPRateLimiter_IPv6Aggregation(t *testing.T) {
 	rl := NewIPRateLimiter(10, 2)
+	defer rl.Stop()
 
 	if !rl.Allow("2001:db8::1") {
 		t.Fatal("first IPv6 request should be allowed")

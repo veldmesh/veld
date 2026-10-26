@@ -24,6 +24,7 @@ type IPRateLimiter struct {
 	entries map[string]*ipBucket
 	rate    float64
 	burst   float64
+	gcStop  chan struct{}
 }
 
 type ipBucket struct {
@@ -36,9 +37,14 @@ func NewIPRateLimiter(ratePerSec, burst float64) *IPRateLimiter {
 		entries: make(map[string]*ipBucket),
 		rate:    ratePerSec,
 		burst:   burst,
+		gcStop:  make(chan struct{}),
 	}
 	go rl.gc()
 	return rl
+}
+
+func (rl *IPRateLimiter) Stop() {
+	close(rl.gcStop)
 }
 
 func normalizeIP(ip string) string {
@@ -100,18 +106,23 @@ func (rl *IPRateLimiter) evictOldest(now time.Time) {
 func (rl *IPRateLimiter) gc() {
 	t := time.NewTicker(10 * time.Minute)
 	defer t.Stop()
-	for range t.C {
-		cutoff := time.Now().Add(-15 * time.Minute)
-		rl.mu.Lock()
-		for ip, b := range rl.entries {
-			if b.lastFill.Before(cutoff) {
-				delete(rl.entries, ip)
+	for {
+		select {
+		case <-t.C:
+			cutoff := time.Now().Add(-15 * time.Minute)
+			rl.mu.Lock()
+			for ip, b := range rl.entries {
+				if b.lastFill.Before(cutoff) {
+					delete(rl.entries, ip)
+				}
 			}
+			for len(rl.entries) > maxRateLimiterEntries {
+				rl.evictOldest(time.Now())
+			}
+			rl.mu.Unlock()
+		case <-rl.gcStop:
+			return
 		}
-		for len(rl.entries) > maxRateLimiterEntries {
-			rl.evictOldest(time.Now())
-		}
-		rl.mu.Unlock()
 	}
 }
 

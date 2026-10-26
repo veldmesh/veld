@@ -335,7 +335,7 @@ func TestServer_ExpelStalePeers_SkipsConnectedPeer(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("peer never marked connected")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(15 * time.Millisecond)
 	}
 
 	removed, err := srv.ExpelStalePeers(context.Background(), time.Hour)
@@ -363,7 +363,7 @@ func TestServer_ExpelStalePeers_SkipsConnectedPeer(t *testing.T) {
 			t.Errorf("LastSeen not refreshed while connected: got %d, was %d", rec.LastSeen, old)
 			break
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(15 * time.Millisecond)
 	}
 	rec, err := reg.GetPeer("online-stale")
 	if err != nil {
@@ -389,7 +389,7 @@ func TestServer_ExpelStalePeers_SkipsConnectedPeer(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("peer still marked connected after Watch ended")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(15 * time.Millisecond)
 	}
 
 	hooks.mu.Lock()
@@ -407,10 +407,10 @@ func TestSweepLoop_RunsPeriodically(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// Interval is intentionally tiny (10ms) so the test does not wait for
+	// Interval is intentionally small (50ms) so the test does not wait for
 	// the 1h production default. StartPeerSweeper refuses sub-minute
 	// intervals (clamped to MinSweepInterval), so drive the loop directly.
-	go sweepLoop(ctx, srv, 24*time.Hour, 10*time.Millisecond, func(string, ...any) {})
+	go sweepLoop(ctx, srv, 24*time.Hour, 50*time.Millisecond, func(string, ...any) {})
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -420,7 +420,7 @@ func TestSweepLoop_RunsPeriodically(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("stale peer not swept within 2s")
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
