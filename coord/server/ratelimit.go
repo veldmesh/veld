@@ -6,7 +6,6 @@ import (
 	"context"
 	"net"
 	"net/netip"
-	"sort"
 	"sync"
 	"time"
 
@@ -17,18 +16,14 @@ import (
 )
 
 const (
-	// maxRateLimiterEntries caps the number of tracked IPs to prevent unbounded growth.
 	maxRateLimiterEntries = 10000
 )
 
-// IPRateLimiter limits requests per source IP using a token-bucket algorithm.
-// IPv6 addresses are aggregated by /64 prefix. Stale entries are pruned every
-// 10 minutes and the map size is capped at maxRateLimiterEntries.
 type IPRateLimiter struct {
 	mu      sync.Mutex
 	entries map[string]*ipBucket
-	rate    float64 // tokens added per second
-	burst   float64 // bucket capacity
+	rate    float64
+	burst   float64
 }
 
 type ipBucket struct {
@@ -36,8 +31,6 @@ type ipBucket struct {
 	lastFill time.Time
 }
 
-// NewIPRateLimiter creates a limiter allowing burst requests immediately and
-// then ratePerSec requests per second, tracked per source IP (with IPv6 /64 aggregation).
 func NewIPRateLimiter(ratePerSec, burst float64) *IPRateLimiter {
 	rl := &IPRateLimiter{
 		entries: make(map[string]*ipBucket),
@@ -48,22 +41,18 @@ func NewIPRateLimiter(ratePerSec, burst float64) *IPRateLimiter {
 	return rl
 }
 
-// normalizeIP aggregates IPv6 addresses to their /64 prefix.
-// IPv4 addresses are used as-is.
 func normalizeIP(ip string) string {
 	addr, err := netip.ParseAddr(ip)
 	if err != nil {
-		return ip // fallback: use as-is
+		return ip
 	}
 	if addr.Is6() {
-		// Mask to /64 by creating a /64 prefix and getting its address.
 		prefix := netip.PrefixFrom(addr, 64)
 		return prefix.Masked().String()
 	}
 	return addr.String()
 }
 
-// Allow returns true when the IP is within its rate limit.
 func (rl *IPRateLimiter) Allow(ip string) bool {
 	normIP := normalizeIP(ip)
 	rl.mu.Lock()
@@ -71,10 +60,8 @@ func (rl *IPRateLimiter) Allow(ip string) bool {
 	now := time.Now()
 	b, ok := rl.entries[normIP]
 	if !ok {
-		// Cap the map size: if at capacity, evict a random stale entry.
-		// We use a simple strategy: if at capacity, clear 10% of oldest entries.
 		if len(rl.entries) >= maxRateLimiterEntries {
-			rl.evictOldest(now, maxRateLimiterEntries/10)
+			rl.evictOldest(now)
 		}
 		rl.entries[normIP] = &ipBucket{tokens: rl.burst - 1, lastFill: now}
 		return true
@@ -91,27 +78,22 @@ func (rl *IPRateLimiter) Allow(ip string) bool {
 	return false
 }
 
-// evictOldest removes up to n oldest entries (called with lock held).
-func (rl *IPRateLimiter) evictOldest(now time.Time, n int) {
-	if n <= 0 || len(rl.entries) == 0 {
+func (rl *IPRateLimiter) evictOldest(now time.Time) {
+	if len(rl.entries) == 0 {
 		return
 	}
-	// Find the n oldest entries by lastFill time.
-	type entry struct {
-		key string
-		t   time.Time
-	}
-	oldest := make([]entry, 0, len(rl.entries))
+	var oldestKey string
+	var oldestTime time.Time
+	first := true
 	for k, b := range rl.entries {
-		oldest = append(oldest, entry{key: k, t: b.lastFill})
+		if first || b.lastFill.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = b.lastFill
+			first = false
+		}
 	}
-	// Sort by time (oldest first)
-	sort.Slice(oldest, func(i, j int) bool {
-		return oldest[i].t.Before(oldest[j].t)
-	})
-	// Remove up to n oldest
-	for i := 0; i < n && i < len(oldest); i++ {
-		delete(rl.entries, oldest[i].key)
+	if oldestKey != "" {
+		delete(rl.entries, oldestKey)
 	}
 }
 
@@ -126,9 +108,8 @@ func (rl *IPRateLimiter) gc() {
 				delete(rl.entries, ip)
 			}
 		}
-		// Hard cap: if still over limit after GC, evict oldest.
-		if len(rl.entries) > maxRateLimiterEntries {
-			rl.evictOldest(time.Now(), len(rl.entries)-maxRateLimiterEntries)
+		for len(rl.entries) > maxRateLimiterEntries {
+			rl.evictOldest(time.Now())
 		}
 		rl.mu.Unlock()
 	}
@@ -146,7 +127,6 @@ func peerIP(ctx context.Context) string {
 	return host
 }
 
-// UnaryRateLimitInterceptor rejects unary RPCs from IPs that exceed rl's rate.
 func UnaryRateLimitInterceptor(rl *IPRateLimiter) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if !rl.Allow(peerIP(ctx)) {
@@ -156,7 +136,6 @@ func UnaryRateLimitInterceptor(rl *IPRateLimiter) grpc.UnaryServerInterceptor {
 	}
 }
 
-// StreamRateLimitInterceptor rejects new streams from IPs that exceed rl's rate.
 func StreamRateLimitInterceptor(rl *IPRateLimiter) grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		if !rl.Allow(peerIP(ss.Context())) {

@@ -60,6 +60,7 @@ func (c *testConn) SetWriteDeadline(t time.Time) error { return nil }
 func makeTestEntry(id *crypto.Identity, vpn string, ep string) *peer.Entry {
 	var peerID [32]byte
 	copy(peerID[:], id.Ed25519Public)
+
 	e := &peer.Entry{
 		ID:        peerID,
 		X25519Pub: id.X25519Public,
@@ -118,6 +119,92 @@ func TestManager_Initiate_Deduplication(t *testing.T) {
 	case <-conn.out:
 		t.Error("second Initiate should not send a second packet")
 	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+// TestManager_Initiate_RetryAfterTimeout verifies that a pending handshake
+// older than handshakeRetryTimeout (5s) allows a fresh Initiate to send a new Init.
+func TestManager_Initiate_RetryAfterTimeout(t *testing.T) {
+	idA, _ := crypto.Generate()
+	idB, _ := crypto.Generate()
+
+	tbl := peer.New()
+	entryB := makeTestEntry(idB, "10.0.0.2", "1.2.3.4:5000")
+	tbl.Upsert(entryB)
+
+	conn := newTestConn()
+	mgr := New(idA, [16]byte{}, tbl, conn)
+
+	// First Initiate sends an Init.
+	mgr.Initiate(entryB)
+	select {
+	case <-conn.out:
+	case <-time.After(time.Second):
+		t.Fatal("timeout: first init not sent")
+	}
+
+	// Manually expire the pending handshake by advancing createdAt.
+	mgr.mu.Lock()
+	if phs, ok := mgr.pending[entryB.ID]; ok {
+		phs.createdAt = time.Now().Add(-handshakeRetryTimeout - time.Second)
+	}
+	mgr.mu.Unlock()
+
+	// Second Initiate should send a new Init (retry after timeout).
+	mgr.Initiate(entryB)
+	select {
+	case <-conn.out:
+		// Success: new Init sent.
+	case <-time.After(time.Second):
+		t.Fatal("timeout: retry init not sent after timeout")
+	}
+}
+
+// TestManager_Initiate_RetryBounded verifies that retries are bounded to maxHandshakeRetries.
+func TestManager_Initiate_RetryBounded(t *testing.T) {
+	idA, _ := crypto.Generate()
+	idB, _ := crypto.Generate()
+
+	tbl := peer.New()
+	entryB := makeTestEntry(idB, "10.0.0.2", "1.2.3.4:5000")
+	tbl.Upsert(entryB)
+
+	conn := newTestConn()
+	mgr := New(idA, [16]byte{}, tbl, conn)
+
+	// First Initiate.
+	mgr.Initiate(entryB)
+	<-conn.out
+
+	// Expire and retry up to maxHandshakeRetries times.
+	for i := 0; i < maxHandshakeRetries; i++ {
+		mgr.mu.Lock()
+		if phs, ok := mgr.pending[entryB.ID]; ok {
+			phs.createdAt = time.Now().Add(-handshakeRetryTimeout - time.Second)
+		}
+		mgr.mu.Unlock()
+
+		mgr.Initiate(entryB)
+		select {
+		case <-conn.out:
+		case <-time.After(time.Second):
+			t.Fatalf("retry %d: timeout", i+1)
+		}
+	}
+
+	// One more retry should be blocked (exceeds maxHandshakeRetries).
+	mgr.mu.Lock()
+	if phs, ok := mgr.pending[entryB.ID]; ok {
+		phs.createdAt = time.Now().Add(-handshakeRetryTimeout - time.Second)
+	}
+	mgr.mu.Unlock()
+
+	mgr.Initiate(entryB)
+	select {
+	case <-conn.out:
+		t.Error("Initiate should be blocked after maxHandshakeRetries")
+	case <-time.After(20 * time.Millisecond):
+		// Expected: no packet sent.
 	}
 }
 
@@ -200,7 +287,7 @@ func TestManager_HandleInit_UnknownPeer_SilentDrop(t *testing.T) {
 	idA, _ := crypto.Generate()
 	idB, _ := crypto.Generate()
 
-	// B's table is empty — does not know A.
+	// B's table is empty -- does not know A.
 	tblB := peer.New()
 	connB := newTestConn()
 	mgrB := New(idB, [16]byte{}, tblB, connB)
@@ -220,7 +307,7 @@ func TestManager_HandleInit_UnknownPeer_SilentDrop(t *testing.T) {
 		t.Fatal("timeout waiting for init packet from A")
 	}
 
-	// B processes it — should be silently dropped (no resp).
+	// B processes it -- should be silently dropped (no resp).
 	addrA := &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 1000}
 	mgrB.HandlePacket(initPkt.data, addrA)
 
@@ -228,5 +315,165 @@ func TestManager_HandleInit_UnknownPeer_SilentDrop(t *testing.T) {
 	case <-connB.out:
 		t.Error("unknown peer should be silently dropped")
 	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+// TestManager_HandleInit_ReplayRejection verifies that processing the same
+// Init message twice results in the second being rejected (replay protection).
+func TestManager_HandleInit_ReplayRejection(t *testing.T) {
+	idA, _ := crypto.Generate()
+	idB, _ := crypto.Generate()
+
+	var netID [16]byte
+
+	// B's table knows A.
+	tblB := peer.New()
+	entryAinB := makeTestEntry(idA, "10.0.0.1", "1.1.1.1:1000")
+	tblB.Upsert(entryAinB)
+
+	connB := newTestConn()
+	mgrB := New(idB, netID, tblB, connB)
+	sessEstB := make(chan struct{}, 1)
+	mgrB.OnSessionEstablished = func(*peer.Entry) { sessEstB <- struct{}{} }
+
+	// Build a valid init packet from A.
+	connA := newTestConn()
+	tblA := peer.New()
+	entryBinA := makeTestEntry(idB, "10.0.0.2", "2.2.2.2:2000")
+	tblA.Upsert(entryBinA)
+	mgrA := New(idA, netID, tblA, connA)
+	mgrA.Initiate(entryBinA)
+
+	var initPkt testMsg
+	select {
+	case initPkt = <-connA.out:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for init packet from A")
+	}
+
+	// Feed init packet to B (first time -- should succeed).
+	addrA := &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 1000}
+	mgrB.HandlePacket(initPkt.data, addrA)
+
+	select {
+	case <-sessEstB:
+	case <-time.After(time.Second):
+		t.Fatal("first handshake: B session not established")
+	}
+
+	// Verify session is established.
+	if entryAinB.GetSession() == nil {
+		t.Fatal("session should be established after first Init")
+	}
+	firstSession := entryAinB.GetSession()
+
+	// Drain the first response packet from connB.
+	select {
+	case <-connB.out:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for first response")
+	}
+
+	// Feed the SAME init packet again (replay) -- should be rejected.
+	// The session pointer should remain unchanged.
+	mgrB.HandlePacket(initPkt.data, addrA)
+
+	select {
+	case <-connB.out:
+		t.Error("replayed Init should not trigger a second response")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// Session should be unchanged.
+	if entryAinB.GetSession() != firstSession {
+		t.Error("replayed Init should not replace existing session")
+	}
+}
+
+// TestManager_HandleInit_StaleTimestampRejection verifies that an Init with
+// a timestamp <= the previously accepted timestamp is rejected.
+func TestManager_HandleInit_StaleTimestampRejection(t *testing.T) {
+	idA, _ := crypto.Generate()
+	idB, _ := crypto.Generate()
+
+	var netID [16]byte
+
+	// B's table knows A.
+	tblB := peer.New()
+	entryAinB := makeTestEntry(idA, "10.0.0.1", "1.1.1.1:1000")
+	tblB.Upsert(entryAinB)
+
+	connB := newTestConn()
+	mgrB := New(idB, netID, tblB, connB)
+	sessEstB := make(chan struct{}, 1)
+	mgrB.OnSessionEstablished = func(*peer.Entry) { sessEstB <- struct{}{} }
+
+	// Build a valid init packet from A with a specific timestamp.
+	hs, err := crypto.NewInitiatorHS(idA, idB.X25519Public, netID)
+	if err != nil {
+		t.Fatalf("NewInitiatorHS: %v", err)
+	}
+	ts := time.Now().UnixNano()
+	initMsg, err := hs.BuildMessage1(ts)
+	if err != nil {
+		t.Fatalf("BuildMessage1: %v", err)
+	}
+	initPkt := buildPacket(typeHandshakeInit, initMsg)
+
+	// Feed init packet to B (first time -- should succeed).
+	addrA := &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 1000}
+	mgrB.HandlePacket(initPkt, addrA)
+
+	select {
+	case <-sessEstB:
+	case <-time.After(time.Second):
+		t.Fatal("first handshake: B session not established")
+	}
+
+	if entryAinB.GetSession() == nil {
+		t.Fatal("session should be established after first Init")
+	}
+
+	// Drain the first response packet from connB.
+	select {
+	case <-connB.out:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for first response")
+	}
+
+	// Now send another Init with the SAME timestamp (stale) -- must be rejected.
+	mgrB.HandlePacket(initPkt, addrA)
+
+	select {
+	case <-connB.out:
+		t.Error("stale timestamp Init should not trigger a response")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// Session should be unchanged.
+	if entryAinB.GetSession() == nil {
+		t.Error("session should still exist")
+	}
+
+	// Send an Init with a newer timestamp (should succeed).
+	// Build it with a fresh initiator HS: a Noise handshake state is single-shot.
+	newerTS := ts + 1_000_000 // 1ms later
+	hs2, err := crypto.NewInitiatorHS(idA, idB.X25519Public, netID)
+	if err != nil {
+		t.Fatalf("NewInitiatorHS: %v", err)
+	}
+	initMsg2, err := hs2.BuildMessage1(newerTS)
+	if err != nil {
+		t.Fatalf("BuildMessage1: %v", err)
+	}
+	initPkt2 := buildPacket(typeHandshakeInit, initMsg2)
+
+	mgrB.HandlePacket(initPkt2, addrA)
+
+	select {
+	case <-connB.out:
+		// Expected: new response sent.
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for response to newer Init")
 	}
 }

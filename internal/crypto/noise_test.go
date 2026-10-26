@@ -26,14 +26,14 @@ func testHandshake(t *testing.T, idA, idB *Identity, networkID [16]byte) (*Hands
 		t.Fatalf("failed to create responder: %v", err)
 	}
 
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 
 	msg1, err := initiator.BuildMessage1(now)
 	if err != nil {
 		t.Fatalf("failed to build message 1: %v", err)
 	}
 
-	err = responder.ProcessMessage1(msg1, now)
+	_, err = responder.ProcessMessage1(msg1, now)
 	if err != nil {
 		t.Fatalf("failed to process message 1: %v", err)
 	}
@@ -121,14 +121,14 @@ func TestNoiseHandshake_UnknownInitiator(t *testing.T) {
 		t.Fatalf("failed to create responder: %v", err)
 	}
 
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 
 	msg1, err := initiator.BuildMessage1(now)
 	if err != nil {
 		t.Fatalf("failed to build message 1: %v", err)
 	}
 
-	err = responder.ProcessMessage1(msg1, now)
+	_, err = responder.ProcessMessage1(msg1, now)
 	if !errors.Is(err, ErrHandshakeDrop) {
 		t.Errorf("expected ErrHandshakeDrop, got %v", err)
 	}
@@ -162,7 +162,7 @@ func TestNoiseHandshake_TamperedMessage1(t *testing.T) {
 		t.Fatalf("failed to create responder: %v", err)
 	}
 
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 
 	msg1, err := initiator.BuildMessage1(now)
 	if err != nil {
@@ -171,7 +171,7 @@ func TestNoiseHandshake_TamperedMessage1(t *testing.T) {
 
 	msg1[len(msg1)/2] ^= 0xFF
 
-	err = responder.ProcessMessage1(msg1, now)
+	_, err = responder.ProcessMessage1(msg1, now)
 	if !errors.Is(err, ErrHandshakeDrop) {
 		t.Errorf("expected ErrHandshakeDrop, got %v", err)
 	}
@@ -205,14 +205,14 @@ func TestNoiseHandshake_TamperedMessage2(t *testing.T) {
 		t.Fatalf("failed to create responder: %v", err)
 	}
 
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 
 	msg1, err := initiator.BuildMessage1(now)
 	if err != nil {
 		t.Fatalf("failed to build message 1: %v", err)
 	}
 
-	err = responder.ProcessMessage1(msg1, now)
+	_, err = responder.ProcessMessage1(msg1, now)
 	if err != nil {
 		t.Fatalf("failed to process message 1: %v", err)
 	}
@@ -258,15 +258,15 @@ func TestNoiseHandshake_TimestampTooOld(t *testing.T) {
 		t.Fatalf("failed to create responder: %v", err)
 	}
 
-	oldTime := time.Now().Unix() - 31
-	newTime := time.Now().Unix()
+	oldTime := time.Now().UnixNano() - 31_000_000_000
+	newTime := time.Now().UnixNano()
 
 	msg1, err := initiator.BuildMessage1(oldTime)
 	if err != nil {
 		t.Fatalf("failed to build message 1: %v", err)
 	}
 
-	err = responder.ProcessMessage1(msg1, newTime)
+	_, err = responder.ProcessMessage1(msg1, newTime)
 	if !errors.Is(err, ErrHandshakeDrop) {
 		t.Errorf("expected ErrHandshakeDrop, got %v", err)
 	}
@@ -300,15 +300,15 @@ func TestNoiseHandshake_TimestampTooNew(t *testing.T) {
 		t.Fatalf("failed to create responder: %v", err)
 	}
 
-	newTime := time.Now().Unix()
-	futureTime := newTime + 31
+	newTime := time.Now().UnixNano()
+	futureTime := newTime + 31_000_000_000
 
 	msg1, err := initiator.BuildMessage1(futureTime)
 	if err != nil {
 		t.Fatalf("failed to build message 1: %v", err)
 	}
 
-	err = responder.ProcessMessage1(msg1, newTime)
+	_, err = responder.ProcessMessage1(msg1, newTime)
 	if !errors.Is(err, ErrHandshakeDrop) {
 		t.Errorf("expected ErrHandshakeDrop, got %v", err)
 	}
@@ -347,14 +347,14 @@ func TestNoiseHandshake_WrongPeerX25519(t *testing.T) {
 		t.Fatalf("failed to create responder: %v", err)
 	}
 
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 
 	msg1, err := initiator.BuildMessage1(now)
 	if err != nil {
 		t.Fatalf("failed to build message 1: %v", err)
 	}
 
-	err = responder.ProcessMessage1(msg1, now)
+	_, err = responder.ProcessMessage1(msg1, now)
 	if !errors.Is(err, ErrHandshakeDrop) {
 		t.Errorf("expected ErrHandshakeDrop, got %v", err)
 	}

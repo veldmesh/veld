@@ -40,14 +40,14 @@ func newTestSessionPair(t *testing.T) (initiator *Session, responder *Session) {
 		t.Fatalf("failed to create responder handshake: %v", err)
 	}
 
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 
 	msg1, err := initiatorHS.BuildMessage1(now)
 	if err != nil {
 		t.Fatalf("failed to build message 1: %v", err)
 	}
 
-	err = responderHS.ProcessMessage1(msg1, now)
+	_, err = responderHS.ProcessMessage1(msg1, now)
 	if err != nil {
 		t.Fatalf("failed to process message 1: %v", err)
 	}

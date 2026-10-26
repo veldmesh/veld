@@ -69,8 +69,8 @@ var upCmd = &cobra.Command{
 }
 
 var (
-	upConfigPath  string
-	upForeground  bool
+	upConfigPath string
+	upForeground bool
 )
 
 func init() {
@@ -494,7 +494,7 @@ func runTofuForget(cobraCmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := tofuStore.Forget(peerArg); err != nil {
+	if err := tofuStore.ForgetByVPNAddr(peerArg); err != nil {
 		return fmt.Errorf("forget: %w", err)
 	}
 	fmt.Printf("forgot pin for peer %s\n", peerArg)

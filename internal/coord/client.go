@@ -28,6 +28,14 @@ const (
 	retryMax = 60 * time.Second
 )
 
+// jitterBackoff applies full jitter to a backoff duration: a uniform random
+// value in [0, backoff). This prevents thundering-herd reconnects when many
+// clients lose their coord connection at once.
+
+func jitterBackoff(backoff time.Duration) time.Duration {
+	return time.Duration(rand.Float64() * float64(backoff))
+}
+
 // Config configures the coord client.
 type Config struct {
 	ServerAddr   string           // gRPC address, e.g. "coord.example.com:50051"
@@ -178,7 +186,7 @@ func (c *Client) run(ctx context.Context) {
 		}
 		// Transient error: wait with jitter then retry.
 		// Use full jitter: random value in [0, backoff].
-		jitter := time.Duration(rand.Float64() * float64(backoff))
+		jitter := jitterBackoff(backoff)
 		select {
 		case <-ctx.Done():
 		case <-time.After(jitter):

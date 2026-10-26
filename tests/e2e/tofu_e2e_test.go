@@ -155,9 +155,8 @@ func TestTOFU_E2E_SameKey_Accepted(t *testing.T) {
 		t.Fatal("first handshake: session not established")
 	}
 
-	// Second handshake with same key — should also succeed.
-	// Wait to ensure a different timestamp (replay protection requires strictly increasing timestamps).
-	time.Sleep(15 * time.Second)
+	// Second handshake with same key -- should also succeed.
+	// Timestamps are nanosecond-resolution, so back-to-back handshakes are fine.
 	doHandshake(t, mgrA, mgrB, connA, connB, entryBinA, addrA, addrB)
 	select {
 	case <-established:

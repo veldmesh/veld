@@ -13,20 +13,20 @@ import (
 )
 
 const (
-	RekeyThreshold  uint64 = 1 << 32
-	RekeyTimeLimit         = 120 * time.Second // 2 minutes, matching WireGuard
+	RekeyThreshold uint64 = 1 << 32
+	RekeyTimeLimit        = 120 * time.Second // 2 minutes, matching WireGuard
 )
 
 var ErrRekeyRequired = errors.New("session nonce threshold reached: rekey required")
 
 type Session struct {
-	id           [8]byte
-	sendCS       *noise.CipherState
-	recvCS       *noise.CipherState
-	sendNonce    uint64
-	createdAt    time.Time
-	mu           sync.Mutex
-	window       replayWindow
+	id        [8]byte
+	sendCS    *noise.CipherState
+	recvCS    *noise.CipherState
+	sendNonce uint64
+	createdAt time.Time
+	mu        sync.Mutex
+	window    replayWindow
 }
 
 func New(result *crypto.HandshakeResult) *Session {

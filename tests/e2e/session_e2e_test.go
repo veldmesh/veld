@@ -26,12 +26,12 @@ func runHandshake(t *testing.T, idA, idB *crypto.Identity) (*crypto.HandshakeRes
 	if err != nil {
 		t.Fatalf("failed to create responder handshake: %v", err)
 	}
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	msg1, err := initiatorHS.BuildMessage1(now)
 	if err != nil {
 		t.Fatalf("failed to build message 1: %v", err)
 	}
-	err = responderHS.ProcessMessage1(msg1, now)
+	_, err = responderHS.ProcessMessage1(msg1, now)
 	if err != nil {
 		t.Fatalf("failed to process message 1: %v", err)
 	}

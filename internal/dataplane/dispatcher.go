@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 
 	"github.com/veldmesh/veld/internal/peer"
 	"github.com/veldmesh/veld/internal/session"
@@ -14,9 +15,10 @@ import (
 )
 
 const (
-	maxMTU      = 1500
-	authTagSize = 16 // ChaCha20-Poly1305 tag
-	udpBufSize  = HeaderSize + maxMTU + authTagSize
+	maxMTU             = 1500
+	authTagSize        = 16 // ChaCha20-Poly1305 tag
+	udpBufSize         = HeaderSize + maxMTU + authTagSize
+	rekeyCheckInterval = 30 * time.Second // periodic check for time-based rekey
 )
 
 // Dispatcher routes encrypted packets between TUN and UDP.
@@ -33,10 +35,10 @@ type Dispatcher struct {
 	OnHandshakeRequired func(entry *peer.Entry)
 
 	// OnRekeyRequired is called when the current session hits the nonce threshold
-	// (2^32 packets). The packet is already in the peer's hold queue. The caller
-	// must clear the old session and initiate a fresh handshake — SetSession will
-	// drain the hold queue once the new session is ready.
-	// May be nil (packets queued until queue is full, then dropped).
+	// (2^32 packets) or the time-based rekey limit (2 minutes). The packet is
+	// already in the peer's hold queue. The caller must clear the old session and
+	// initiate a fresh handshake -- SetSession will drain the hold queue once the
+	// new session is ready. May be nil (packets queued until queue is full, then dropped).
 	OnRekeyRequired func(entry *peer.Entry)
 
 	// OnHandshakePacket is called for TypeHandshakeInit and TypeHandshakeResp packets.
@@ -48,23 +50,26 @@ type Dispatcher struct {
 	OnNATProbePacket func(pkt []byte, addr net.Addr)
 
 	stopOnce sync.Once
+	stopCh   chan struct{}
 	wg       sync.WaitGroup
 }
 
 // New creates a Dispatcher. Call Start to launch the I/O goroutines.
 func New(t tun.TUN, conn net.PacketConn, peers *peer.Table) *Dispatcher {
 	return &Dispatcher{
-		tun:   t,
-		conn:  conn,
-		peers: peers,
+		tun:    t,
+		conn:   conn,
+		peers:  peers,
+		stopCh: make(chan struct{}),
 	}
 }
 
-// Start launches the TUN→UDP and UDP→TUN goroutines.
+// Start launches the TUN->UDP and UDP->TUN goroutines.
 func (d *Dispatcher) Start() {
-	d.wg.Add(2)
+	d.wg.Add(3)
 	go d.tunLoop()
 	go d.udpLoop()
+	go d.rekeyLoop()
 }
 
 // SetTUN sets the TUN device. If the dispatcher was started with a nil TUN
@@ -83,6 +88,7 @@ func (d *Dispatcher) SetTUN(t tun.TUN) {
 // Safe to call multiple times.
 func (d *Dispatcher) Stop() {
 	d.stopOnce.Do(func() {
+		close(d.stopCh)
 		d.tunMu.Lock()
 		if d.tun != nil {
 			_ = d.tun.Close()
@@ -114,6 +120,35 @@ func (d *Dispatcher) FlushHoldQueue(entry *peer.Entry) {
 			continue
 		}
 		d.conn.WriteTo(buildDataPacket(nonce, ct), net.UDPAddrFromAddrPort(ep))
+	}
+}
+
+// rekeyLoop periodically scans all peers and triggers rekey for sessions
+// that have exceeded the time limit (but not the nonce threshold, which is
+// checked inline in handleTunPacket).
+func (d *Dispatcher) rekeyLoop() {
+	defer d.wg.Done()
+	ticker := time.NewTicker(rekeyCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.stopCh:
+			return
+		case <-ticker.C:
+			d.checkRekey()
+		}
+	}
+}
+
+func (d *Dispatcher) checkRekey() {
+	for _, e := range d.peers.List() {
+		sess := e.GetSession()
+		if sess != nil && sess.NeedsRekey() {
+			if d.OnRekeyRequired != nil {
+				d.OnRekeyRequired(e)
+			}
+		}
 	}
 }
 
@@ -226,7 +261,7 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 		d.tunMu.RUnlock()
 		if t != nil {
 			if _, err := t.Write(plain); err != nil {
-				// TODO: log err before stopping — Dispatcher has no logger yet
+				// TODO: log err before stopping -- Dispatcher has no logger yet
 				d.Stop()
 				return
 			}

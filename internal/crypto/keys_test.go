@@ -64,8 +64,8 @@ func TestSignForPeerAndVerify(t *testing.T) {
 		t.Fatalf("failed to generate identity B: %v", err)
 	}
 
-	// A signs for B with current timestamp
-	now := time.Now().Unix()
+	// A signs for B with current timestamp (nanoseconds)
+	now := time.Now().UnixNano()
 	sig, err := idA.SignForPeer(idB.X25519Public, now)
 	if err != nil {
 		t.Fatalf("failed to sign for peer: %v", err)
@@ -77,9 +77,9 @@ func TestSignForPeerAndVerify(t *testing.T) {
 		t.Fatalf("verification failed: %v", err)
 	}
 
-	// Mutate timestamp by 31 seconds (outside the ±30s window)
+	// Mutate timestamp by 31 seconds (outside the ±30s window = 31e9 nanoseconds)
 	oldTimestamp := now
-	badTimestamp := now + 31
+	badTimestamp := now + 31_000_000_000
 
 	sig2, err := idA.SignForPeer(idB.X25519Public, badTimestamp)
 	if err != nil {
@@ -93,7 +93,7 @@ func TestSignForPeerAndVerify(t *testing.T) {
 	}
 
 	// Also test with timestamp 31s in the past
-	pastTimestamp := now - 31
+	pastTimestamp := now - 31_000_000_000
 	sig3, err := idA.SignForPeer(idB.X25519Public, pastTimestamp)
 	if err != nil {
 		t.Fatalf("failed to sign for peer with past timestamp: %v", err)
@@ -144,7 +144,7 @@ func TestVerifyPeerSig_WrongEd25519Key(t *testing.T) {
 	}
 
 	// A signs for B
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	sig, err := idA.SignForPeer(idB.X25519Public, now)
 	if err != nil {
 		t.Fatalf("failed to sign for peer: %v", err)
@@ -169,7 +169,7 @@ func TestVerifyPeerSig_TamperedSig(t *testing.T) {
 	}
 
 	// A signs for B
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	sig, err := idA.SignForPeer(idB.X25519Public, now)
 	if err != nil {
 		t.Fatalf("failed to sign for peer: %v", err)
@@ -197,7 +197,7 @@ func TestVerifyPeerSig_SwappedKeys(t *testing.T) {
 	}
 
 	// A signs for B with proper order (A_x25519 || B_x25519 || ts)
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	sig, err := idA.SignForPeer(idB.X25519Public, now)
 	if err != nil {
 		t.Fatalf("failed to sign for peer: %v", err)

@@ -15,7 +15,7 @@ import (
 	"github.com/veldmesh/veld/internal/session"
 )
 
-// Packet type constants — must match dataplane.TypeHandshakeInit/Resp.
+// Packet type constants -- must match dataplane.TypeHandshakeInit/Resp.
 const (
 	typeHandshakeInit uint32 = 0x02
 	typeHandshakeResp uint32 = 0x03
@@ -30,10 +30,10 @@ const handshakeRetryTimeout = 5 * time.Second
 const maxHandshakeRetries = 3
 
 type pendingHS struct {
-	hs         *crypto.InitiatorHS
-	peerID     [32]byte
-	createdAt  time.Time
-	retries    int
+	hs        *crypto.InitiatorHS
+	peerID    [32]byte
+	createdAt time.Time
+	retries   int
 }
 
 // Manager handles Noise IK handshake initiation and response over a shared UDP conn.
@@ -103,12 +103,17 @@ func (m *Manager) Initiate(entry *peer.Entry) {
 		m.mu.Unlock()
 		return
 	}
-	m.pending[entry.ID] = &pendingHS{hs: hs, peerID: entry.ID, createdAt: time.Now(), retries: 0}
+	// Preserve retry count when retrying an existing handshake.
+	retries := 0
+	if exists {
+		retries = phs.retries
+	}
+	m.pending[entry.ID] = &pendingHS{hs: hs, peerID: entry.ID, createdAt: time.Now(), retries: retries}
 	m.mu.Unlock()
 
 	entry.SetState(peer.StateHandshaking)
 
-	msg1, err := hs.BuildMessage1(time.Now().Unix())
+	msg1, err := hs.BuildMessage1(time.Now().UnixNano())
 	if err != nil {
 		m.mu.Lock()
 		delete(m.pending, entry.ID)
@@ -146,15 +151,26 @@ func (m *Manager) HandlePacket(pkt []byte, addr net.Addr) {
 	}
 }
 
+// OnPeerRemoved cleans up handshake state for a peer that has been removed.
+// Call this when the peer table removes a peer (e.g., on Leave or expiration).
+func (m *Manager) OnPeerRemoved(peerID [32]byte) {
+	m.mu.Lock()
+	delete(m.pending, peerID)
+	delete(m.initTimestamps, peerID)
+	m.mu.Unlock()
+}
+
 func (m *Manager) handleInit(noiseMsg []byte, addr net.Addr) {
 	respHS, err := crypto.NewResponderHS(m.localID, m.peers.PeerLookupFn())
 	if err != nil {
 		return
 	}
-	if err := respHS.ProcessMessage1(noiseMsg, time.Now().Unix()); err != nil {
+	// ProcessMessage1 now returns the timestamp from the decrypted payload.
+	ts, err := respHS.ProcessMessage1(noiseMsg, time.Now().UnixNano())
+	if err != nil {
 		return // silently drop unknown or tampered init
 	}
-	msg2, result, err := respHS.BuildMessage2(time.Now().Unix())
+	msg2, result, err := respHS.BuildMessage2(time.Now().UnixNano())
 	if err != nil {
 		return
 	}
@@ -169,8 +185,6 @@ func (m *Manager) handleInit(noiseMsg []byte, addr net.Addr) {
 
 	// Replay protection: reject Init if its timestamp is not strictly greater
 	// than the greatest timestamp we've accepted from this peer.
-	// The timestamp is at payload offset 112 (8 bytes, big-endian uint64 seconds).
-	ts := extractInitTimestamp(noiseMsg)
 	if ts == 0 {
 		return // malformed
 	}
@@ -185,7 +199,7 @@ func (m *Manager) handleInit(noiseMsg []byte, addr net.Addr) {
 	// TOFU check: verify the initiator's fingerprint matches prior connections.
 	if m.TOFUCheck != nil {
 		if err := m.TOFUCheck(entry.VPNAddr.String(), result.PeerEd25519Public); err != nil {
-			return // silently drop — fingerprint mismatch
+			return // silently drop -- fingerprint mismatch
 		}
 	}
 
@@ -222,9 +236,11 @@ func (m *Manager) handleResp(noiseMsg []byte, addr net.Addr) {
 		return
 	}
 	delete(m.pending, entry.ID)
+	// Clean up initTimestamps on successful handshake completion.
+	delete(m.initTimestamps, entry.ID)
 	m.mu.Unlock()
 
-	result, err := phs.hs.ProcessMessage2(noiseMsg, time.Now().Unix())
+	result, err := phs.hs.ProcessMessage2(noiseMsg, time.Now().UnixNano())
 	if err != nil {
 		return
 	}
@@ -234,13 +250,13 @@ func (m *Manager) handleResp(noiseMsg []byte, addr net.Addr) {
 	var responderID [32]byte
 	copy(responderID[:], result.PeerEd25519Public)
 	if responderID != entry.ID {
-		return // identity mismatch — silently drop
+		return // identity mismatch -- silently drop
 	}
 
 	// TOFU check: verify the responder's fingerprint matches prior connections.
 	if m.TOFUCheck != nil {
 		if err := m.TOFUCheck(entry.VPNAddr.String(), result.PeerEd25519Public); err != nil {
-			return // silently drop — fingerprint mismatch
+			return // silently drop -- fingerprint mismatch
 		}
 	}
 
@@ -251,12 +267,15 @@ func (m *Manager) handleResp(noiseMsg []byte, addr net.Addr) {
 	}
 }
 
-// extractInitTimestamp extracts the Unix timestamp (seconds) from an encrypted
+// extractInitTimestamp extracts the Unix timestamp (nanoseconds) from an encrypted
 // Noise IK Message1 payload. The payload is 120 bytes:
-//   ed25519_pub [32]
-//   sig         [64]
-//   network_id  [16]
-//   timestamp   [ 8]  (big-endian uint64 seconds)
+//
+//	ed25519_pub [32]
+//	sig         [64]
+//	network_id  [16]
+//	timestamp   [ 8]  (big-endian uint64 nanoseconds since epoch)
+//
+// Kept for potential external use, but handleInit now gets timestamp from ProcessMessage1.
 func extractInitTimestamp(payload []byte) int64 {
 	if len(payload) < 120 {
 		return 0
@@ -265,11 +284,11 @@ func extractInitTimestamp(payload []byte) int64 {
 }
 
 // buildPacket assembles a wire-format handshake UDP payload.
-// Uses the same 16-byte header as data packets, with bytes 4–15 zeroed.
+// Uses the same 16-byte header as data packets, with bytes 4-15 zeroed.
 func buildPacket(pktType uint32, msg []byte) []byte {
 	buf := make([]byte, headerSize+len(msg))
 	binary.BigEndian.PutUint32(buf[0:4], pktType)
-	// bytes 4–15: reserved (zero)
+	// bytes 4-15: reserved (zero)
 	copy(buf[headerSize:], msg)
 	return buf
 }

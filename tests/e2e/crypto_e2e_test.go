@@ -29,7 +29,7 @@ func TestFullHandshakeSimulation(t *testing.T) {
 	}
 
 	// A signs for B at current time
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	sigAforB, err := idA.SignForPeer(idB.X25519Public, now)
 	if err != nil {
 		t.Fatalf("A failed to sign for B: %v", err)
@@ -93,14 +93,14 @@ func TestNoiseHandshake_EndToEnd(t *testing.T) {
 		t.Fatalf("failed to create responder: %v", err)
 	}
 
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 
 	msg1, err := initiator.BuildMessage1(now)
 	if err != nil {
 		t.Fatalf("failed to build message 1: %v", err)
 	}
 
-	err = responder.ProcessMessage1(msg1, now)
+	_, err = responder.ProcessMessage1(msg1, now)
 	if err != nil {
 		t.Fatalf("failed to process message 1: %v", err)
 	}

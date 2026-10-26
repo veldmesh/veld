@@ -118,9 +118,9 @@ func TestDataplane_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewResponderHS: %v", err)
 	}
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	msg1, _ := initiatorHS.BuildMessage1(now)
-	if err := responderHS.ProcessMessage1(msg1, now); err != nil {
+	if _, err := responderHS.ProcessMessage1(msg1, now); err != nil {
 		t.Fatalf("ProcessMessage1: %v", err)
 	}
 	msg2, respResult, _ := responderHS.BuildMessage2(now)
