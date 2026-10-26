@@ -3,7 +3,6 @@
 package handshake
 
 import (
-	"encoding/binary"
 	"net"
 	"net/netip"
 	"sync"
@@ -14,16 +13,6 @@ import (
 	"github.com/veldmesh/veld/internal/peer"
 )
 
-const typeData uint32 = 0x01
-
-// buildDataPacket builds a TypeData packet with the given nonce and ciphertext.
-func buildDataPacket(nonce uint64, ct []byte) []byte {
-	buf := make([]byte, headerSize+8+len(ct))
-	binary.BigEndian.PutUint32(buf[0:4], typeData)
-	binary.BigEndian.PutUint64(buf[8:16], nonce)
-	copy(buf[headerSize:], ct)
-	return buf
-}
 
 // testConn is a minimal net.PacketConn for testing.
 type testConn struct {
