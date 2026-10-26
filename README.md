@@ -50,18 +50,23 @@ The coordinator assigns a VPN address (e.g., `10.100.0.1`); the daemon then crea
 ## Quick start — self-hosted coordination server
 
 ```sh
-# Run the coordination server (Docker)
-docker run -p 50051:50051 ghcr.io/veldmesh/veld-coord
-
-# On each machine
-veld login --server your-server:50051 --token <token>
-veld up
+# Build and run the coordination server (Docker)
+make docker
+docker run -p 50051:50051 -v veld-coord-data:/data veld-coord:latest
 ```
+
+> **Note on TLS:** `veld-coord` itself does not terminate TLS — it serves plaintext gRPC. The daemon connects with TLS by default and verifies the certificate against the host CA store. For a plaintext server you must either terminate TLS in front of it (e.g., a reverse proxy such as nginx, Caddy, or HAProxy) or, for testing only, set `tls_insecure = true` in the daemon's `[coord]` config section.
 
 Or without Docker:
 ```sh
 ./veld-coord --listen :50051 --db ./peers.db
 ```
+
+> **Same TLS note applies:** the binary also serves plaintext gRPC — use a TLS-terminating proxy or set `tls_insecure = true` in the daemon config.
+
+# On each machine
+veld login --server your-server:50051 --token <token>
+veld up
 
 ---
 
@@ -132,6 +137,8 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design: crypto s
 
 The daemon's gRPC connection to the coordination server uses standard TLS and verifies the server certificate against the **host's system CA store** (not an embedded bundle). This means hosts — including OpenWrt routers — must have a current `ca-certificates` package installed. After industry-wide distrust of weak CA keys (e.g. the eMudhra roots removed by Go 1.26.10, Mozilla NSS, and major distros), stale trust stores can cause spurious TLS failures or, worse, accept distrusted roots. On OpenWrt, run `opkg update && opkg upgrade ca-certificates` to stay current.
 
+> **Note:** `veld-coord` itself does not terminate TLS — it serves plaintext gRPC. To use TLS, terminate it in front of `veld-coord` (e.g., with a reverse proxy such as nginx, Caddy, or HAProxy) or, for testing only, set `tls_insecure = true` in the daemon's `[coord]` config section.
+
 ---
 
 ## Building from source
@@ -184,7 +191,7 @@ Contributions to the daemon, CLI, CE coord server, and docs are welcome. Please 
 
 ## License
 
-The **daemon and CLI** (`cmd/` — except `cmd/veld-relay` — `internal/`) are licensed under the **MIT License**. Note the **relay client** (`internal/relay`, linked into every daemon) stays MIT; the wire protocol is open.
+The **daemon, CLI, tray app, and tests** (`cmd/` except `cmd/veld-relay`; `internal/` except `internal/coord`; `tray/`; `tests/e2e/`) are licensed under the **MIT License**. Note the **relay client** (`internal/relay`, linked into every daemon) stays MIT; the wire protocol is open.
 
 The **coordination server** (`coord/`) is licensed under the **Business Source License 1.1 (BSL-1.1)**. Source code is publicly available. You may self-host it for personal or internal use. You may not offer it as a competing managed network service. The license converts to Apache 2.0 four years after each version's release date.
 
