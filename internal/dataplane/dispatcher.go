@@ -264,7 +264,7 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 		}
 		sess := entry.GetSession()
 
-		plain := decryptDataPacket(entry, sess, nonce, payload)
+		plain := d.decryptDataPacket(entry, sess, nonce, payload)
 
 		if plain == nil {
 			return
@@ -311,7 +311,7 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 // falling back to the pending session (WireGuard-style handshake confirmation).
 // If the pending session decrypts successfully, it is promoted to active and
 // OnSessionEstablished is called. Returns nil if decryption fails with both.
-func decryptDataPacket(entry *peer.Entry, sess *session.Session, nonce uint64, payload []byte) []byte {
+func (d *Dispatcher) decryptDataPacket(entry *peer.Entry, sess *session.Session, nonce uint64, payload []byte) []byte {
 	// Try the active session first.
 	if sess != nil {
 		plain, err := sess.Decrypt(nonce, payload)
@@ -328,6 +328,9 @@ func decryptDataPacket(entry *peer.Entry, sess *session.Session, nonce uint64, p
 		if err == nil && plain != nil {
 			// Pending session works -- promote it to active.
 			entry.PromotePendingSession()
+			if d.OnSessionEstablished != nil {
+				d.OnSessionEstablished(entry)
+			}
 			return plain
 		}
 	}

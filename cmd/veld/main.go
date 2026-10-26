@@ -437,7 +437,7 @@ func runJoin(cobraCmd *cobra.Command, args []string) error {
 var tofuCmd = &cobra.Command{
 	Use:   "tofu",
 	Short: "Manage TOFU (Trust-On-First-Use) fingerprint pins",
-	Long:  "Manage TOFU fingerprint pins. Pins are keyed by VPN address.",
+	Long:  "Manage TOFU fingerprint pins. Pins are keyed by Ed25519 public key with a reverse VPN address map.",
 }
 
 var tofuConfigPath string

@@ -150,32 +150,46 @@ func (id *Identity) SignForPeer(theirX25519Public [32]byte, timestampNano int64)
 	return sigArray, nil
 }
 
+// NormalizeTimestamp interprets the raw 8-byte handshake timestamp as either
+// seconds or nanoseconds since epoch and returns the value in nanoseconds.
+// Values > 1e12 are treated as nanoseconds; values <= 1e12 are treated as seconds
+// and multiplied by 1e9. This maintains wire compatibility with older daemons
+// that encoded the timestamp in seconds.
+func NormalizeTimestamp(raw int64) int64 {
+	const threshold = 1_000_000_000_000 // 1e12 ~ year 2001 in seconds
+	const nanosPerSec = 1_000_000_000
+	if raw > threshold {
+		return raw // already nanoseconds
+	}
+	return raw * nanosPerSec // seconds -> nanoseconds
+}
+
 // VerifyPeerSig verifies the signature a remote peer included in their handshake message.
 // peerEd25519Public: their permanent Ed25519 public key
 // peerX25519Public:  their X25519 static key (from handshake)
 // ourX25519Public:   our X25519 static key
 // sig:               the signature to verify
-// timestampNano:     timestamp from the handshake; must be within +/-30s of now
-func VerifyPeerSig(peerEd25519Public ed25519.PublicKey, peerX25519Public, ourX25519Public [32]byte, sig [64]byte, timestampNano int64) error {
-	// Check timestamp is within +/-30s of now (30e9 nanoseconds)
-	now := time.Now().UnixNano()
-	if diff := now - timestampNano; diff < -30_000_000_000 || diff > 30_000_000_000 {
-		return fmt.Errorf("timestamp out of window: peer timestamp %d, now %d (diff %d nanoseconds, max +/-30s)", timestampNano, now, diff)
-	}
-
-	// Construct message: peerX25519Public || ourX25519Public || timestampNano (big-endian int64)
+// timestampRaw:      timestamp from the handshake (raw 8-byte value); must be within +/-30s of now
+func VerifyPeerSig(peerEd25519Public ed25519.PublicKey, peerX25519Public, ourX25519Public [32]byte, sig [64]byte, timestampRaw int64) error {
+	// Construct message: peerX25519Public || ourX25519Public || timestampRaw (big-endian int64)
+	// The signature covers the exact wire bytes, so we use the raw value directly.
 	message := make([]byte, 32+32+8)
 	copy(message[0:32], peerX25519Public[:])
 	copy(message[32:64], ourX25519Public[:])
-
-	// Encode timestamp as big-endian int64 (nanoseconds)
 	for i := 0; i < 8; i++ {
-		message[64+i] = byte((timestampNano >> (56 - 8*i)) & 0xFF)
+		message[64+i] = byte((timestampRaw >> (56 - 8*i)) & 0xFF)
 	}
 
-	// Verify signature
+	// Verify signature (format-agnostic: uses raw wire bytes)
 	if !ed25519.Verify(peerEd25519Public, message, sig[:]) {
 		return fmt.Errorf("invalid peer signature")
+	}
+
+	// Time window check: normalize timestamp to nanoseconds for comparison
+	tsNano := NormalizeTimestamp(timestampRaw)
+	now := time.Now().UnixNano()
+	if diff := now - tsNano; diff < -30_000_000_000 || diff > 30_000_000_000 {
+		return fmt.Errorf("timestamp out of window: peer timestamp %d (normalized %d), now %d (diff %d nanoseconds, max +/-30s)", timestampRaw, tsNano, now, diff)
 	}
 
 	return nil

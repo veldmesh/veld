@@ -191,11 +191,14 @@ func (m *Manager) handleInit(noiseMsg []byte, addr net.Addr) {
 	if err != nil {
 		return
 	}
-	// ProcessMessage1 now returns the timestamp from the decrypted payload.
-	ts, err := respHS.ProcessMessage1(noiseMsg, time.Now().UnixNano())
+	// ProcessMessage1 now returns the raw timestamp from the decrypted payload.
+	tsRaw, err := respHS.ProcessMessage1(noiseMsg, time.Now().UnixNano())
 	if err != nil {
 		return // silently drop unknown or tampered init
 	}
+	// Normalize timestamp to nanoseconds for replay protection comparison.
+	ts := crypto.NormalizeTimestamp(tsRaw)
+
 	msg2, result, err := respHS.BuildMessage2(time.Now().UnixNano())
 	if err != nil {
 		return

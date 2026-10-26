@@ -102,5 +102,6 @@ func main() {
 
 	log.Println("shutting down...")
 	cancel()
+	rl.Stop()
 	grpcSrv.GracefulStop()
 }
