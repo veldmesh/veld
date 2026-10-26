@@ -187,9 +187,213 @@ func TestBuildParseHeader(t *testing.T) {
 	}
 }
 
+// TestDispatcher_TunToUDP verifies that a TUN packet is encrypted and sent over UDP
+// when a session exists for the destination peer.
+func TestDispatcher_TunToUDP(t *testing.T) {
+	sessA, _ := newTestSessionPair(t)
+
+	peerTbl := peer.New()
+	var peerBID [32]byte
+	peerBID[0] = 0x02
+	ep := mustAddrPort("1.2.3.4:5000")
+	entryB := &peer.Entry{ID: peerBID, VPNAddr: mustAddr("10.0.0.2")}
+	entryB.SetEndpoint(ep)
+	entryB.SetSession(sessA)
+	peerTbl.Upsert(entryB)
+
+	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
+	conn := newFakeConn()
+
+	d := New(tunDev, conn, peerTbl)
+	d.Start()
+	defer d.Stop()
+
+	// Send a packet from TUN destined for 10.0.0.2
+	ipPkt := buildIPv4Packet([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, []byte("hello"))
+	tunDev.Inject(ipPkt)
+
+	// Expect an encrypted UDP packet to be sent to peerB's endpoint
+	select {
+	case msg := <-conn.out:
+		if len(msg.data) < HeaderSize {
+			t.Fatalf("packet too short: %d", len(msg.data))
+		}
+		pktType, _, _ := parseHeader(msg.data[:HeaderSize])
+		if pktType != TypeData {
+			t.Errorf("pktType: got %d, want %d (TypeData)", pktType, TypeData)
+		}
+		// Verify it was sent to the correct endpoint
+		if msg.addr.String() != "1.2.3.4:5000" {
+			t.Errorf("sent to wrong addr: got %v, want 1.2.3.4:5000", msg.addr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout: no UDP packet sent")
+	}
+}
+
+// TestDispatcher_UDPToTun verifies that a UDP data packet is decrypted and injected into TUN.
+func TestDispatcher_UDPToTun(t *testing.T) {
+	sessA, sessB := newTestSessionPair(t)
+
+	peerTbl := peer.New()
+	var peerBID [32]byte
+	peerBID[0] = 0x02
+	ep := mustAddrPort("1.2.3.4:5000")
+	entryB := &peer.Entry{ID: peerBID, VPNAddr: mustAddr("10.0.0.2")}
+	entryB.SetEndpoint(ep)
+	entryB.SetSession(sessA)
+	peerTbl.Upsert(entryB)
+
+	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
+	conn := newFakeConn()
+
+	d := New(tunDev, conn, peerTbl)
+	d.Start()
+	defer d.Stop()
+
+	// Encrypt a packet with B's session (sessB) and send it via UDP
+	nonce, ct, err := sessB.Encrypt([]byte("hello from B"))
+	if err != nil {
+		t.Fatalf("encrypt failed: %v", err)
+	}
+	udpPkt := buildDataPacket(nonce, ct)
+
+	// Inject the UDP packet as if received from peerB's endpoint
+	conn.in <- udpMsg{data: udpPkt, addr: &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5000}}
+
+	// Expect the decrypted packet to appear on TUN via ReadDelivered
+	buf := make([]byte, 1500)
+	n, err := tunDev.ReadDelivered(buf)
+	if err != nil {
+		t.Fatalf("ReadDelivered failed: %v", err)
+	}
+	if string(buf[:n]) != "hello from B" {
+		t.Errorf("decrypted payload mismatch: got %q, want %q", buf[:n], "hello from B")
+	}
+}
+
+// TestDispatcher_NoSession_HoldsPacket verifies that a TUN packet for a peer
+// with no session is held in the queue and OnHandshakeRequired is called.
+func TestDispatcher_NoSession_HoldsPacket(t *testing.T) {
+	peerTbl := peer.New()
+	var peerBID [32]byte
+	peerBID[0] = 0x02
+	ep := mustAddrPort("1.2.3.4:5000")
+	entryB := &peer.Entry{ID: peerBID, VPNAddr: mustAddr("10.0.0.2")}
+	entryB.SetEndpoint(ep)
+	peerTbl.Upsert(entryB)
+
+	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
+	conn := newFakeConn()
+
+	handshakeRequired := make(chan *peer.Entry, 1)
+	d := New(tunDev, conn, peerTbl)
+	d.OnHandshakeRequired = func(e *peer.Entry) {
+		select {
+		case handshakeRequired <- e:
+		default:
+		}
+	}
+	d.Start()
+	defer d.Stop()
+
+	// Send a packet from TUN destined for 10.0.0.2 (no session yet)
+	ipPkt := buildIPv4Packet([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, []byte("hello"))
+	tunDev.Inject(ipPkt)
+
+	// Expect OnHandshakeRequired to be called
+	select {
+	case e := <-handshakeRequired:
+		if e.ID != peerBID {
+			t.Errorf("handshake required for wrong peer: got %x, want %x", e.ID[:8], peerBID[:8])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout: OnHandshakeRequired not called")
+	}
+
+	// Verify packet is held in queue
+	queued := entryB.DrainQueue()
+	if len(queued) != 1 {
+		t.Errorf("expected 1 queued packet, got %d", len(queued))
+	}
+}
+
+// TestDispatcher_UnknownDestIP_Drop verifies that a TUN packet with an unknown
+// destination IP is dropped (no session, no handshake trigger).
+func TestDispatcher_UnknownDestIP_Drop(t *testing.T) {
+	peerTbl := peer.New()
+	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
+	conn := newFakeConn()
+
+	d := New(tunDev, conn, peerTbl)
+	d.Start()
+	defer d.Stop()
+
+	// Send a packet from TUN destined for unknown IP 10.0.0.99
+	ipPkt := buildIPv4Packet([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 99}, []byte("hello"))
+	tunDev.Inject(ipPkt)
+
+	// No UDP packet should be sent, no handshake triggered
+	select {
+	case <-conn.out:
+		t.Error("unknown destination should not trigger UDP send")
+	case <-time.After(100 * time.Millisecond):
+		// Expected: no packet sent
+	}
+}
+
 // TestDispatcher_RekeyThreshold verifies that OnRekeyRequired fires when
 // a TUN packet hits a session at the nonce threshold (ErrRekeyRequired path).
 func TestDispatcher_RekeyThreshold(t *testing.T) {
+	sessA, _ := newTestSessionPair(t)
+
+	// Set session age beyond the rekey time limit (lowered threshold for testing).
+	sessA.SetCreatedAt(time.Now().Add(-session.RekeyTimeLimit - time.Second))
+
+	peerTbl := peer.New()
+	var peerBID [32]byte
+	peerBID[0] = 0x02
+	ep := mustAddrPort("1.2.3.4:5000")
+	entryB := &peer.Entry{ID: peerBID, VPNAddr: mustAddr("10.0.0.2")}
+	entryB.SetEndpoint(ep)
+	entryB.SetSession(sessA)
+	peerTbl.Upsert(entryB)
+
+	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
+	conn := newFakeConn()
+
+	rekeyCalled := make(chan struct{}, 1)
+	d := New(tunDev, conn, peerTbl)
+	d.OnRekeyRequired = func(e *peer.Entry) {
+		select {
+		case rekeyCalled <- struct{}{}:
+		default:
+		}
+	}
+	d.Start()
+	defer d.Stop()
+
+	// Send a packet from TUN - should trigger rekey because session needs rekey
+	ipPkt := buildIPv4Packet([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, []byte("hello"))
+	tunDev.Inject(ipPkt)
+
+	select {
+	case <-rekeyCalled:
+		// Expected: rekey callback fired
+	case <-time.After(time.Second):
+		t.Fatal("timeout: OnRekeyRequired not called when session needs rekey")
+	}
+
+	// Verify packet is held in queue
+	queued := entryB.DrainQueue()
+	if len(queued) != 1 {
+		t.Errorf("expected 1 queued packet, got %d", len(queued))
+	}
+}
+
+// TestDispatcher_RekeyViaNeedsRekey verifies that a session with an old
+// CreatedAt triggers rekey via the periodic NeedsRekey scan (time-based rekey).
+func TestDispatcher_RekeyViaNeedsRekey(t *testing.T) {
 	sessA, _ := newTestSessionPair(t)
 
 	peerTbl := peer.New()
@@ -212,26 +416,31 @@ func TestDispatcher_RekeyThreshold(t *testing.T) {
 		default:
 		}
 	}
-
-	// The actual nonce threshold logic is tested in session_test.go (TestSession_RekeyThreshold).
-	// Here we just verify the callback wiring exists.
-	_ = rekeyCalled
-	_ = sessA
-}
-
-// TestDispatcher_RekeyViaNeedsRekey verifies that a session with an old
-// CreatedAt triggers rekey via the periodic NeedsRekey scan (time-based rekey).
-func TestDispatcher_RekeyViaNeedsRekey(t *testing.T) {
-	sessA, _ := newTestSessionPair(t)
+	d.Start()
+	defer d.Stop()
 
 	// Fresh session should not need rekey.
 	if sessA.NeedsRekey() {
 		t.Fatal("fresh session should not need rekey")
 	}
 
-	// The time-based rekey is tested in session_test.go (TestSession_RekeyTimeLimit).
-	// Here we just verify the callback wiring exists.
-	_ = sessA
+	// Simulate an old session by setting createdAt to the past (lowered threshold for testing).
+	sessA.SetCreatedAt(time.Now().Add(-session.RekeyTimeLimit - time.Second))
+
+	// Now the session needs rekey.
+	if !sessA.NeedsRekey() {
+		t.Fatal("old session should need rekey")
+	}
+
+	// Call checkRekey directly (normally called by rekeyLoop every 30s)
+	d.checkRekey()
+
+	select {
+	case <-rekeyCalled:
+		// Expected: rekey callback fired
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timeout: OnRekeyRequired not called for time-based rekey")
+	}
 }
 
 // TestDispatcher_RekeyCallbackWiring verifies that OnRekeyRequired is
@@ -260,6 +469,8 @@ func TestDispatcher_RekeyCallbackWiring(t *testing.T) {
 		default:
 		}
 	}
+	d.Start()
+	defer d.Stop()
 
 	// For a fresh session, checkRekey should not call OnRekeyRequired.
 	d.checkRekey()
@@ -269,5 +480,16 @@ func TestDispatcher_RekeyCallbackWiring(t *testing.T) {
 		t.Error("checkRekey should not fire for fresh session")
 	case <-time.After(50 * time.Millisecond):
 		// Expected: no rekey call.
+	}
+
+	// Now set session to need rekey (by time limit)
+	sessA.SetCreatedAt(time.Now().Add(-session.RekeyTimeLimit - time.Second))
+	d.checkRekey()
+
+	select {
+	case <-rekeyCalled:
+		// Expected: rekey callback fired for session needing rekey
+	case <-time.After(50 * time.Millisecond):
+		t.Error("checkRekey should fire for session needing rekey")
 	}
 }

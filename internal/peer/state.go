@@ -33,12 +33,13 @@ type Entry struct {
 	Name         string         // peer name as registered (e.g. "server1")
 	SubnetRoutes []netip.Prefix // LAN prefixes this peer advertises (e.g. 192.168.1.0/24)
 
-	mu        sync.Mutex
-	endpoint  netip.AddrPort
-	session   *internalsession.Session
-	state     State
-	lastSeen  time.Time
-	holdQueue [][]byte
+	mu            sync.Mutex
+	endpoint      netip.AddrPort
+	session       *internalsession.Session
+	pendingSession *internalsession.Session
+	state         State
+	lastSeen      time.Time
+	holdQueue     [][]byte
 }
 
 // GetEndpoint returns the peer's current UDP endpoint.
@@ -67,7 +68,36 @@ func (e *Entry) SetSession(s *internalsession.Session) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.session = s
+	e.pendingSession = nil
 	e.state = StateConnected
+}
+
+// GetPendingSession returns the pending session (nil if none).
+func (e *Entry) GetPendingSession() *internalsession.Session {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.pendingSession
+}
+
+// SetPendingSession sets the pending session (for handshake confirmation).
+func (e *Entry) SetPendingSession(s *internalsession.Session) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.pendingSession = s
+}
+
+// PromotePendingSession promotes the pending session to the active session
+// if a pending session exists. Returns true if promotion occurred.
+func (e *Entry) PromotePendingSession() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.pendingSession != nil {
+		e.session = e.pendingSession
+		e.pendingSession = nil
+		e.state = StateConnected
+		return true
+	}
+	return false
 }
 
 // GetState returns the current connection state.

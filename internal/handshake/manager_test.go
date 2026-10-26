@@ -3,6 +3,7 @@
 package handshake
 
 import (
+	"encoding/binary"
 	"net"
 	"net/netip"
 	"sync"
@@ -12,6 +13,17 @@ import (
 	"github.com/veldmesh/veld/internal/crypto"
 	"github.com/veldmesh/veld/internal/peer"
 )
+
+const typeData uint32 = 0x01
+
+// buildDataPacket builds a TypeData packet with the given nonce and ciphertext.
+func buildDataPacket(nonce uint64, ct []byte) []byte {
+	buf := make([]byte, headerSize+8+len(ct))
+	binary.BigEndian.PutUint32(buf[0:4], typeData)
+	binary.BigEndian.PutUint64(buf[8:16], nonce)
+	copy(buf[headerSize:], ct)
+	return buf
+}
 
 // testConn is a minimal net.PacketConn for testing.
 type testConn struct {
@@ -296,13 +308,12 @@ func TestManager_FullHandshake(t *testing.T) {
 	connB := newTestConn()
 
 	sessEstA := make(chan struct{}, 1)
-	sessEstB := make(chan struct{}, 1)
-
+	// B's session is established lazily (on first data packet), so we don't
+	// wait for OnSessionEstablished here. We verify the pending session exists.
 	mgrA := New(idA, netID, tblA, connA)
 	mgrA.OnSessionEstablished = func(*peer.Entry) { sessEstA <- struct{}{} }
 
 	mgrB := New(idB, netID, tblB, connB)
-	mgrB.OnSessionEstablished = func(*peer.Entry) { sessEstB <- struct{}{} }
 
 	// A initiates.
 	mgrA.Initiate(entryBinA)
@@ -319,17 +330,17 @@ func TestManager_FullHandshake(t *testing.T) {
 	addrA := &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 1000}
 	mgrB.HandlePacket(initPkt.data, addrA)
 
-	// Expect B to have sent a resp and established its session.
+	// Expect B to have sent a resp.
 	var respPkt testMsg
 	select {
 	case respPkt = <-connB.out:
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for resp packet")
 	}
-	select {
-	case <-sessEstB:
-	case <-time.After(time.Second):
-		t.Fatal("timeout: B session not established")
+
+	// B should have a pending session now (not yet confirmed).
+	if entryAinB.GetPendingSession() == nil {
+		t.Error("B should have a pending session after processing Init")
 	}
 
 	// Feed resp packet to A (as if received from 2.2.2.2:2000 = B's addr).
@@ -342,12 +353,41 @@ func TestManager_FullHandshake(t *testing.T) {
 		t.Fatal("timeout: A session not established")
 	}
 
-	// Verify sessions are set on both sides.
+	// Verify A's session is set (initiator confirms immediately on Resp).
 	if entryBinA.GetSession() == nil {
 		t.Error("A's session for B should be set")
 	}
+	// B still has pending session until first data packet arrives.
+	if entryAinB.GetPendingSession() == nil {
+		t.Error("B should still have pending session")
+	}
+
+	// Simulate A sending a data packet to B to confirm the handshake.
+	// Encrypt a dummy packet with A's session and feed it to B via HandleDataPacket.
+	sessA := entryBinA.GetSession()
+	if sessA == nil {
+		t.Fatal("A session is nil")
+	}
+	nonce, ct, err := sessA.Encrypt([]byte("test"))
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+
+	// Use HandleDataPacket to process the data packet and promote pending session.
+	plain, promoted := mgrB.HandleDataPacket(entryAinB, nonce, ct)
+	if !promoted {
+		t.Error("HandleDataPacket should promote pending session")
+	}
+	if plain == nil {
+		t.Error("HandleDataPacket should return decrypted plaintext")
+	}
+
+	// Now B should have promoted the pending session to active.
 	if entryAinB.GetSession() == nil {
-		t.Error("B's session for A should be set")
+		t.Error("B's session should be promoted after receiving data packet")
+	}
+	if entryAinB.GetPendingSession() != nil {
+		t.Error("B's pending session should be cleared after promotion")
 	}
 }
 
@@ -401,8 +441,6 @@ func TestManager_HandleInit_ReplayRejection(t *testing.T) {
 
 	connB := newTestConn()
 	mgrB := New(idB, netID, tblB, connB)
-	sessEstB := make(chan struct{}, 1)
-	mgrB.OnSessionEstablished = func(*peer.Entry) { sessEstB <- struct{}{} }
 
 	// Build a valid init packet from A.
 	connA := newTestConn()
@@ -423,17 +461,11 @@ func TestManager_HandleInit_ReplayRejection(t *testing.T) {
 	addrA := &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 1000}
 	mgrB.HandlePacket(initPkt.data, addrA)
 
-	select {
-	case <-sessEstB:
-	case <-time.After(time.Second):
-		t.Fatal("first handshake: B session not established")
+	// B should have a pending session now.
+	if entryAinB.GetPendingSession() == nil {
+		t.Fatal("pending session should be created after first Init")
 	}
-
-	// Verify session is established.
-	if entryAinB.GetSession() == nil {
-		t.Fatal("session should be established after first Init")
-	}
-	firstSession := entryAinB.GetSession()
+	firstPending := entryAinB.GetPendingSession()
 
 	// Drain the first response packet from connB.
 	select {
@@ -443,7 +475,7 @@ func TestManager_HandleInit_ReplayRejection(t *testing.T) {
 	}
 
 	// Feed the SAME init packet again (replay) -- should be rejected.
-	// The session pointer should remain unchanged.
+	// The pending session pointer should remain unchanged.
 	mgrB.HandlePacket(initPkt.data, addrA)
 
 	select {
@@ -452,9 +484,9 @@ func TestManager_HandleInit_ReplayRejection(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 
-	// Session should be unchanged.
-	if entryAinB.GetSession() != firstSession {
-		t.Error("replayed Init should not replace existing session")
+	// Pending session should be unchanged.
+	if entryAinB.GetPendingSession() != firstPending {
+		t.Error("replayed Init should not replace existing pending session")
 	}
 }
 
@@ -473,8 +505,6 @@ func TestManager_HandleInit_StaleTimestampRejection(t *testing.T) {
 
 	connB := newTestConn()
 	mgrB := New(idB, netID, tblB, connB)
-	sessEstB := make(chan struct{}, 1)
-	mgrB.OnSessionEstablished = func(*peer.Entry) { sessEstB <- struct{}{} }
 
 	// Build a valid init packet from A with a specific timestamp.
 	hs, err := crypto.NewInitiatorHS(idA, idB.X25519Public, netID)
@@ -492,15 +522,11 @@ func TestManager_HandleInit_StaleTimestampRejection(t *testing.T) {
 	addrA := &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 1000}
 	mgrB.HandlePacket(initPkt, addrA)
 
-	select {
-	case <-sessEstB:
-	case <-time.After(time.Second):
-		t.Fatal("first handshake: B session not established")
+	// B should have a pending session.
+	if entryAinB.GetPendingSession() == nil {
+		t.Fatal("pending session should be created after first Init")
 	}
-
-	if entryAinB.GetSession() == nil {
-		t.Fatal("session should be established after first Init")
-	}
+	firstPending := entryAinB.GetPendingSession()
 
 	// Drain the first response packet from connB.
 	select {
@@ -518,9 +544,9 @@ func TestManager_HandleInit_StaleTimestampRejection(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 
-	// Session should be unchanged.
-	if entryAinB.GetSession() == nil {
-		t.Error("session should still exist")
+	// Pending session should be unchanged.
+	if entryAinB.GetPendingSession() != firstPending {
+		t.Error("stale timestamp Init should not replace existing pending session")
 	}
 
 	// Send an Init with a newer timestamp (should succeed).
@@ -543,5 +569,95 @@ func TestManager_HandleInit_StaleTimestampRejection(t *testing.T) {
 		// Expected: new response sent.
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for response to newer Init")
+	}
+
+	// New pending session should be created.
+	if entryAinB.GetPendingSession() == firstPending {
+		t.Error("newer Init should create a new pending session")
+	}
+}
+
+// TestManager_PendingSessionPromotion verifies that a pending session is
+// promoted to active when a data packet decrypts successfully with it.
+func TestManager_PendingSessionPromotion(t *testing.T) {
+	idA, _ := crypto.Generate()
+	idB, _ := crypto.Generate()
+
+	var netID [16]byte
+
+	// B's table knows A.
+	tblB := peer.New()
+	entryAinB := makeTestEntry(idA, "10.0.0.1", "1.1.1.1:1000")
+	tblB.Upsert(entryAinB)
+
+	connB := newTestConn()
+	mgrB := New(idB, netID, tblB, connB)
+
+	// Build a valid init packet from A.
+	connA := newTestConn()
+	tblA := peer.New()
+	entryBinA := makeTestEntry(idB, "10.0.0.2", "2.2.2.2:2000")
+	tblA.Upsert(entryBinA)
+	mgrA := New(idA, netID, tblA, connA)
+	mgrA.Initiate(entryBinA)
+
+	var initPkt testMsg
+	select {
+	case initPkt = <-connA.out:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for init packet from A")
+	}
+
+	// Feed init packet to B.
+	addrA := &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 1000}
+	mgrB.HandlePacket(initPkt.data, addrA)
+
+	// B has pending session.
+	pending := entryAinB.GetPendingSession()
+	if pending == nil {
+		t.Fatal("pending session should exist")
+	}
+
+	// Drain the response.
+	select {
+	case respPkt := <-connB.out:
+		// Feed resp to A to complete A's side.
+		addrB := &net.UDPAddr{IP: net.ParseIP("2.2.2.2"), Port: 2000}
+		mgrA.HandlePacket(respPkt.data, addrB)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for response")
+	}
+
+	// A now has active session.
+	sessA := entryBinA.GetSession()
+	if sessA == nil {
+		t.Fatal("A should have active session")
+	}
+
+	// Encrypt a data packet with A's session and send to B via HandleDataPacket.
+	nonce, ct, err := sessA.Encrypt([]byte("confirmation packet"))
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+
+	// Use HandleDataPacket to process the data packet and promote pending session.
+	plain, promoted := mgrB.HandleDataPacket(entryAinB, nonce, ct)
+	if !promoted {
+		t.Error("HandleDataPacket should promote pending session")
+	}
+	if plain == nil {
+		t.Error("HandleDataPacket should return decrypted plaintext")
+	}
+
+	// B should have promoted the session.
+	if entryAinB.GetSession() == nil {
+		t.Error("session should be promoted after valid data packet")
+	}
+	if entryAinB.GetPendingSession() != nil {
+		t.Error("pending session should be cleared after promotion")
+	}
+	// The promoted session should be the same as the pending one.
+	if entryAinB.GetSession() != pending {
+		t.Error("promoted session should be the same as pending session")
 	}
 }

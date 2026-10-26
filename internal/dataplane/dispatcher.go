@@ -49,6 +49,11 @@ type Dispatcher struct {
 	// pkt is the full wire packet (including 16-byte header); addr is the sender.
 	OnNATProbePacket func(pkt []byte, addr net.Addr)
 
+	// OnSessionEstablished is called when a pending session is promoted to active
+	// (WireGuard-style handshake confirmation). The caller uses this to flush the
+	// peer's hold queue via FlushHoldQueue.
+	OnSessionEstablished func(entry *peer.Entry)
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -196,6 +201,16 @@ func (d *Dispatcher) handleTunPacket(pkt []byte) {
 		return
 	}
 
+	// Check NeedsRekey before encrypting: a session at the nonce threshold
+	// or beyond the time limit must not be used for new packets.
+	if sess.NeedsRekey() {
+		entry.Enqueue(pkt)
+		if d.OnRekeyRequired != nil {
+			d.OnRekeyRequired(entry)
+		}
+		return
+	}
+
 	nonce, ct, err := sess.Encrypt(pkt)
 	if err != nil {
 		if errors.Is(err, session.ErrRekeyRequired) {
@@ -248,13 +263,13 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 			return
 		}
 		sess := entry.GetSession()
-		if sess == nil {
+
+		plain := decryptDataPacket(entry, sess, nonce, payload)
+
+		if plain == nil {
 			return
 		}
-		plain, err := sess.Decrypt(nonce, payload)
-		if err != nil || plain == nil {
-			return
-		}
+
 		entry.Touch()
 		d.tunMu.RLock()
 		t := d.tun
@@ -290,6 +305,34 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 			d.OnNATProbePacket(pktCopy, addr)
 		}
 	}
+}
+
+// decryptDataPacket decrypts a data packet using the peer's active session,
+// falling back to the pending session (WireGuard-style handshake confirmation).
+// If the pending session decrypts successfully, it is promoted to active and
+// OnSessionEstablished is called. Returns nil if decryption fails with both.
+func decryptDataPacket(entry *peer.Entry, sess *session.Session, nonce uint64, payload []byte) []byte {
+	// Try the active session first.
+	if sess != nil {
+		plain, err := sess.Decrypt(nonce, payload)
+		if err == nil && plain != nil {
+			return plain
+		}
+	}
+
+	// Fall back to the pending session. If a handshake was initiated by the
+	// peer, the new session is pending confirmation. The first data packet
+	// that decrypts with it confirms the handshake.
+	if pending := entry.GetPendingSession(); pending != nil {
+		plain, err := pending.Decrypt(nonce, payload)
+		if err == nil && plain != nil {
+			// Pending session works -- promote it to active.
+			entry.PromotePendingSession()
+			return plain
+		}
+	}
+
+	return nil
 }
 
 // extractDestIP reads the destination IP from a raw IPv4 or IPv6 packet.

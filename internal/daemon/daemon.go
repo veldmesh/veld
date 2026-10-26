@@ -68,6 +68,7 @@ func New(
 	disp.OnRekeyRequired = hsMgr.Initiate
 	disp.OnHandshakePacket = hsMgr.HandlePacket
 	hsMgr.OnSessionEstablished = disp.FlushHoldQueue
+	disp.OnSessionEstablished = disp.FlushHoldQueue
 
 	return &Daemon{
 		disp:      disp,

@@ -45,6 +45,12 @@ func (s *Session) CreatedAt() time.Time {
 	return s.createdAt
 }
 
+// SetCreatedAt sets the session creation time. Used to adjust the session age
+// for the time-based rekey check (e.g., after a clock adjustment).
+func (s *Session) SetCreatedAt(t time.Time) {
+	s.createdAt = t
+}
+
 // NeedsRekey returns true if the session has exceeded either the nonce
 // threshold or the time limit and should be rekeyed.
 func (s *Session) NeedsRekey() bool {

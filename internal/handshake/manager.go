@@ -154,6 +154,29 @@ func (m *Manager) HandlePacket(pkt []byte, addr net.Addr) {
 	}
 }
 
+// HandleDataPacket attempts to decrypt a data packet using the peer's pending
+// session (for handshake confirmation). If successful, promotes the pending
+// session to active and calls OnSessionEstablished.
+// Returns the decrypted plaintext, or nil if decryption failed or no pending session.
+// This is called by the dispatcher when a data packet fails to decrypt with the active session.
+func (m *Manager) HandleDataPacket(entry *peer.Entry, nonce uint64, ciphertext []byte) ([]byte, bool) {
+	pending := entry.GetPendingSession()
+	if pending == nil {
+		return nil, false
+	}
+	plain, err := pending.Decrypt(nonce, ciphertext)
+	if err != nil || plain == nil {
+		return nil, false
+	}
+	// Pending session works -- promote it to active.
+	if entry.PromotePendingSession() {
+		if m.OnSessionEstablished != nil {
+			m.OnSessionEstablished(entry)
+		}
+	}
+	return plain, true
+}
+
 // OnPeerRemoved cleans up handshake state for a peer that has been removed.
 // Call this when the peer table removes a peer (e.g., on Leave or expiration).
 func (m *Manager) OnPeerRemoved(peerID [32]byte) {
@@ -211,11 +234,11 @@ func (m *Manager) handleInit(noiseMsg []byte, addr net.Addr) {
 		m.peers.UpdateEndpoint(peerID, ep)
 	}
 
-	entry.SetSession(session.New(result))
-
-	if m.OnSessionEstablished != nil {
-		m.OnSessionEstablished(entry)
-	}
+	// Store the new session as pending. It will be promoted to active when
+	// the initiator sends a data packet that successfully decrypts with it
+	// (WireGuard-style handshake confirmation). This prevents tunnel desync
+	// if the Resp packet is lost.
+	entry.SetPendingSession(session.New(result))
 
 	pkt := buildPacket(typeHandshakeResp, msg2)
 	m.conn.WriteTo(pkt, addr)
@@ -239,8 +262,6 @@ func (m *Manager) handleResp(noiseMsg []byte, addr net.Addr) {
 		return
 	}
 	delete(m.pending, entry.ID)
-	// Clean up initTimestamps on successful handshake completion.
-	delete(m.initTimestamps, entry.ID)
 	m.mu.Unlock()
 
 	result, err := phs.hs.ProcessMessage2(noiseMsg, time.Now().UnixNano())
@@ -263,6 +284,8 @@ func (m *Manager) handleResp(noiseMsg []byte, addr net.Addr) {
 		}
 	}
 
+	// Initiator side: the handshake is confirmed when we successfully process
+	// the Resp. Promote the session immediately.
 	entry.SetSession(session.New(result))
 
 	if m.OnSessionEstablished != nil {
