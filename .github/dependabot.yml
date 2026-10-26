@@ -15,10 +15,10 @@ updates:
       - "docker"
     # Pin to golang:1.26.x - only patch updates within 1.26
     allow:
-      - dependency-name: "golang"
-        update-type: "version-update:semver-patch"
       - dependency-type: "direct"
-        update-type: "version-update:semver-patch"
+        dependency-name: "golang"
+        update-types:
+          - "version-update:semver-patch"
 
   # GitHub Actions - check weekly for updates to pinned actions
   - package-ecosystem: "github-actions"
