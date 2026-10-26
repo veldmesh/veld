@@ -22,6 +22,13 @@ SOFTWARE.
 
 ---
 
-Note: This MIT License applies to the daemon, CLI, and web frontend
-(cmd/, internal/, web/ directories). The coordination server (coord/)
-is governed by a separate license — see coord/LICENSE.
+Note: This MIT License applies to the daemon, CLI, tray app, and tests:
+- `cmd/` (except `cmd/veld-relay`)
+- `internal/` (except `internal/coord`)
+- `tray/`
+- `tests/e2e/`
+
+The following are licensed under the Business Source License 1.1 (BSL-1.1):
+- Coordination server (`coord/`) — see coord/LICENSE
+- Coord client library (`internal/coord`) — see coord/LICENSE
+- Relay server (`relay/`, `cmd/veld-relay`) — see relay/LICENSE
