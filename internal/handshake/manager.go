@@ -87,6 +87,9 @@ func (m *Manager) Initiate(entry *peer.Entry) {
 		}
 		// Expired: allow retry, but bound total retries.
 		if phs.retries >= maxHandshakeRetries {
+			// Retries exhausted: delete the pending entry so a future Initiate
+			// can start a fresh handshake attempt (e.g., after network recovery).
+			delete(m.pending, entry.ID)
 			m.mu.Unlock()
 			return
 		}
@@ -265,22 +268,6 @@ func (m *Manager) handleResp(noiseMsg []byte, addr net.Addr) {
 	if m.OnSessionEstablished != nil {
 		m.OnSessionEstablished(entry)
 	}
-}
-
-// extractInitTimestamp extracts the Unix timestamp (nanoseconds) from an encrypted
-// Noise IK Message1 payload. The payload is 120 bytes:
-//
-//	ed25519_pub [32]
-//	sig         [64]
-//	network_id  [16]
-//	timestamp   [ 8]  (big-endian uint64 nanoseconds since epoch)
-//
-// Kept for potential external use, but handleInit now gets timestamp from ProcessMessage1.
-func extractInitTimestamp(payload []byte) int64 {
-	if len(payload) < 120 {
-		return 0
-	}
-	return int64(binary.BigEndian.Uint64(payload[112:120]))
 }
 
 // buildPacket assembles a wire-format handshake UDP payload.

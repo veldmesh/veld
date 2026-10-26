@@ -208,6 +208,74 @@ func TestManager_Initiate_RetryBounded(t *testing.T) {
 	}
 }
 
+// TestManager_Initiate_RetryResetAfterExhaustion verifies that after retries
+// are exhausted and the pending entry is cleaned up, a future Initiate can
+// start a fresh handshake (e.g., after network recovery).
+func TestManager_Initiate_RetryResetAfterExhaustion(t *testing.T) {
+	idA, _ := crypto.Generate()
+	idB, _ := crypto.Generate()
+
+	tbl := peer.New()
+	entryB := makeTestEntry(idB, "10.0.0.2", "1.2.3.4:5000")
+	tbl.Upsert(entryB)
+
+	conn := newTestConn()
+	mgr := New(idA, [16]byte{}, tbl, conn)
+
+	// First Initiate.
+	mgr.Initiate(entryB)
+	<-conn.out
+
+	// Expire and retry up to maxHandshakeRetries times.
+	for i := 0; i < maxHandshakeRetries; i++ {
+		mgr.mu.Lock()
+		if phs, ok := mgr.pending[entryB.ID]; ok {
+			phs.createdAt = time.Now().Add(-handshakeRetryTimeout - time.Second)
+		}
+		mgr.mu.Unlock()
+
+		mgr.Initiate(entryB)
+		select {
+		case <-conn.out:
+		case <-time.After(time.Second):
+			t.Fatalf("retry %d: timeout", i+1)
+		}
+	}
+
+	// One more retry attempt (exceeds maxHandshakeRetries) -- should be blocked
+	// and the pending entry should be cleaned up.
+	mgr.mu.Lock()
+	if phs, ok := mgr.pending[entryB.ID]; ok {
+		phs.createdAt = time.Now().Add(-handshakeRetryTimeout - time.Second)
+	}
+	mgr.mu.Unlock()
+
+	mgr.Initiate(entryB)
+	select {
+	case <-conn.out:
+		t.Error("Initiate should be blocked after maxHandshakeRetries")
+	case <-time.After(20 * time.Millisecond):
+		// Expected: no packet sent.
+	}
+
+	// Verify pending entry was cleaned up.
+	mgr.mu.Lock()
+	_, exists := mgr.pending[entryB.ID]
+	mgr.mu.Unlock()
+	if exists {
+		t.Error("pending entry should be cleaned up after retries exhausted")
+	}
+
+	// Now a new Initiate should start a fresh handshake (retries reset).
+	mgr.Initiate(entryB)
+	select {
+	case <-conn.out:
+		// Success: fresh Init sent.
+	case <-time.After(time.Second):
+		t.Fatal("timeout: fresh init not sent after retries exhausted and cleaned up")
+	}
+}
+
 func TestManager_FullHandshake(t *testing.T) {
 	idA, _ := crypto.Generate()
 	idB, _ := crypto.Generate()

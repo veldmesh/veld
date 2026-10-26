@@ -5,6 +5,7 @@ package tofu
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -57,16 +58,23 @@ func TestStore_SameKey_Accepted(t *testing.T) {
 	}
 }
 
-func TestStore_DifferentKey_Rejected(t *testing.T) {
+func TestStore_DifferentKeyAtSameVPN_Rejected(t *testing.T) {
 	s := tempStore(t)
 	pub1 := genKey(t)
 	pub2 := genKey(t)
 
 	s.Check("10.0.0.2", pub1) //nolint:errcheck -- first pin
 
+	// Different Ed25519 key at same VPN is a TOFU violation -- rejected.
 	err := s.Check("10.0.0.2", pub2)
 	if !errors.Is(err, ErrFingerprintMismatch) {
 		t.Errorf("different key at same VPN should be rejected: got %v, want ErrFingerprintMismatch", err)
+	}
+
+	pins := s.List()
+	// Only the first peer remains pinned.
+	if len(pins) != 1 {
+		t.Errorf("expected 1 pin, got %d", len(pins))
 	}
 }
 
@@ -88,8 +96,9 @@ func TestStore_Persist_AcrossLoad(t *testing.T) {
 	}
 
 	pub2 := genKey(t)
+	// Different key at same VPN is a TOFU violation -- rejected.
 	if err := s2.Check("10.0.0.2", pub2); !errors.Is(err, ErrFingerprintMismatch) {
-		t.Errorf("reloaded store accepted different key: %v", err)
+		t.Errorf("reloaded store should reject different key at same VPN: %v", err)
 	}
 }
 
@@ -100,16 +109,19 @@ func TestStore_Forget_ReallowsRepin(t *testing.T) {
 
 	s.Check("10.0.0.2", pub1) //nolint:errcheck -- first pin
 
-	if err := s.Forget("10.0.0.2"); err != nil {
+	if err := s.Forget(pub1); err != nil {
 		t.Fatalf("Forget: %v", err)
 	}
 
-	if err := s.Check("10.0.0.2", pub2); err != nil {
-		t.Errorf("after Forget, first key should be accepted: %v", err)
+	// After Forget(pub1), the VPN address is unpinned.
+	// pub1 can be pinned again.
+	if err := s.Check("10.0.0.2", pub1); err != nil {
+		t.Errorf("after Forget, pub1 should be accepted: %v", err)
 	}
 
-	if err := s.Check("10.0.0.2", pub1); !errors.Is(err, ErrFingerprintMismatch) {
-		t.Errorf("after re-pin, different key should be rejected: %v", err)
+	// Now pub1 is pinned at 10.0.0.2 again. pub2 at same VPN should be rejected.
+	if err := s.Check("10.0.0.2", pub2); !errors.Is(err, ErrFingerprintMismatch) {
+		t.Errorf("pub2 should be rejected (pub1 now occupies VPN): %v", err)
 	}
 }
 
@@ -127,6 +139,7 @@ func TestStore_MultipleVPNs_Independent(t *testing.T) {
 	if err := s.Check("10.0.0.2", pubB); err != nil {
 		t.Errorf("VPN B with key B rejected: %v", err)
 	}
+	// Same pubA at different VPN -- updates VPN address for pubA.
 	if err := s.Check("10.0.0.3", pubA); err != nil {
 		t.Errorf("VPN C with key A rejected: %v", err)
 	}
@@ -224,6 +237,7 @@ func TestStore_Migration_OldFormat(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
+	// v1 entries have no pubkey -- dropped during migration.
 	pins := s.List()
 	if len(pins) != 0 {
 		t.Errorf("old entries should be migrated away, got %d", len(pins))
@@ -244,10 +258,12 @@ func TestStore_ForgetByVPNAddr(t *testing.T) {
 	pub1 := genKey(t)
 	pub2 := genKey(t)
 
+	// pub1 at 10.0.0.1
 	s.Check("10.0.0.1", pub1) //nolint:errcheck
-	s.Check("10.0.0.1", pub2) //nolint:errcheck
-	s.Check("10.0.0.2", pub1) //nolint:errcheck
+	// pub2 at 10.0.0.2 (different VPN)
+	s.Check("10.0.0.2", pub2) //nolint:errcheck
 
+	// Forget by VPN address 10.0.0.1 -- should remove pub1.
 	if err := s.ForgetByVPNAddr("10.0.0.1"); err != nil {
 		t.Fatalf("ForgetByVPNAddr: %v", err)
 	}
@@ -284,22 +300,26 @@ func TestStore_Migration_MixedFormats(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
+	// v2 entry with pubkey is migrated (re-keyed by pubkey).
+	// v2 entry without pubkey is dropped.
 	pins := s.List()
 	if len(pins) != 1 {
 		t.Errorf("expected 1 valid pin after migration, got %d", len(pins))
 	}
 
-	// The valid entry pins 10.0.0.1 to fingerprint "aaaa...".
-	// A different key should be rejected (TOFU enforcement).
+	// The migrated entry has pubkey "aaaa..." pinned to fingerprint "aaaa..." at VPN 10.0.0.1.
+	// A different key at same VPN is a TOFU violation -- rejected.
 	pub := genKey(t)
 	if err := s.Check("10.0.0.1", pub); !errors.Is(err, ErrFingerprintMismatch) {
-		t.Errorf("valid pin should enforce its fingerprint: got %v, want ErrFingerprintMismatch", err)
+		t.Errorf("different key at same VPN should be rejected: got %v, want ErrFingerprintMismatch", err)
 	}
 
-	// After Forget, the first key is accepted.
-	if err := s.Forget("10.0.0.1"); err != nil {
+	// Forget the migrated pubkey.
+	pubKeyToForget, _ := hex.DecodeString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	if err := s.Forget(pubKeyToForget); err != nil {
 		t.Fatalf("Forget: %v", err)
 	}
+	// Now the VPN is unpinned, first key is accepted.
 	if err := s.Check("10.0.0.1", pub); err != nil {
 		t.Errorf("after Forget, first key should be accepted: %v", err)
 	}
