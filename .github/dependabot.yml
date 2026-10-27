@@ -18,7 +18,8 @@ updates:
     allow:
       - dependency-type: "direct"
         dependency-name: "golang"
-        update-type: "version-update:semver-patch"
+        update-types:
+          - "version-update:semver-patch"
 
   # GitHub Actions - check weekly for updates to pinned actions
   - package-ecosystem: "github-actions"
