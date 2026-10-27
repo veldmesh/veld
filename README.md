@@ -10,25 +10,25 @@ Traffic flows directly between your devices. When direct connection isn't possib
 
 | | Tailscale | Veld |
 |---|---|---|
-| Traffic routing | Via relay if direct fails | Direct P2P for ~85% of NATs. Relay via a mesh peer for the rest — relay path is a known gap (not yet implemented). |
-| Coord server sees traffic | Yes (DERP relay) | Coord server never sees, routes, or authenticates traffic. It holds only public keys and endpoints. |
+| Traffic routing | Via relay if direct fails | Direct P2P for most NATs. Relay via a mesh peer when hole punching fails (e.g., symmetric NAT on both sides) — see [docs/RELAY.md](docs/RELAY.md). |
+| Coord server sees traffic | No (DERP relays forward encrypted WireGuard packets) | Coord server never carries or reads traffic. It stores public keys, names, VPN addresses, subnet routes, and hour-rounded last-seen on disk; endpoints are kept in memory only. |
 | Open source | Client only | Daemon + CE coord server (BSL) |
 | Pricing model | Per user | Per network |
 | Runs without a server | No | Yes (static config or LAN mDNS) |
-| IoT / OpenWrt | Yes | Yes (MIPS + ARMv6 builds) |
+| IoT / OpenWrt | Yes (MIPSLE, ARMv6, ARMv7, ARM64) | Yes (MIPS, MIPSLE, ARMv6, ARMv7, ARM64) |
 
 ---
 
 ## Features
 
 - **Custom Noise IK handshake** — Ed25519 identity keys, X25519 session keys, ChaCha20-Poly1305 encryption, forward secrecy
-- **No kernel modules** — userspace TUN via `wireguard/tun`; no WireGuard daemon
-- **NAT traversal** — UDP hole-punching via ICE for ~85% of NATs. Where direct connection fails (symmetric NAT behind symmetric NAT), traffic *will* relay through a chosen mesh peer over a Noise IK-encrypted channel — never the coordination server. The relaying peer sees only encrypted packet sizes/timing, not content. **Relay implementation is in progress.**
+- **No WireGuard kernel module or daemon** — needs only the kernel TUN driver (kmod-tun on OpenWrt)
+- **NAT traversal** — UDP hole-punching via ICE for most NATs. Where direct connection fails (symmetric NAT on both sides), traffic relays through a chosen mesh peer over a Noise IK-encrypted channel — never the coordination server. The relaying peer sees only encrypted packet sizes/timing, not content.
 - **Three operating modes** — static config (no server), LAN mDNS discovery, full coord server
 - **Name-based routing** — `ping server1.veld` via local DNS stub
 - **Subnet routing** — expose a whole LAN through one Veld node (IoT gateway)
 - **TOFU key pinning** — peer fingerprints saved on first connect; mismatches blocked
-- **IoT friendly** — builds for `linux/mips`, `linux/arm/v6`, `linux/arm/v7`, `linux/arm64`, OpenWrt
+- **IoT friendly** — builds for `linux/mips`, `linux/mipsle`, `linux/arm/v6`, `linux/arm/v7`, `linux/arm64`, OpenWrt
 
 ---
 
@@ -50,18 +50,23 @@ The coordinator assigns a VPN address (e.g., `10.100.0.1`); the daemon then crea
 ## Quick start — self-hosted coordination server
 
 ```sh
-# Run the coordination server (Docker)
-docker run -p 50051:50051 ghcr.io/veldmesh/veld-coord
-
-# On each machine
-veld login --coord your-server:50051
-veld up --network mynet
+# Build and run the coordination server (Docker)
+make docker
+docker run -p 50051:50051 -v veld-coord-data:/data veld-coord:latest
 ```
+
+> **Note on TLS:** `veld-coord` itself does not terminate TLS — it serves plaintext gRPC. The daemon connects with TLS by default and verifies the certificate against the host CA store. For a plaintext server you must either terminate TLS in front of it (e.g., a reverse proxy such as nginx, Caddy, or HAProxy) or, for testing only, set `tls_insecure = true` in the daemon's `[coord]` config section.
 
 Or without Docker:
 ```sh
 ./veld-coord --listen :50051 --db ./peers.db
 ```
+
+> **Same TLS note applies:** the binary also serves plaintext gRPC — use a TLS-terminating proxy or set `tls_insecure = true` in the daemon config.
+
+# On each machine
+veld login --server your-server:50051 --token <token>
+veld up
 
 ---
 
@@ -118,9 +123,9 @@ Run `veld-daemon` from an elevated terminal (Run as administrator): creating the
 └────────────────────────────────────┼────────────┘───┘
                                      ▼
                             ┌─────────────────┐
-                            │ veld-coord      │  ← thin: pubkeys +
-                            │ (coord server)  │    endpoints only
-                            └─────────────────┘
+                            │ veld-coord      │  ← stores: pubkeys,
+                            │ (coord server)  │    names, VPN addrs,
+                            └─────────────────┘    subnet routes, last-seen
                                      ▲
                             optional dashboard
                             (self-host or managed)
@@ -131,6 +136,8 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design: crypto s
 ### Coord TLS and the host CA store
 
 The daemon's gRPC connection to the coordination server uses standard TLS and verifies the server certificate against the **host's system CA store** (not an embedded bundle). This means hosts — including OpenWrt routers — must have a current `ca-certificates` package installed. After industry-wide distrust of weak CA keys (e.g. the eMudhra roots removed by Go 1.26.10, Mozilla NSS, and major distros), stale trust stores can cause spurious TLS failures or, worse, accept distrusted roots. On OpenWrt, run `opkg update && opkg upgrade ca-certificates` to stay current.
+
+> **Note:** `veld-coord` itself does not terminate TLS — it serves plaintext gRPC. To use TLS, terminate it in front of `veld-coord` (e.g., with a reverse proxy such as nginx, Caddy, or HAProxy) or, for testing only, set `tls_insecure = true` in the daemon's `[coord]` config section.
 
 ---
 
@@ -184,9 +191,9 @@ Contributions to the daemon, CLI, CE coord server, and docs are welcome. Please 
 
 ## License
 
-The **daemon, CLI, and web frontend** (`cmd/` — except `cmd/veld-relay` — `internal/`, `web/`) are licensed under the **MIT License**. Note the **relay client** (`internal/relay`, linked into every daemon) stays MIT; the wire protocol is open.
+The **daemon, CLI, tray app, and tests** (`cmd/` except `cmd/veld-relay`; `internal/` except `internal/coord`; `tray/`; `tests/e2e/`) are licensed under the **MIT License**. Note the **relay client** (`internal/relay`, linked into every daemon) stays MIT; the wire protocol is open.
 
-The **coordination server** (`coord/`) is licensed under the **Business Source License 1.1 (BSL-1.1)**. Source code is publicly available. You may self-host it for personal or internal use. You may not offer it as a competing managed network service. The license converts to Apache 2.0 four years after each version's release date.
+The **coordination server** (`coord/`) and the **coord client library** (`internal/coord`) are licensed under the **Business Source License 1.1 (BSL-1.1)**. Source code is publicly available. You may self-host them for personal or internal use. You may not offer the coordination server as a competing managed network service. The license converts to Apache 2.0 four years after each version's release date.
 
 The **relay server** (`relay/`, `cmd/veld-relay`) is licensed under BSL-1.1 on the same terms: source available, self-host it freely for personal or internal use, but you may not offer it to others as a hosted relay or mesh VPN service. Converts to Apache 2.0 four years after each version's release.
 
