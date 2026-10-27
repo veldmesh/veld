@@ -12,7 +12,7 @@ import (
 )
 
 // ErrHandshakeDrop is returned when a handshake message must be silently dropped.
-// The caller MUST NOT send any response — doing so leaks information about valid keys.
+// The caller MUST NOT send any response -- doing so leaks information about valid keys.
 var ErrHandshakeDrop = errors.New("handshake dropped")
 
 // HandshakeResult holds the outputs of a completed Noise IK handshake.
@@ -28,7 +28,7 @@ type HandshakeResult struct {
 
 // PeerLookupFn authorizes an initiator by Ed25519 public key.
 // Returns the peer's expected X25519 static pubkey from the peer table.
-// Returns false if the peer is unknown — the caller must silently drop.
+// Returns false if the peer is unknown -- the caller must silently drop.
 type PeerLookupFn func(ed25519Pub []byte) (x25519Pub [32]byte, known bool)
 
 // InitiatorHS is the initiator side of a Noise IK handshake.
@@ -76,11 +76,11 @@ func NewInitiatorHS(localID *Identity, peerX25519 [32]byte, networkID [16]byte) 
 // Payload (120 bytes, encrypted by Noise):
 //
 //	ed25519_pub [32]  initiator's Ed25519 public key
-//	sig         [64]  SignForPeer(peerX25519, nowSec)
+//	sig         [64]  SignForPeer(peerX25519, nowNano)
 //	network_id  [16]  the network UUID
-//	timestamp   [ 8]  nowSec as big-endian uint64
-func (h *InitiatorHS) BuildMessage1(nowSec int64) ([]byte, error) {
-	sig, err := h.localID.SignForPeer(h.peerX25519, nowSec)
+//	timestamp   [ 8]  nowNano as big-endian uint64 (nanoseconds since epoch)
+func (h *InitiatorHS) BuildMessage1(nowNano int64) ([]byte, error) {
+	sig, err := h.localID.SignForPeer(h.peerX25519, nowNano)
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +89,7 @@ func (h *InitiatorHS) BuildMessage1(nowSec int64) ([]byte, error) {
 	copy(payload[0:32], h.localID.Ed25519Public)
 	copy(payload[32:96], sig[:])
 	copy(payload[96:112], h.networkID[:])
-	binary.BigEndian.PutUint64(payload[112:120], uint64(nowSec))
+	binary.BigEndian.PutUint64(payload[112:120], uint64(nowNano))
 
 	msg, _, _, err := h.hs.WriteMessage(nil, payload)
 	if err != nil {
@@ -99,14 +99,14 @@ func (h *InitiatorHS) BuildMessage1(nowSec int64) ([]byte, error) {
 }
 
 // ProcessMessage2 decrypts and validates the responder's reply, returning session keys.
-// Returns ErrHandshakeDrop on ANY validation failure — caller must send no response.
+// Returns ErrHandshakeDrop on ANY validation failure -- caller must send no response.
 //
 // Payload (112 bytes, decrypted by Noise):
 //
 //	ed25519_pub [32]  responder's Ed25519 public key
-//	sig         [64]  responder's SignForPeer(initiator_x25519, nowSec)
+//	sig         [64]  responder's SignForPeer(initiator_x25519, nowNano)
 //	session_id  [ 8]  random
-//	timestamp   [ 8]  big-endian uint64
+//	timestamp   [ 8]  big-endian uint64 (nanoseconds since epoch)
 func (h *InitiatorHS) ProcessMessage2(msg []byte, _ int64) (*HandshakeResult, error) {
 	payload, cs1, cs2, err := h.hs.ReadMessage(nil, msg)
 	if err != nil {
@@ -133,7 +133,7 @@ func (h *InitiatorHS) ProcessMessage2(msg []byte, _ int64) (*HandshakeResult, er
 		return nil, ErrHandshakeDrop
 	}
 
-	// Initiator: cs1 = send (initiator→responder), cs2 = recv (responder→initiator)
+	// Initiator: cs1 = send (initiator->responder), cs2 = recv (responder->initiator)
 	return &HandshakeResult{
 		SendCS:            cs1,
 		RecvCS:            cs2,
@@ -162,15 +162,16 @@ func NewResponderHS(localID *Identity, peerLookup PeerLookupFn) (*ResponderHS, e
 }
 
 // ProcessMessage1 decrypts and validates the initiator's first message.
-// Returns ErrHandshakeDrop on ANY validation failure — caller must send no response.
-func (h *ResponderHS) ProcessMessage1(msg []byte, _ int64) error {
+// Returns the timestamp from the decrypted payload (nanoseconds since epoch)
+// and ErrHandshakeDrop on ANY validation failure -- caller must send no response.
+func (h *ResponderHS) ProcessMessage1(msg []byte, _ int64) (int64, error) {
 	payload, _, _, err := h.hs.ReadMessage(nil, msg)
 	if err != nil {
-		return ErrHandshakeDrop
+		return 0, ErrHandshakeDrop
 	}
 
 	if len(payload) != 120 {
-		return ErrHandshakeDrop
+		return 0, ErrHandshakeDrop
 	}
 
 	peerEd25519Pub := make(ed25519.PublicKey, 32)
@@ -187,7 +188,7 @@ func (h *ResponderHS) ProcessMessage1(msg []byte, _ int64) error {
 	// Extract initiator's X25519 static key (decrypted by Noise IK 's' token)
 	peerStaticBytes := h.hs.PeerStatic()
 	if len(peerStaticBytes) != 32 {
-		return ErrHandshakeDrop
+		return 0, ErrHandshakeDrop
 	}
 	var peerX25519 [32]byte
 	copy(peerX25519[:], peerStaticBytes)
@@ -195,18 +196,18 @@ func (h *ResponderHS) ProcessMessage1(msg []byte, _ int64) error {
 	// Authorize: check peer table; also verify the X25519 they sent matches what's registered
 	registeredX25519, known := h.peerLookup(peerEd25519Pub)
 	if !known || peerX25519 != registeredX25519 {
-		return ErrHandshakeDrop
+		return 0, ErrHandshakeDrop
 	}
 
 	// sig covers initiator_x25519 || responder_x25519 || timestamp
 	if err := VerifyPeerSig(peerEd25519Pub, peerX25519, h.localID.X25519Public, sig, ts); err != nil {
-		return ErrHandshakeDrop
+		return 0, ErrHandshakeDrop
 	}
 
 	h.peerX25519 = peerX25519
 	h.peerEd25519Public = peerEd25519Pub
 	h.networkID = networkID
-	return nil
+	return ts, nil
 }
 
 // BuildMessage2 constructs the responder's reply and returns session keys.
@@ -215,11 +216,11 @@ func (h *ResponderHS) ProcessMessage1(msg []byte, _ int64) error {
 // Payload (112 bytes, encrypted by Noise):
 //
 //	ed25519_pub [32]  responder's Ed25519 public key
-//	sig         [64]  SignForPeer(peerX25519, nowSec)
+//	sig         [64]  SignForPeer(peerX25519, nowNano)
 //	session_id  [ 8]  random
-//	timestamp   [ 8]  nowSec as big-endian uint64
-func (h *ResponderHS) BuildMessage2(nowSec int64) ([]byte, *HandshakeResult, error) {
-	sig, err := h.localID.SignForPeer(h.peerX25519, nowSec)
+//	timestamp   [ 8]  nowNano as big-endian uint64 (nanoseconds since epoch)
+func (h *ResponderHS) BuildMessage2(nowNano int64) ([]byte, *HandshakeResult, error) {
+	sig, err := h.localID.SignForPeer(h.peerX25519, nowNano)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -233,14 +234,14 @@ func (h *ResponderHS) BuildMessage2(nowSec int64) ([]byte, *HandshakeResult, err
 	copy(payload[0:32], h.localID.Ed25519Public)
 	copy(payload[32:96], sig[:])
 	copy(payload[96:104], sessionID[:])
-	binary.BigEndian.PutUint64(payload[104:112], uint64(nowSec))
+	binary.BigEndian.PutUint64(payload[104:112], uint64(nowNano))
 
 	msg, cs1, cs2, err := h.hs.WriteMessage(nil, payload)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Responder: cs1 = recv (initiator→responder), cs2 = send (responder→initiator)
+	// Responder: cs1 = recv (initiator->responder), cs2 = send (responder->initiator)
 	return msg, &HandshakeResult{
 		SendCS:            cs2,
 		RecvCS:            cs1,

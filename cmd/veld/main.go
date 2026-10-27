@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/veldmesh/veld/internal/config"
 	"github.com/veldmesh/veld/internal/daemon"
+	"github.com/veldmesh/veld/internal/tofu"
 )
 
 var (
@@ -47,7 +49,7 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&socketPath, "socket", "", "IPC socket path (default: platform default)")
-	rootCmd.AddCommand(upCmd, downCmd, statusCmd, loginCmd, joinCmd, versionCmd)
+	rootCmd.AddCommand(upCmd, downCmd, statusCmd, loginCmd, joinCmd, versionCmd, tofuCmd)
 }
 
 var versionCmd = &cobra.Command{
@@ -67,8 +69,8 @@ var upCmd = &cobra.Command{
 }
 
 var (
-	upConfigPath  string
-	upForeground  bool
+	upConfigPath string
+	upForeground bool
 )
 
 func init() {
@@ -274,9 +276,9 @@ var loginCmd = &cobra.Command{
 }
 
 var (
-	loginServer    string
-	loginNetworkID string
-	loginToken     string
+	loginServer     string
+	loginNetworkID  string
+	loginToken      string
 	loginConfigPath string
 )
 
@@ -390,9 +392,9 @@ var joinCmd = &cobra.Command{
 }
 
 var (
-	joinServer      string
-	joinNetworkID   string
-	joinConfigPath  string
+	joinServer     string
+	joinNetworkID  string
+	joinConfigPath string
 )
 
 func init() {
@@ -428,6 +430,103 @@ func runJoin(cobraCmd *cobra.Command, args []string) error {
 	fmt.Printf("saved token to %s\n", cfgPath)
 	fmt.Printf("use 'veld up' to connect\n")
 	return nil
+}
+
+// --- TOFU command ---
+
+var tofuCmd = &cobra.Command{
+	Use:   "tofu",
+	Short: "Manage TOFU (Trust-On-First-Use) fingerprint pins",
+	Long:  "Manage TOFU fingerprint pins. Pins are keyed by Ed25519 public key with a reverse VPN address map.",
+}
+
+var tofuConfigPath string
+
+func init() {
+	tofuCmd.PersistentFlags().StringVar(&tofuConfigPath, "config", "", "config file path (default: ~/.config/veld/config.toml)")
+	tofuCmd.AddCommand(tofuListCmd, tofuForgetCmd)
+}
+
+var tofuListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List all pinned fingerprints",
+	RunE:  runTofuList,
+}
+
+func runTofuList(cobraCmd *cobra.Command, args []string) error {
+	tofuStore, err := openTofuStore()
+	if err != nil {
+		return err
+	}
+
+	pins := tofuStore.List()
+	if len(pins) == 0 {
+		fmt.Println("no pinned fingerprints")
+		return nil
+	}
+
+	fmt.Println("Pinned fingerprints (VPN address → SHA-256 fingerprint):")
+	for vpnAddr, fp := range pins {
+		fmt.Printf("  %s → %s\n", vpnAddr, fp)
+	}
+	return nil
+}
+
+var tofuForgetCmd = &cobra.Command{
+	Use:   "forget <peer>",
+	Short: "Forget a pinned fingerprint for a peer",
+	Long: `Forget a pinned fingerprint for a peer. The peer is specified as a
+VPN address (IP). The next handshake with that peer will re-pin their fingerprint.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runTofuForget,
+}
+
+func runTofuForget(cobraCmd *cobra.Command, args []string) error {
+	peerArg := args[0]
+
+	// The peer must be a VPN address.
+	if _, err := netip.ParseAddr(peerArg); err != nil {
+		return fmt.Errorf("invalid peer argument %q: must be a VPN address (e.g. 10.0.0.2)", peerArg)
+	}
+
+	tofuStore, err := openTofuStore()
+	if err != nil {
+		return err
+	}
+
+	if err := tofuStore.ForgetByVPNAddr(peerArg); err != nil {
+		return fmt.Errorf("forget: %w", err)
+	}
+	fmt.Printf("forgot pin for peer %s\n", peerArg)
+	fmt.Printf("the next handshake with this peer will re-pin their fingerprint\n")
+	return nil
+}
+
+// openTofuStore loads the config to find the identity path, then opens the
+// TOFU store that lives next to it.
+func openTofuStore() (*tofu.Store, error) {
+	cfgPath, err := getConfigPath(tofuConfigPath)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg, err := loadConfig(cfgPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("load config: %w", err)
+	}
+	var identityPath string
+	if cfg != nil {
+		identityPath = cfg.Node.IdentityPath
+	} else {
+		identityPath = filepath.Join(filepath.Dir(cfgPath), "identity.json")
+	}
+	tofuPath := filepath.Join(filepath.Dir(identityPath), "tofu.json")
+
+	store, err := tofu.New(tofuPath)
+	if err != nil {
+		return nil, fmt.Errorf("load TOFU store: %w", err)
+	}
+	return store, nil
 }
 
 // --- Helpers ---

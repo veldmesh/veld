@@ -10,6 +10,7 @@ updates:
       interval: "weekly"
       day: "monday"
       time: "06:00"
+      timezone: "UTC"
     labels:
       - "dependencies"
       - "docker"
@@ -26,6 +27,7 @@ updates:
       interval: "weekly"
       day: "monday"
       time: "06:00"
+      timezone: "UTC"
     labels:
       - "dependencies"
       - "github-actions"

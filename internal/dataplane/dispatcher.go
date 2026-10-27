@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 
 	"github.com/veldmesh/veld/internal/peer"
 	"github.com/veldmesh/veld/internal/session"
@@ -14,9 +15,10 @@ import (
 )
 
 const (
-	maxMTU      = 1500
-	authTagSize = 16 // ChaCha20-Poly1305 tag
-	udpBufSize  = HeaderSize + maxMTU + authTagSize
+	maxMTU             = 1500
+	authTagSize        = 16 // ChaCha20-Poly1305 tag
+	udpBufSize         = HeaderSize + maxMTU + authTagSize
+	rekeyCheckInterval = 30 * time.Second // periodic check for time-based rekey
 )
 
 // Dispatcher routes encrypted packets between TUN and UDP.
@@ -33,10 +35,10 @@ type Dispatcher struct {
 	OnHandshakeRequired func(entry *peer.Entry)
 
 	// OnRekeyRequired is called when the current session hits the nonce threshold
-	// (2^32 packets). The packet is already in the peer's hold queue. The caller
-	// must clear the old session and initiate a fresh handshake — SetSession will
-	// drain the hold queue once the new session is ready.
-	// May be nil (packets queued until queue is full, then dropped).
+	// (2^32 packets) or the time-based rekey limit (2 minutes). The packet is
+	// already in the peer's hold queue. The caller must clear the old session and
+	// initiate a fresh handshake -- SetSession will drain the hold queue once the
+	// new session is ready. May be nil (packets queued until queue is full, then dropped).
 	OnRekeyRequired func(entry *peer.Entry)
 
 	// OnHandshakePacket is called for TypeHandshakeInit and TypeHandshakeResp packets.
@@ -47,24 +49,32 @@ type Dispatcher struct {
 	// pkt is the full wire packet (including 16-byte header); addr is the sender.
 	OnNATProbePacket func(pkt []byte, addr net.Addr)
 
+	// OnSessionEstablished is called when a pending session is promoted to active
+	// (WireGuard-style handshake confirmation). The caller uses this to flush the
+	// peer's hold queue via FlushHoldQueue.
+	OnSessionEstablished func(entry *peer.Entry)
+
 	stopOnce sync.Once
+	stopCh   chan struct{}
 	wg       sync.WaitGroup
 }
 
 // New creates a Dispatcher. Call Start to launch the I/O goroutines.
 func New(t tun.TUN, conn net.PacketConn, peers *peer.Table) *Dispatcher {
 	return &Dispatcher{
-		tun:   t,
-		conn:  conn,
-		peers: peers,
+		tun:    t,
+		conn:   conn,
+		peers:  peers,
+		stopCh: make(chan struct{}),
 	}
 }
 
-// Start launches the TUN→UDP and UDP→TUN goroutines.
+// Start launches the TUN->UDP and UDP->TUN goroutines.
 func (d *Dispatcher) Start() {
-	d.wg.Add(2)
+	d.wg.Add(3)
 	go d.tunLoop()
 	go d.udpLoop()
+	go d.rekeyLoop()
 }
 
 // SetTUN sets the TUN device. If the dispatcher was started with a nil TUN
@@ -83,6 +93,7 @@ func (d *Dispatcher) SetTUN(t tun.TUN) {
 // Safe to call multiple times.
 func (d *Dispatcher) Stop() {
 	d.stopOnce.Do(func() {
+		close(d.stopCh)
 		d.tunMu.Lock()
 		if d.tun != nil {
 			_ = d.tun.Close()
@@ -114,6 +125,35 @@ func (d *Dispatcher) FlushHoldQueue(entry *peer.Entry) {
 			continue
 		}
 		d.conn.WriteTo(buildDataPacket(nonce, ct), net.UDPAddrFromAddrPort(ep))
+	}
+}
+
+// rekeyLoop periodically scans all peers and triggers rekey for sessions
+// that have exceeded the time limit (but not the nonce threshold, which is
+// checked inline in handleTunPacket).
+func (d *Dispatcher) rekeyLoop() {
+	defer d.wg.Done()
+	ticker := time.NewTicker(rekeyCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.stopCh:
+			return
+		case <-ticker.C:
+			d.checkRekey()
+		}
+	}
+}
+
+func (d *Dispatcher) checkRekey() {
+	for _, e := range d.peers.List() {
+		sess := e.GetSession()
+		if sess != nil && sess.NeedsRekey() {
+			if d.OnRekeyRequired != nil {
+				d.OnRekeyRequired(e)
+			}
+		}
 	}
 }
 
@@ -157,6 +197,16 @@ func (d *Dispatcher) handleTunPacket(pkt []byte) {
 		entry.Enqueue(pkt)
 		if d.OnHandshakeRequired != nil {
 			d.OnHandshakeRequired(entry)
+		}
+		return
+	}
+
+	// Check NeedsRekey before encrypting: a session at the nonce threshold
+	// or beyond the time limit must not be used for new packets.
+	if sess.NeedsRekey() {
+		entry.Enqueue(pkt)
+		if d.OnRekeyRequired != nil {
+			d.OnRekeyRequired(entry)
 		}
 		return
 	}
@@ -213,20 +263,20 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 			return
 		}
 		sess := entry.GetSession()
-		if sess == nil {
+
+		plain := d.decryptDataPacket(entry, sess, nonce, payload)
+
+		if plain == nil {
 			return
 		}
-		plain, err := sess.Decrypt(nonce, payload)
-		if err != nil || plain == nil {
-			return
-		}
+
 		entry.Touch()
 		d.tunMu.RLock()
 		t := d.tun
 		d.tunMu.RUnlock()
 		if t != nil {
 			if _, err := t.Write(plain); err != nil {
-				// TODO: log err before stopping — Dispatcher has no logger yet
+				// TODO: log err before stopping -- Dispatcher has no logger yet
 				d.Stop()
 				return
 			}
@@ -255,6 +305,37 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 			d.OnNATProbePacket(pktCopy, addr)
 		}
 	}
+}
+
+// decryptDataPacket decrypts a data packet using the peer's active session,
+// falling back to the pending session (WireGuard-style handshake confirmation).
+// If the pending session decrypts successfully, it is promoted to active and
+// OnSessionEstablished is called. Returns nil if decryption fails with both.
+func (d *Dispatcher) decryptDataPacket(entry *peer.Entry, sess *session.Session, nonce uint64, payload []byte) []byte {
+	// Try the active session first.
+	if sess != nil {
+		plain, err := sess.Decrypt(nonce, payload)
+		if err == nil && plain != nil {
+			return plain
+		}
+	}
+
+	// Fall back to the pending session. If a handshake was initiated by the
+	// peer, the new session is pending confirmation. The first data packet
+	// that decrypts with it confirms the handshake.
+	if pending := entry.GetPendingSession(); pending != nil {
+		plain, err := pending.Decrypt(nonce, payload)
+		if err == nil && plain != nil {
+			// Pending session works -- promote it to active.
+			entry.PromotePendingSession()
+			if d.OnSessionEstablished != nil {
+				d.OnSessionEstablished(entry)
+			}
+			return plain
+		}
+	}
+
+	return nil
 }
 
 // extractDestIP reads the destination IP from a raw IPv4 or IPv6 packet.

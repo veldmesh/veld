@@ -71,8 +71,10 @@ func New(
 	hsMgr := handshake.New(localID, networkID, peerTbl, conn)
 
 	disp.OnHandshakeRequired = hsMgr.Initiate
+	disp.OnRekeyRequired = hsMgr.Initiate
 	disp.OnHandshakePacket = hsMgr.HandlePacket
 	hsMgr.OnSessionEstablished = disp.FlushHoldQueue
+	disp.OnSessionEstablished = disp.FlushHoldQueue
 
 	return &Daemon{
 		disp:      disp,
@@ -295,8 +297,6 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 						fmt.Printf("warning: relay proxy for peer %x: %v\n", peerID[:8], err)
 						return
 					}
-					// Keep one proxy per peer: a previous fallback (or a
-					// re-punch that timed out again) is replaced and closed.
 					d.mu.Lock()
 					if d.relayProxies == nil {
 						d.relayProxies = make(map[[32]byte]*relay.Proxy)
@@ -307,6 +307,8 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 					if old != nil {
 						_ = old.Close()
 					}
+					// Keep one proxy per peer: a previous fallback (or a
+					// re-punch that timed out again) is replaced and closed.
 
 					peerTbl.UpdateEndpoint(peerID, proxy.LocalAddr())
 					if e, ok := peerTbl.LookupByID(peerID); ok {
@@ -355,6 +357,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 			if proxy != nil {
 				_ = proxy.Close()
 			}
+			d.hsMgr.OnPeerRemoved(id)
 		}
 
 		d.coordCli.OnSignal = d.natMgr.DeliverSignal
@@ -591,18 +594,15 @@ func buildPeerTable(peerCfgs []intconfig.PeerConfig) (*peer.Table, error) {
 
 		e := &peer.Entry{ID: id, X25519Pub: x25519, VPNAddr: vpnAddr, Name: pc.Name, SubnetRoutes: routes}
 		if pc.Endpoint != "" {
-			ep, err := netip.ParseAddrPort(pc.Endpoint)
-			if err != nil {
-				return nil, fmt.Errorf("peer %q: invalid endpoint: %w", pc.Name, err)
+			if ep, err := netip.ParseAddrPort(pc.Endpoint); err == nil {
+				e.SetEndpoint(ep)
 			}
-			e.SetEndpoint(ep)
 		}
 		tbl.Upsert(e)
 	}
 	return tbl, nil
 }
 
-// Start launches the dispatcher, coord client, mDNS discovery, and IPC server goroutines.
 func (d *Daemon) Start() {
 	d.disp.Start()
 	if d.coordCli != nil {
@@ -620,10 +620,7 @@ func (d *Daemon) Start() {
 	}
 }
 
-// Stop signals all components to exit.
 func (d *Daemon) Stop() {
-	// The dispatcher owns the TUN once SetTUN/Start has it. Daemon.Stop()
-	// only nils its reference; it does not close the TUN again.
 	d.disp.Stop()
 	d.mu.Lock()
 	proxies := d.relayProxies
@@ -650,16 +647,12 @@ func (d *Daemon) Stop() {
 	}
 }
 
-// mdnsDiscovery returns the current mDNS discovery instance, if any. It may
-// be set after construction in coord mode, once the coordinator assigns a
-// VPN address (see onVPNAddrAssigned), so reads must go through the lock.
 func (d *Daemon) mdnsDiscovery() *mdns.Discovery {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.mdnsDisco
 }
 
-// Wait blocks until all components have exited.
 func (d *Daemon) Wait() {
 	d.disp.Wait()
 	if d.coordCli != nil {
@@ -667,7 +660,6 @@ func (d *Daemon) Wait() {
 	}
 }
 
-// updateIPCStatus builds and sends the current status to the IPC server.
 func (d *Daemon) updateIPCStatus() {
 	if d.ipcSrv == nil {
 		return
@@ -680,9 +672,6 @@ func (d *Daemon) updateIPCStatus() {
 	tun := d.tunDev
 	d.mu.Unlock()
 
-	// Prefer the actual data-plane TUN address if available. This avoids
-	// reporting a coordinator-assigned address when the TUN creation for
-	// that address failed (e.g., during a failed address change).
 	if tun != nil {
 		vpnAddr = tun.Addr().Addr()
 	} else if d.coordCli != nil {

@@ -104,12 +104,12 @@ func newTestSessionPair(t *testing.T) (initiator, responder *session.Session) {
 	if err != nil {
 		t.Fatalf("NewResponderHS: %v", err)
 	}
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	msg1, err := initiatorHS.BuildMessage1(now)
 	if err != nil {
 		t.Fatalf("BuildMessage1: %v", err)
 	}
-	if err := responderHS.ProcessMessage1(msg1, now); err != nil {
+	if _, err := responderHS.ProcessMessage1(msg1, now); err != nil {
 		t.Fatalf("ProcessMessage1: %v", err)
 	}
 	msg2, respResult, err := responderHS.BuildMessage2(now)

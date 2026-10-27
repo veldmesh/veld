@@ -1,10 +1,6 @@
 // Copyright (c) 2026 Veld Authors.
 // SPDX-License-Identifier: MIT
 
-// Package tofu implements Trust-On-First-Use Ed25519 fingerprint pinning.
-// On the first successful handshake with a peer, their Ed25519 fingerprint is
-// saved to disk. Subsequent handshakes from a different key for the same peer
-// are rejected — this catches a compromised coord server swapping pubkeys.
 package tofu
 
 import (
@@ -17,29 +13,39 @@ import (
 	"sync"
 )
 
-// ErrFingerprintMismatch is returned when a peer's Ed25519 fingerprint differs
-// from the pinned value. The handshake MUST be silently dropped — do not
-// downgrade to warn-only mode.
-var ErrFingerprintMismatch = errors.New("TOFU: Ed25519 fingerprint mismatch — possible MITM; rejecting")
+var ErrFingerprintMismatch = errors.New("TOFU: Ed25519 fingerprint mismatch -- possible MITM; rejecting")
 
-// Fingerprint computes the canonical SHA-256 fingerprint of an Ed25519 public key.
 func Fingerprint(pub ed25519.PublicKey) [32]byte {
 	return sha256.Sum256(pub)
 }
 
-// Store persists Ed25519 fingerprints keyed by a stable peer identifier
-// (typically the peer's VPN IP address string). It is safe for concurrent use.
+func pubKeyString(pub ed25519.PublicKey) string {
+	return hex.EncodeToString(pub)
+}
+
 type Store struct {
 	path string
 	mu   sync.Mutex
-	pins map[string][32]byte // peerKey → SHA-256(Ed25519 pubkey)
+	// pins maps Ed25519 public key (hex) -> pinValue.
+	// Primary key is Ed25519 pubkey so static config with reused VPN addresses
+	// can distinguish different peers.
+	pins map[string]pinValue
+	// vpnToPub maps VPN address -> Ed25519 pubkey (hex) for TOFU enforcement.
+	// Ensures a VPN address is only associated with one Ed25519 identity.
+	vpnToPub map[string]string
 }
 
-// New loads a Store from path, or creates a fresh one if the file does not exist.
+type pinValue struct {
+	Fingerprint [32]byte
+	Ed25519Pub  string
+	VPNAddr     string
+}
+
 func New(path string) (*Store, error) {
 	s := &Store{
-		path: path,
-		pins: make(map[string][32]byte),
+		path:     path,
+		pins:     make(map[string]pinValue),
+		vpnToPub: make(map[string]string),
 	}
 	if err := s.load(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
@@ -47,55 +53,91 @@ func New(path string) (*Store, error) {
 	return s, nil
 }
 
-// Check performs the TOFU check for peerKey against the Ed25519 key seen in
-// this handshake.
-//   - First time: pin the fingerprint, persist, return nil.
-//   - Matching fingerprint: return nil.
-//   - Mismatched fingerprint: return ErrFingerprintMismatch (caller must drop).
-func (s *Store) Check(peerKey string, pub ed25519.PublicKey) error {
+// Check verifies the peer's Ed25519 public key against the pinned fingerprint.
+// The pin is keyed by Ed25519 pubkey, but TOFU enforcement ensures a VPN address
+// is only ever associated with one Ed25519 identity.
+// If the same pubkey appears at a different VPN address, the VPN address is updated.
+// If a different pubkey appears at a VPN address that already has a different pubkey pinned,
+// the check fails (TOFU violation / possible MITM).
+func (s *Store) Check(vpnAddr string, pub ed25519.PublicKey) error {
 	fp := Fingerprint(pub)
+	pubStr := pubKeyString(pub)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if stored, ok := s.pins[peerKey]; ok {
-		if stored != fp {
+	// Case 1: This pubkey is already known.
+	if stored, ok := s.pins[pubStr]; ok {
+		if stored.Fingerprint != fp {
 			return ErrFingerprintMismatch
+		}
+		// Update VPN address if changed (peer moved).
+		if stored.VPNAddr != vpnAddr {
+			// Update reverse mapping.
+			delete(s.vpnToPub, stored.VPNAddr)
+			stored.VPNAddr = vpnAddr
+			s.vpnToPub[vpnAddr] = pubStr
+			s.pins[pubStr] = stored
+			return s.save()
 		}
 		return nil
 	}
 
-	// First connect — trust and persist.
-	s.pins[peerKey] = fp
+	// Case 2: New pubkey. Check if this VPN address is already pinned to a different pubkey.
+	if existingPub, ok := s.vpnToPub[vpnAddr]; ok && existingPub != pubStr {
+		// TOFU violation: different identity claiming same VPN address.
+		return ErrFingerprintMismatch
+	}
+
+	// Case 3: New pubkey, VPN address not pinned (or pinned to same pubkey which is impossible here).
+	s.pins[pubStr] = pinValue{
+		Fingerprint: fp,
+		Ed25519Pub:  pubStr,
+		VPNAddr:     vpnAddr,
+	}
+	s.vpnToPub[vpnAddr] = pubStr
 	return s.save()
 }
 
-// Forget removes the pinned fingerprint for peerKey.
-// The next handshake will re-pin. Returns an error only if the save fails.
-func (s *Store) Forget(peerKey string) error {
+// Forget removes the pin for the given Ed25519 public key.
+func (s *Store) Forget(pub ed25519.PublicKey) error {
+	pubStr := pubKeyString(pub)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.pins, peerKey)
+	if v, ok := s.pins[pubStr]; ok {
+		delete(s.vpnToPub, v.VPNAddr)
+		delete(s.pins, pubStr)
+	}
 	return s.save()
 }
 
-// List returns a snapshot of all pinned fingerprints as a map from peerKey to
-// hex-encoded SHA-256 fingerprint.
+// ForgetByVPNAddr removes all pins associated with a VPN address.
+// Used by the CLI `veld tofu forget <vpn-addr>` command.
+func (s *Store) ForgetByVPNAddr(vpnAddr string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if pubStr, ok := s.vpnToPub[vpnAddr]; ok {
+		delete(s.vpnToPub, vpnAddr)
+		delete(s.pins, pubStr)
+	}
+	return s.save()
+}
+
+// List returns a map of VPN address -> fingerprint for display purposes.
 func (s *Store) List() map[string]string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make(map[string]string, len(s.pins))
-	for k, v := range s.pins {
-		out[k] = hex.EncodeToString(v[:])
+	for _, v := range s.pins {
+		out[v.VPNAddr] = hex.EncodeToString(v.Fingerprint[:])
 	}
 	return out
 }
 
-// -- persistence -------------------------------------------------------
-
 type pinEntry struct {
-	PeerKey     string `json:"peer_key"`
-	Fingerprint string `json:"fingerprint"` // hex SHA-256
+	VPNAddr     string `json:"vpn_addr"`
+	Ed25519Pub  string `json:"ed25519_pub"`
+	Fingerprint string `json:"fingerprint"`
 }
 
 type storeFile struct {
@@ -108,36 +150,70 @@ func (s *Store) load() error {
 	if err != nil {
 		return err
 	}
+
 	var f storeFile
-	if err := json.Unmarshal(data, &f); err != nil {
-		return err
-	}
-	for _, p := range f.Pins {
-		b, err := hex.DecodeString(p.Fingerprint)
-		if err != nil || len(b) != 32 {
-			continue // skip malformed entries rather than aborting
+	if err := json.Unmarshal(data, &f); err == nil {
+		valid := false
+		for _, p := range f.Pins {
+			if p.Ed25519Pub != "" && p.Fingerprint != "" {
+				valid = true
+				break
+			}
 		}
-		var fp [32]byte
-		copy(fp[:], b)
-		s.pins[p.PeerKey] = fp
+		if valid {
+			for _, p := range f.Pins {
+				if p.Ed25519Pub == "" || p.Fingerprint == "" {
+					continue
+				}
+				b, err := hex.DecodeString(p.Fingerprint)
+				if err != nil || len(b) != 32 {
+					continue
+				}
+				var fp [32]byte
+				copy(fp[:], b)
+				pubStr := p.Ed25519Pub
+				s.pins[pubStr] = pinValue{
+					Fingerprint: fp,
+					Ed25519Pub:  pubStr,
+					VPNAddr:     p.VPNAddr,
+				}
+				s.vpnToPub[p.VPNAddr] = pubStr
+			}
+			return nil
+		}
 	}
+
+	// v1 format: peer_key (VPN address) + fingerprint, no ed25519_pub.
+	// These cannot be migrated to v3 because we don't have the pubkey.
+	// They will be dropped and re-pinned on next handshake.
+	var oldFormat struct {
+		Version int `json:"version"`
+		Pins    []struct {
+			PeerKey     string `json:"peer_key"`
+			Fingerprint string `json:"fingerprint"`
+		} `json:"pins"`
+	}
+	if err := json.Unmarshal(data, &oldFormat); err == nil && len(oldFormat.Pins) > 0 {
+		// v1 entries have no pubkey -- drop them.
+		return s.save()
+	}
+
 	return nil
 }
 
-// save must be called with s.mu held.
 func (s *Store) save() error {
-	f := storeFile{Version: 1}
-	for k, v := range s.pins {
+	f := storeFile{Version: 3}
+	for _, v := range s.pins {
 		f.Pins = append(f.Pins, pinEntry{
-			PeerKey:     k,
-			Fingerprint: hex.EncodeToString(v[:]),
+			VPNAddr:     v.VPNAddr,
+			Ed25519Pub:  v.Ed25519Pub,
+			Fingerprint: hex.EncodeToString(v.Fingerprint[:]),
 		})
 	}
 	data, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return err
 	}
-	// Write atomically: write to a temp file then rename.
 	tmp := s.path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
