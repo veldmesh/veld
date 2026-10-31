@@ -193,13 +193,25 @@ func WriteFrame(w io.Writer, msg []byte) error {
 	return err
 }
 
+// ErrFrameTooLarge is returned by ReadFrameMax for a frame over its limit.
+var ErrFrameTooLarge = errors.New("relay: frame too large")
+
 // ReadFrame reads one length-prefixed frame.
 func ReadFrame(r io.Reader) ([]byte, error) {
+	return ReadFrameMax(r, 0xffff)
+}
+
+// ReadFrameMax reads one length-prefixed frame of at most max bytes, without
+// allocating for a larger one.
+func ReadFrameMax(r io.Reader, max int) ([]byte, error) {
 	var hdr [2]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}
 	n := binary.BigEndian.Uint16(hdr[:])
+	if int(n) > max {
+		return nil, ErrFrameTooLarge
+	}
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return nil, err

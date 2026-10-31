@@ -22,6 +22,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -39,6 +40,18 @@ const handshakeTimeout = 10 * time.Second
 // waitingTimeout bounds how long an unpaired connection waits for its
 // counterpart before being evicted.
 const waitingTimeout = 60 * time.Second
+
+// Connection limits. Every connection holds a goroutine and buffers, and
+// the handshake is reached before any authentication, so both the total
+// and the number from one client IP are capped.
+const (
+	defaultMaxConns      = 4096
+	defaultMaxConnsPerIP = 64
+)
+
+// maxMsg1Size bounds the unauthenticated first frame. An IK message 1 with
+// its 32-byte payload is 128 bytes.
+const maxMsg1Size = 256
 
 // Service is a DERP-style relay server. It accepts Noise IK-encrypted client
 // connections, pairs the two ends of a peer pair (each client sends the
@@ -66,6 +79,11 @@ type Service struct {
 	wg          sync.WaitGroup // tracks running splice goroutines
 	// verbose enables per-connection debug logging; off by default.
 	verbose bool
+
+	maxConns      int
+	maxConnsPerIP int
+	conns         int                // open connections, guarded by mu
+	connsByIP     map[netip.Addr]int // open connections per client IP
 }
 
 // serverConn is one client connection on the relay side.
@@ -88,6 +106,19 @@ func Verbose() Option {
 	return func(s *Service) { s.verbose = true }
 }
 
+// MaxConns sets the limits on open connections in total and per client IP.
+// Zero leaves a limit at its default.
+func MaxConns(total, perIP int) Option {
+	return func(s *Service) {
+		if total > 0 {
+			s.maxConns = total
+		}
+		if perIP > 0 {
+			s.maxConnsPerIP = perIP
+		}
+	}
+}
+
 // NewService creates a relay Service listening on ln with the given identity.
 // Clients must be configured with the identity's X25519 public key.
 func NewService(id *crypto.Identity, ln net.Listener, opts ...Option) *Service {
@@ -98,6 +129,10 @@ func NewService(id *crypto.Identity, ln net.Listener, opts ...Option) *Service {
 		active:      make(map[*serverConn]struct{}),
 		done:        make(chan struct{}),
 		waitTimeout: waitingTimeout,
+
+		maxConns:      defaultMaxConns,
+		maxConnsPerIP: defaultMaxConnsPerIP,
+		connsByIP:     make(map[netip.Addr]int),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -134,6 +169,7 @@ func (s *Service) Serve(ctx context.Context) error {
 	}()
 	// Join the watcher before returning so no goroutine outlives Serve.
 	defer func() { <-watchDone }()
+	var backoff time.Duration
 	for {
 		c, err := s.ln.Accept()
 		if err != nil {
@@ -142,13 +178,71 @@ func (s *Service) Serve(ctx context.Context) error {
 				return nil
 			default:
 			}
-			// Accept failed for a reason other than shutdown: close the
-			// service so the watcher unblocks, then report the error.
-			_ = s.Close()
-			return err
+			if errors.Is(err, net.ErrClosed) {
+				// The listener is gone: close the service so the watcher
+				// unblocks, then report the error.
+				_ = s.Close()
+				return err
+			}
+			// Anything else (EMFILE, ECONNABORTED, ...) is transient:
+			// back off and keep serving, as net/http does.
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else if backoff *= 2; backoff > time.Second {
+				backoff = time.Second
+			}
+			select {
+			case <-s.done:
+				return nil
+			case <-time.After(backoff):
+			}
+			continue
 		}
-		go s.handleConn(c)
+		backoff = 0
+		lc, ok := s.admit(c)
+		if !ok {
+			_ = c.Close()
+			continue
+		}
+		go s.handleConn(lc)
 	}
+}
+
+// admit counts c against the connection limits and wraps it so closing it
+// releases its slot. It reports false when a limit is reached.
+func (s *Service) admit(c net.Conn) (net.Conn, bool) {
+	var ip netip.Addr
+	if ap, err := netip.ParseAddrPort(c.RemoteAddr().String()); err == nil {
+		ip = ap.Addr().Unmap()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conns >= s.maxConns || s.connsByIP[ip] >= s.maxConnsPerIP {
+		return nil, false
+	}
+	s.conns++
+	s.connsByIP[ip]++
+	return &limitedConn{Conn: c, release: func() {
+		s.mu.Lock()
+		s.conns--
+		if s.connsByIP[ip]--; s.connsByIP[ip] <= 0 {
+			delete(s.connsByIP, ip)
+		}
+		s.mu.Unlock()
+	}}, true
+}
+
+// limitedConn releases its connection-limit slot on the first Close.
+type limitedConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *limitedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
 }
 
 // Close stops the service, closes all pending and active connections, and
@@ -208,7 +302,7 @@ func (s *Service) handleConn(raw net.Conn) {
 
 	// Bound the handshake so half-open connections cannot pile up.
 	_ = raw.SetDeadline(time.Now().Add(handshakeTimeout))
-	msg1, err := relayc.ReadFrame(raw)
+	msg1, err := relayc.ReadFrameMax(raw, maxMsg1Size)
 	if err != nil {
 		_ = raw.Close()
 		return
