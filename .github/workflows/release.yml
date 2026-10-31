@@ -5,9 +5,10 @@ on:
     tags:
       - 'v*'
 
+# Read-only by default; each job asks for what it needs, so the build jobs
+# (which run third-party actions) cannot write to the repository.
 permissions:
-  contents: write    # create GitHub Release and upload assets
-  id-token: write    # Sigstore keyless OIDC signing
+  contents: read
 
 # Single source of truth for the Wintun release shipped inside the Windows
 # archive. The Download Wintun step reads both values from here — a version
@@ -21,6 +22,9 @@ jobs:
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm && format('/v{0}', matrix.goarm) || '' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write    # Sigstore keyless OIDC signing
     strategy:
       fail-fast: false
       matrix:
@@ -164,6 +168,9 @@ jobs:
     name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write    # create GitHub Release and upload assets
+      id-token: write    # Sigstore keyless OIDC signing of checksums.txt
     outputs:
       checksums: ${{ steps.checksums.outputs.file }}
     steps:
@@ -182,6 +189,17 @@ jobs:
           cd release-assets
           sha256sum veld-*.tar.gz veld-*.zip > checksums.txt
           echo "file=release-assets/checksums.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5  # v3.10.1
+
+      # The archives are only covered by checksums.txt, so sign it: then one
+      # verified file vouches for every download.
+      - name: Sign checksums (Sigstore keyless)
+        run: |
+          cosign sign-blob --yes \
+            --bundle release-assets/checksums.txt.bundle \
+            release-assets/checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
@@ -207,6 +225,8 @@ jobs:
     name: Update Homebrew tap
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     # Skip for pre-releases (alpha/beta/rc tags contain a hyphen).
     if: ${{ !contains(github.ref_name, '-') }}
     steps:
