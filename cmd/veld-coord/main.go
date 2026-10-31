@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"google.golang.org/grpc"
@@ -27,12 +28,23 @@ func main() {
 	networkID := flag.String("network-id", "", "auto-create network with this ID if missing")
 	networkCIDR := flag.String("network-cidr", "10.100.0.0/24", "CIDR for auto-created network")
 	networkName := flag.String("network-name", "default", "name for auto-created network")
-	tokenStr := flag.String("token", "", "auth token to pre-register (format: token)")
+	tokenStr := flag.String("token", "", "auth token to pre-register (prefer -token-file or $VELD_COORD_TOKEN: flags are visible in the process list)")
+	tokenFile := flag.String("token-file", "", "file holding the auth token to pre-register")
 	peerTTL := flag.Duration("peer-ttl", coordserver.DefaultPeerTTL,
 		"peer registration TTL; peers not seen for this long are pruned (0 disables the sweep)")
 	sweepInterval := flag.Duration("sweep-interval", coordserver.DefaultSweepInterval,
 		"how often the stale-peer sweep runs (minimum one minute; shorter values are clamped up)")
 	flag.Parse()
+	if *tokenStr == "" {
+		*tokenStr = os.Getenv("VELD_COORD_TOKEN")
+	}
+	if *tokenFile != "" {
+		b, err := os.ReadFile(*tokenFile)
+		if err != nil {
+			log.Fatalf("read -token-file: %v", err)
+		}
+		*tokenStr = strings.TrimSpace(string(b))
+	}
 
 	reg, err := coordserver.NewRegistry(*dbPath)
 	if err != nil {

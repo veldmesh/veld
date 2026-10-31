@@ -65,7 +65,7 @@ Or without Docker:
 > **Same TLS note applies:** the binary also serves plaintext gRPC — use a TLS-terminating proxy or set `tls_insecure = true` in the daemon config.
 
 # On each machine
-veld login --server your-server:50051 --token <token>
+veld login --server your-server:50051 --token -   # paste the token, then Enter
 veld up
 
 ---
