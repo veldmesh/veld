@@ -13,6 +13,14 @@ type replayWindow struct {
 	inited bool
 }
 
+// check reports whether n would be accepted, without recording it.
+func (w *replayWindow) check(n uint64) bool {
+	if !w.inited || n > w.max {
+		return true
+	}
+	return w.max-n < WindowSize && !w.getBit(n)
+}
+
 func (w *replayWindow) checkAndMark(n uint64) bool {
 	if !w.inited {
 		w.max = n

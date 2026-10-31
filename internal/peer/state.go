@@ -37,6 +37,7 @@ type Entry struct {
 	endpoint      netip.AddrPort
 	session       *internalsession.Session
 	pendingSession *internalsession.Session
+	prevSession   *internalsession.Session
 	state         State
 	lastSeen      time.Time
 	holdQueue     [][]byte
@@ -63,13 +64,26 @@ func (e *Entry) GetSession() *internalsession.Session {
 	return e.session
 }
 
-// SetSession sets the session and transitions state to StateConnected.
+// SetSession sets the session and transitions state to StateConnected. The
+// replaced session is kept as the previous session, and any pending session
+// is kept too: when both sides initiate at once, the peer may confirm the
+// session it responded to instead of this one.
 func (e *Entry) SetSession(s *internalsession.Session) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.session != nil && e.session != s {
+		e.prevSession = e.session
+	}
 	e.session = s
-	e.pendingSession = nil
 	e.state = StateConnected
+}
+
+// GetPreviousSession returns the session replaced by the last SetSession or
+// promotion (nil if none). It is only used to decrypt packets still in flight.
+func (e *Entry) GetPreviousSession() *internalsession.Session {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.prevSession
 }
 
 // GetPendingSession returns the pending session (nil if none).
@@ -92,6 +106,9 @@ func (e *Entry) PromotePendingSession() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.pendingSession != nil {
+		if e.session != nil {
+			e.prevSession = e.session
+		}
 		e.session = e.pendingSession
 		e.pendingSession = nil
 		e.state = StateConnected

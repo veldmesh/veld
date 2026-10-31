@@ -313,7 +313,8 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 }
 
 // decryptDataPacket decrypts a data packet using the peer's active session,
-// falling back to the pending session (WireGuard-style handshake confirmation).
+// falling back to the pending session (WireGuard-style handshake confirmation)
+// and then the previous session.
 // If the pending session decrypts successfully, it is promoted to active and
 // OnSessionEstablished is called. Returns nil if decryption fails with both.
 func (d *Dispatcher) decryptDataPacket(entry *peer.Entry, sess *session.Session, nonce uint64, payload []byte) []byte {
@@ -336,6 +337,14 @@ func (d *Dispatcher) decryptDataPacket(entry *peer.Entry, sess *session.Session,
 			if d.OnSessionEstablished != nil {
 				d.OnSessionEstablished(entry)
 			}
+			return plain
+		}
+	}
+
+	// Packets sent under the session we just replaced may still be in flight.
+	if prev := entry.GetPreviousSession(); prev != nil && prev != sess {
+		plain, err := prev.Decrypt(nonce, payload)
+		if err == nil && plain != nil {
 			return plain
 		}
 	}

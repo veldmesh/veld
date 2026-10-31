@@ -4,6 +4,7 @@ package session
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -228,5 +229,91 @@ func TestSession_NeedsRekey_NonceThreshold(t *testing.T) {
 	// Should need rekey.
 	if !sA.NeedsRekey() {
 		t.Error("session at nonce threshold should need rekey")
+	}
+}
+
+func TestSession_LossAndReorder(t *testing.T) {
+	a, b := newTestSessionPair(t)
+
+	type pkt struct {
+		n  uint64
+		ct []byte
+	}
+	var pkts []pkt
+	for i := 0; i < 4; i++ {
+		n, ct, err := a.Encrypt([]byte{byte(i)})
+		if err != nil {
+			t.Fatalf("encrypt %d: %v", i, err)
+		}
+		pkts = append(pkts, pkt{n, ct})
+	}
+
+	// Packet 1 is lost and 3 arrives before 2; 0 arrives last.
+	for _, i := range []int{3, 2, 0} {
+		plain, _ := b.Decrypt(pkts[i].n, pkts[i].ct)
+		if len(plain) != 1 || plain[0] != byte(i) {
+			t.Errorf("packet %d: got %v", i, plain)
+		}
+	}
+}
+
+func TestSession_ForgedPacketDoesNotPoisonWindow(t *testing.T) {
+	a, b := newTestSessionPair(t)
+
+	if plain, _ := b.Decrypt(1<<31, make([]byte, 32)); plain != nil {
+		t.Fatal("forged packet decrypted")
+	}
+
+	n, ct, _ := a.Encrypt([]byte("hello"))
+	if plain, _ := b.Decrypt(n, ct); string(plain) != "hello" {
+		t.Errorf("legit packet after forged one: got %q", plain)
+	}
+}
+
+func TestSession_WrongNonceRejected(t *testing.T) {
+	a, b := newTestSessionPair(t)
+
+	n, ct, _ := a.Encrypt([]byte("hello"))
+	if plain, _ := b.Decrypt(n+1, ct); plain != nil {
+		t.Error("packet decrypted under a nonce it was not sent with")
+	}
+}
+
+func TestSession_ConcurrentEncryptUniqueNonces(t *testing.T) {
+	a, b := newTestSessionPair(t)
+
+	const workers, per = 4, 500
+	type pkt struct {
+		n  uint64
+		ct []byte
+	}
+	out := make(chan pkt, workers*per)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < per; i++ {
+				n, ct, err := a.Encrypt(make([]byte, 16))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				out <- pkt{n, ct}
+			}
+		}()
+	}
+	wg.Wait()
+	close(out)
+
+	seen := map[string]bool{}
+	for p := range out {
+		if seen[string(p.ct)] {
+			t.Fatal("two packets share a ciphertext: nonce reused")
+		}
+		seen[string(p.ct)] = true
+		if plain, _ := b.Decrypt(p.n, p.ct); plain == nil {
+			t.Fatalf("packet with nonce %d did not decrypt", p.n)
+		}
 	}
 }
