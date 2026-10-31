@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"log"
 	"math/rand/v2"
 	"net/netip"
 	"sync"
@@ -46,7 +47,7 @@ type Config struct {
 	Endpoint     string           // UDP endpoint to advertise, e.g. "1.2.3.4:51820"
 	SubnetRoutes []string         // CIDR prefixes to advertise (e.g. "192.168.1.0/24")
 	PeerTable    *peer.Table      // peer table kept in sync with coord server events
-	TLSInsecure  bool             // disable TLS cert verification (testing only)
+	TLSInsecure  bool             // connect without TLS at all (plaintext; testing only)
 }
 
 // Client maintains a live connection to the coord server, registers the local
@@ -59,6 +60,7 @@ type Client struct {
 	vpnAddr     netip.Addr
 	peerID      string
 	networkCidr string
+	lastTS      int64 // last timestamp signed into Register/Watch/Leave
 
 	gcMu sync.Mutex
 	gc   coordv1.CoordClient // set when connected; nil when not
@@ -144,11 +146,15 @@ func (c *Client) SendSignal(ctx context.Context, toPeerID string, payload []byte
 	fromPeerID := c.peerID
 	token := c.cfg.Token
 	c.mu.Unlock()
+	ts := time.Now().Unix()
 	_, err := gc.SendSignal(ctx, &coordv1.SendSignalRequest{
-		Token:      token,
-		FromPeerId: fromPeerID,
-		ToPeerId:   toPeerID,
-		Payload:    payload,
+		Token:         token,
+		FromPeerId:    fromPeerID,
+		ToPeerId:      toPeerID,
+		Payload:       payload,
+		TimestampUnix: ts,
+		Signature: crypto.SignCall(c.cfg.Identity.Ed25519Private,
+			crypto.SendSignalClaims(fromPeerID, toPeerID, payload, ts)),
 	})
 	return err
 }
@@ -158,6 +164,8 @@ func (c *Client) run(ctx context.Context) {
 
 	opts := []grpc.DialOption{}
 	if c.cfg.TLSInsecure {
+		// tls_insecure does not skip certificate checks: it turns TLS off.
+		log.Printf("warning: tls_insecure is set: connecting to %s without TLS; the token and all peer data are sent in plaintext", c.cfg.ServerAddr)
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
 		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})))
@@ -202,6 +210,22 @@ func (c *Client) run(ctx context.Context) {
 	c.sendLeave(gc)
 }
 
+// nextTimestamp returns the timestamp to sign into a Register, Watch or
+// Leave request: the current unix time, but always later than the last one.
+// Ed25519 signatures are deterministic and the coord server accepts each
+// signature once, so a retry within the same second must not sign the same
+// message again.
+func (c *Client) nextTimestamp() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ts := time.Now().Unix()
+	if ts <= c.lastTS {
+		ts = c.lastTS + 1
+	}
+	c.lastTS = ts
+	return ts
+}
+
 // registerAndWatch runs one registration+watch cycle.
 // Returns nil if ctx was cancelled (clean stop), non-nil for transient errors.
 func (c *Client) registerAndWatch(ctx context.Context, gc coordv1.CoordClient) error {
@@ -212,7 +236,7 @@ func (c *Client) registerAndWatch(ctx context.Context, gc coordv1.CoordClient) e
 	// possession of the private key behind the peer ID: the coord
 	// server rejects an unsigned Register. The signature covers every
 	// field that names or addresses the peer plus a fresh timestamp.
-	ts := time.Now().Unix()
+	ts := c.nextTimestamp()
 	req := &coordv1.RegisterRequest{
 		NetworkId:     c.cfg.NetworkID,
 		Token:         c.cfg.Token,
@@ -262,10 +286,14 @@ func (c *Client) registerAndWatch(ctx context.Context, gc coordv1.CoordClient) e
 	// Stream peer events (and signals addressed to us) until ctx is cancelled.
 	// The server sends a synthetic JOIN snapshot of current peers at stream
 	// start, so no separate ListPeers call is needed.
+	ts = c.nextTimestamp()
 	stream, err := gc.Watch(ctx, &coordv1.WatchRequest{
-		NetworkId: c.cfg.NetworkID,
-		Token:     c.cfg.Token,
-		PeerId:    resp.PeerId,
+		NetworkId:     c.cfg.NetworkID,
+		Token:         c.cfg.Token,
+		PeerId:        resp.PeerId,
+		TimestampUnix: ts,
+		Signature: crypto.SignCall(c.cfg.Identity.Ed25519Private,
+			crypto.WatchClaims(resp.PeerId, c.cfg.NetworkID, ts)),
 	})
 	if err != nil {
 		if ctx.Err() != nil {
@@ -363,9 +391,12 @@ func (c *Client) sendLeave(gc coordv1.CoordClient) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	ts := c.nextTimestamp()
 	_, _ = gc.Leave(ctx, &coordv1.LeaveRequest{
-		Token:  c.cfg.Token,
-		PeerId: pid,
+		Token:         c.cfg.Token,
+		PeerId:        pid,
+		TimestampUnix: ts,
+		Signature:     crypto.SignCall(c.cfg.Identity.Ed25519Private, crypto.LeaveClaims(pid, ts)),
 	})
 }
 

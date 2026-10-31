@@ -228,7 +228,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 			Token:        cfg.Coord.Token,
 			Identity:     localID,
 			LocalName:    "host",
-			Endpoint:     cfg.Node.ListenAddr,
+			Endpoint:     advertisedEndpoint(cfg.Node.ListenAddr),
 			SubnetRoutes: cfg.Node.SubnetRoutes,
 			PeerTable:    peerTbl,
 			TLSInsecure:  cfg.Coord.TLSInsecure,
@@ -535,6 +535,18 @@ func (d *Daemon) onMDNSPeer(e *peer.Entry, ep netip.AddrPort, coordMode bool) {
 		return
 	}
 	d.hsMgr.Initiate(e)
+}
+
+// advertisedEndpoint returns the endpoint to register with the coordinator
+// for listenAddr: the address itself when peers could dial it, or "" for a
+// wildcard address (0.0.0.0:51820) or port 0, which tell a peer nothing. The
+// coordinator rejects those, and NAT traversal finds the real endpoint.
+func advertisedEndpoint(listenAddr string) string {
+	ep, err := netip.ParseAddrPort(listenAddr)
+	if err != nil || ep.Port() == 0 || ep.Addr().IsUnspecified() {
+		return ""
+	}
+	return listenAddr
 }
 
 // addPeerRoutes installs OS routes for the subnets e advertises, skipping

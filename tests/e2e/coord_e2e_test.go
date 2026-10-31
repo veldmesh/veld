@@ -47,6 +47,14 @@ func signedRegisterReq(t *testing.T, id *crypto.Identity, networkID, token, name
 	return req
 }
 
+// signedLeaveReq builds a LeaveRequest for peerID signed with id, like the
+// coord client does: the shared account token alone cannot make a peer leave.
+func signedLeaveReq(id *crypto.Identity, token, peerID string) *coordv1.LeaveRequest {
+	req := &coordv1.LeaveRequest{Token: token, PeerId: peerID, TimestampUnix: time.Now().Unix()}
+	req.Signature = crypto.SignCall(id.Ed25519Private, crypto.LeaveClaims(peerID, req.TimestampUnix))
+	return req
+}
+
 func TestCoord_E2E(t *testing.T) {
 	// Start gRPC server on random port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -155,10 +163,7 @@ func TestCoord_E2E(t *testing.T) {
 	}
 
 	// Leave with peer1
-	leaveReq := &coordv1.LeaveRequest{
-		Token:  "test-token",
-		PeerId: regResp1.PeerId,
-	}
+	leaveReq := signedLeaveReq(idA, "test-token", regResp1.PeerId)
 
 	_, err = client.Leave(context.Background(), leaveReq)
 	if err != nil {
@@ -273,10 +278,7 @@ func TestCoord_E2E_Watch(t *testing.T) {
 	}
 
 	// Leave and verify LEAVE event
-	leaveReq := &coordv1.LeaveRequest{
-		Token:  "test-token",
-		PeerId: regResp.PeerId,
-	}
+	leaveReq := signedLeaveReq(id, "test-token", regResp.PeerId)
 
 	_, err = client.Leave(context.Background(), leaveReq)
 	if err != nil {

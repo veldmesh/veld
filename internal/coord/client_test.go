@@ -263,9 +263,12 @@ func TestClient_WatchLeave_RemovesPeerFromTable(t *testing.T) {
 	}
 
 	// B leaves.
+	leaveTS := time.Now().Unix()
 	_, err = rawClient.Leave(context.Background(), &coordv1.LeaveRequest{
-		Token:  "tok",
-		PeerId: regResp.PeerId,
+		Token:         "tok",
+		PeerId:        regResp.PeerId,
+		TimestampUnix: leaveTS,
+		Signature:     crypto.SignCall(idB.Ed25519Private, crypto.LeaveClaims(regResp.PeerId, leaveTS)),
 	})
 	if err != nil {
 		t.Fatalf("Leave B: %v", err)
@@ -332,7 +335,7 @@ func TestClient_OnSignal(t *testing.T) {
 
 	// Start client A.
 	tblA := peer.New()
-	cA, _ := makeClient(t, addr, tblA)
+	cA, idA := makeClient(t, addr, tblA)
 	cA.Start()
 	defer func() { cA.Stop(); cA.Wait() }()
 
@@ -372,11 +375,14 @@ func TestClient_OnSignal(t *testing.T) {
 	rawClient := coordv1.NewCoordClient(grpcConn)
 
 	wantPayload := []byte("hello from A")
+	sigTS := time.Now().Unix()
 	_, err = rawClient.SendSignal(context.Background(), &coordv1.SendSignalRequest{
-		Token:      "tok",
-		FromPeerId: peerIDA,
-		ToPeerId:   peerIDB,
-		Payload:    wantPayload,
+		Token:         "tok",
+		FromPeerId:    peerIDA,
+		ToPeerId:      peerIDB,
+		Payload:       wantPayload,
+		TimestampUnix: sigTS,
+		Signature:     crypto.SignCall(idA.Ed25519Private, crypto.SendSignalClaims(peerIDA, peerIDB, wantPayload, sigTS)),
 	})
 	if err != nil {
 		t.Fatalf("SendSignal: %v", err)

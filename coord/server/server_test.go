@@ -133,6 +133,64 @@ func mustRegister(t *testing.T, srv *Server, req *coordv1.RegisterRequest) *coor
 	return resp
 }
 
+// --- Call signature test helpers ---
+
+var (
+	callTSMu   sync.Mutex
+	callTSUsed = map[string]bool{}
+)
+
+// signedCall returns a call signature by id over the claims built for a
+// timestamp, plus that timestamp. Ed25519 is deterministic, so identical
+// claims at the same unix second would give an identical signature that the
+// server rejects as a replay; the timestamp is therefore bumped until the
+// signature is one this test process has not produced yet.
+func signedCall(id *crypto.Identity, claimsAt func(ts int64) crypto.CallClaims) (int64, []byte) {
+	callTSMu.Lock()
+	defer callTSMu.Unlock()
+	ts := time.Now().Unix()
+	for {
+		sig := crypto.SignCall(id.Ed25519Private, claimsAt(ts))
+		if k := string(sig); !callTSUsed[k] {
+			callTSUsed[k] = true
+			return ts, sig
+		}
+		ts++
+	}
+}
+
+// signLeave stamps and signs req (acting as req.PeerId) with id.
+func signLeave(t *testing.T, id *crypto.Identity, req *coordv1.LeaveRequest) *coordv1.LeaveRequest {
+	t.Helper()
+	req.TimestampUnix, req.Signature = signedCall(id, func(ts int64) crypto.CallClaims {
+		return crypto.LeaveClaims(req.PeerId, ts)
+	})
+	return req
+}
+
+// signWatch stamps and signs req (acting as req.PeerId) with id.
+func signWatch(t *testing.T, id *crypto.Identity, req *coordv1.WatchRequest) *coordv1.WatchRequest {
+	t.Helper()
+	req.TimestampUnix, req.Signature = signedCall(id, func(ts int64) crypto.CallClaims {
+		return crypto.WatchClaims(req.PeerId, req.NetworkId, ts)
+	})
+	return req
+}
+
+// signSendSignal stamps and signs req (acting as req.FromPeerId) with id.
+func signSendSignal(t *testing.T, id *crypto.Identity, req *coordv1.SendSignalRequest) *coordv1.SendSignalRequest {
+	t.Helper()
+	req.TimestampUnix, req.Signature = signedCall(id, func(ts int64) crypto.CallClaims {
+		return crypto.SendSignalClaims(req.FromPeerId, req.ToPeerId, req.Payload, ts)
+	})
+	return req
+}
+
+// peerIDOf returns the peer ID (hex Ed25519 public key) of id.
+func peerIDOf(id *crypto.Identity) string {
+	return hex.EncodeToString(id.Ed25519Public)
+}
+
 func TestServer_Register_OK(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
@@ -299,10 +357,10 @@ func TestServer_Leave_OK(t *testing.T) {
 	}
 
 	// Leave
-	leaveReq := &coordv1.LeaveRequest{
+	leaveReq := signLeave(t, id, &coordv1.LeaveRequest{
 		Token:  "test-token",
 		PeerId: regResp.PeerId,
-	}
+	})
 
 	_, err = srv.Leave(context.Background(), leaveReq)
 	if err != nil {
@@ -364,20 +422,20 @@ func TestServer_SendSignal_OK(t *testing.T) {
 	stream := newFakeWatchStream()
 	done := make(chan error, 1)
 	go func() {
-		done <- srv.Watch(&coordv1.WatchRequest{
+		done <- srv.Watch(signWatch(t, idB, &coordv1.WatchRequest{
 			NetworkId: "test-net",
 			Token:     "test-token",
 			PeerId:    respB.PeerId,
-		}, stream)
+		}), stream)
 	}()
 	time.Sleep(50 * time.Millisecond)
 
-	_, err = srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+	_, err = srv.SendSignal(context.Background(), signSendSignal(t, idA, &coordv1.SendSignalRequest{
 		Token:      "test-token",
 		FromPeerId: respA.PeerId,
 		ToPeerId:   respB.PeerId,
 		Payload:    []byte("test signal"),
-	})
+	}))
 	if err != nil {
 		stream.cancel()
 		t.Fatalf("SendSignal: %v", err)
@@ -512,10 +570,10 @@ func TestServer_Watch_ReceivesLeaveEvent(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Now leave — should trigger LEAVE event.
-	_, err = srv.Leave(context.Background(), &coordv1.LeaveRequest{
+	_, err = srv.Leave(context.Background(), signLeave(t, id, &coordv1.LeaveRequest{
 		Token:  "test-token",
 		PeerId: regResp.PeerId,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Leave: %v", err)
 	}
@@ -669,7 +727,12 @@ func TestServer_Register_Idempotent(t *testing.T) {
 		t.Fatalf("first Register: %v", err)
 	}
 
-	resp2, err := srv.Register(context.Background(), req)
+	// Ed25519 is deterministic, so an identical request is a replay; a
+	// legitimate re-registration is signed with a later timestamp.
+	req2 := newRegisterRequest(id, "test-net", "test-token", "idempotent-peer", "", nil)
+	req2.TimestampUnix = req.TimestampUnix + 1
+	req2.Signature = crypto.SignRegister(id.Ed25519Private, registerClaimsFor(req2))
+	resp2, err := srv.Register(context.Background(), req2)
 	if err != nil {
 		t.Fatalf("second Register: %v", err)
 	}
@@ -712,16 +775,16 @@ func TestServer_SignalSentBeforeRecipientWatches_IsDelivered(t *testing.T) {
 	}
 
 	// B signals A before A has opened its Watch stream.
-	if _, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+	if _, err := srv.SendSignal(context.Background(), signSendSignal(t, idB, &coordv1.SendSignalRequest{
 		Token: "test-token", FromPeerId: respB.PeerId, ToPeerId: respA.PeerId, Payload: []byte("candidates-from-b"),
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("SendSignal: %v", err)
 	}
 
 	stream := newFakeWatchStream()
 	done := make(chan error, 1)
 	go func() {
-		done <- srv.Watch(&coordv1.WatchRequest{NetworkId: "test-net", Token: "test-token", PeerId: respA.PeerId}, stream)
+		done <- srv.Watch(signWatch(t, idA, &coordv1.WatchRequest{NetworkId: "test-net", Token: "test-token", PeerId: respA.PeerId}), stream)
 	}()
 	time.Sleep(100 * time.Millisecond)
 	stream.cancel()
@@ -754,9 +817,9 @@ func TestServer_SignalToUnknownPeer_IsNotHeld(t *testing.T) {
 
 	// The recipient is not registered: the request must be rejected outright
 	// instead of silently accepted, and nothing may be held for it.
-	_, err = srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+	_, err = srv.SendSignal(context.Background(), signSendSignal(t, id, &coordv1.SendSignalRequest{
 		Token: "test-token", FromPeerId: resp.PeerId, ToPeerId: "no-such-peer", Payload: []byte("p"),
-	})
+	}))
 	if status.Code(err) != codes.NotFound {
 		t.Fatalf("SendSignal to an unregistered peer: got %v, want NotFound", err)
 	}
@@ -772,6 +835,13 @@ func TestServer_SignalToUnknownPeer_IsNotHeld(t *testing.T) {
 // owned by acc1 and "net-b" owned by acc2. Peers are registered via the RPC
 // so they have valid keys and signatures.
 func twoAccountTestServer(t *testing.T) (*Server, *Registry) {
+	srv, reg, _, _ := twoAccountTestServerIDs(t)
+	return srv, reg
+}
+
+// twoAccountTestServerIDs is twoAccountTestServer that also returns the
+// identities behind peer-a1 (net-a) and peer-b1 (net-b).
+func twoAccountTestServerIDs(t *testing.T) (*Server, *Registry, *crypto.Identity, *crypto.Identity) {
 	t.Helper()
 	reg, err := NewRegistry(t.TempDir() + "/test.db")
 	if err != nil {
@@ -806,11 +876,11 @@ func twoAccountTestServer(t *testing.T) (*Server, *Registry) {
 		t.Fatalf("Register B: %v", err)
 	}
 
-	return srv, reg
+	return srv, reg, idA, idB
 }
 
 func TestServer_SendSignal_SenderNotOwnedByCaller_IsRejected(t *testing.T) {
-	srv, reg := twoAccountTestServer(t)
+	srv, reg, _, idB1 := twoAccountTestServerIDs(t)
 	defer reg.Close()
 
 	// We need a second peer in net-a to be the recipient.
@@ -840,9 +910,9 @@ func TestServer_SendSignal_SenderNotOwnedByCaller_IsRejected(t *testing.T) {
 	// A caller authenticated as acc1 (tok-a) claims to be acc2's peer (peerB1).
 	// Without the ownership check it could both spoof acc2 and make the registered
 	// recipient hold a signal that never really came from b1's account.
-	_, err = srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+	_, err = srv.SendSignal(context.Background(), signSendSignal(t, idB1, &coordv1.SendSignalRequest{
 		Token: "tok-a", FromPeerId: peerB1, ToPeerId: peerA1, Payload: []byte("spoofed"),
-	})
+	}))
 	if status.Code(err) != codes.NotFound {
 		t.Fatalf("SendSignal with a foreign from_peer_id: got %v, want NotFound", err)
 	}
@@ -855,7 +925,7 @@ func TestServer_SendSignal_SenderNotOwnedByCaller_IsRejected(t *testing.T) {
 }
 
 func TestServer_SendSignal_PeersNotInSameNetwork_IsRejected(t *testing.T) {
-	srv, reg := twoAccountTestServer(t)
+	srv, reg, idA1, _ := twoAccountTestServerIDs(t)
 	defer reg.Close()
 
 	// Get the peer IDs from the registry.
@@ -874,9 +944,9 @@ func TestServer_SendSignal_PeersNotInSameNetwork_IsRejected(t *testing.T) {
 	}
 
 	// Both peers are registered, but they do not share a network.
-	_, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+	_, err := srv.SendSignal(context.Background(), signSendSignal(t, idA1, &coordv1.SendSignalRequest{
 		Token: "tok-a", FromPeerId: peerA1, ToPeerId: peerB1, Payload: []byte("p"),
-	})
+	}))
 	if status.Code(err) != codes.NotFound {
 		t.Fatalf("SendSignal across networks: got %v, want NotFound", err)
 	}
@@ -918,7 +988,7 @@ func TestServer_SendSignal_UnknownSender_IsRejected(t *testing.T) {
 // authenticated account; a valid token for one account must not delete
 // another account's peers.
 func TestServer_Leave_PeerNotOwnedByCaller_IsRejected(t *testing.T) {
-	srv, reg := twoAccountTestServer(t)
+	srv, reg, _, idB1 := twoAccountTestServerIDs(t)
 	defer reg.Close()
 
 	var peerB1 string
@@ -929,9 +999,9 @@ func TestServer_Leave_PeerNotOwnedByCaller_IsRejected(t *testing.T) {
 		}
 	}
 
-	_, err := srv.Leave(context.Background(), &coordv1.LeaveRequest{
+	_, err := srv.Leave(context.Background(), signLeave(t, idB1, &coordv1.LeaveRequest{
 		Token: "tok-a", PeerId: peerB1,
-	})
+	}))
 	if status.Code(err) != codes.NotFound {
 		t.Fatalf("Leave removing a peer of another account: got %v, want NotFound", err)
 	}
@@ -968,12 +1038,12 @@ func TestServer_SendSignal_PayloadTooLarge_IsRejected(t *testing.T) {
 		t.Fatalf("Register B: %v", err)
 	}
 
-	_, err = srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+	_, err = srv.SendSignal(context.Background(), signSendSignal(t, idA, &coordv1.SendSignalRequest{
 		Token:      "test-token",
 		FromPeerId: respA.PeerId,
 		ToPeerId:   respB.PeerId,
 		Payload:    make([]byte, maxSignalPayload+1),
-	})
+	}))
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("SendSignal with an oversized payload: got %v, want InvalidArgument", err)
 	}
@@ -986,12 +1056,12 @@ func TestServer_SendSignal_PayloadTooLarge_IsRejected(t *testing.T) {
 
 	// The boundary is inclusive: a payload of exactly maxSignalPayload
 	// bytes is accepted (held for the recipient that has no Watch yet).
-	if _, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+	if _, err := srv.SendSignal(context.Background(), signSendSignal(t, idA, &coordv1.SendSignalRequest{
 		Token:      "test-token",
 		FromPeerId: respA.PeerId,
 		ToPeerId:   respB.PeerId,
 		Payload:    make([]byte, maxSignalPayload),
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("SendSignal with a max-size payload: %v", err)
 	}
 }
@@ -1014,6 +1084,9 @@ type scopedFixture struct {
 	peerA3 string           // peer in netA2 (account A)
 	peerB1 string           // peer in netB  (account B)
 	idA1   *crypto.Identity // identity behind peerA1
+	idA2   *crypto.Identity // identity behind peerA2
+	idA3   *crypto.Identity // identity behind peerA3
+	idB1   *crypto.Identity // identity behind peerB1
 
 	// newPeerID carries the peer ID registered by the most recent call
 	// row so its check can assert on it.
@@ -1062,9 +1135,9 @@ func newScopedFixture(t *testing.T) *scopedFixture {
 		tokenB: "token-b",
 	}
 	f.peerA1, f.idA1 = scopedRegister(t, f, f.netA, f.tokenA, "peer-a1", "1.1.1.1:1111")
-	f.peerA2, _ = scopedRegister(t, f, f.netA, f.tokenA, "peer-a2", "")
-	f.peerA3, _ = scopedRegister(t, f, f.netA2, f.tokenA, "peer-a3", "")
-	f.peerB1, _ = scopedRegister(t, f, f.netB, f.tokenB, "peer-b1", "")
+	f.peerA2, f.idA2 = scopedRegister(t, f, f.netA, f.tokenA, "peer-a2", "")
+	f.peerA3, f.idA3 = scopedRegister(t, f, f.netA2, f.tokenA, "peer-a3", "")
+	f.peerB1, f.idB1 = scopedRegister(t, f, f.netB, f.tokenB, "peer-b1", "")
 	return f
 }
 
@@ -1101,15 +1174,15 @@ func (f *scopedFixture) scopedWatch(t *testing.T, req *coordv1.WatchRequest) ([]
 	}
 }
 
-// watchDuring starts a Watch for peerID in networkID (authenticated with
+// watchDuring starts a Watch for peerID (signed with id) in networkID (authenticated with
 // token), lets the subscription establish, runs fn, then stops the stream
 // and returns the events it received.
-func (f *scopedFixture) watchDuring(t *testing.T, token, networkID, peerID string, fn func()) []*coordv1.PeerEvent {
+func (f *scopedFixture) watchDuring(t *testing.T, id *crypto.Identity, token, networkID, peerID string, fn func()) []*coordv1.PeerEvent {
 	t.Helper()
 	stream := newFakeWatchStream()
 	done := make(chan error, 1)
 	go func() {
-		done <- f.srv.Watch(&coordv1.WatchRequest{NetworkId: networkID, Token: token, PeerId: peerID}, stream)
+		done <- f.srv.Watch(signWatch(t, id, &coordv1.WatchRequest{NetworkId: networkID, Token: token, PeerId: peerID}), stream)
 	}()
 	time.Sleep(100 * time.Millisecond) // let the subscription establish
 	fn()
@@ -1227,7 +1300,7 @@ func TestServer_PerAccountScoping(t *testing.T) {
 		{
 			name: "Watch own network naming another account's peer",
 			call: func(t *testing.T, f *scopedFixture) error {
-				events, err := f.scopedWatch(t, &coordv1.WatchRequest{NetworkId: f.netB, Token: f.tokenB, PeerId: f.peerA1})
+				events, err := f.scopedWatch(t, signWatch(t, f.idA1, &coordv1.WatchRequest{NetworkId: f.netB, Token: f.tokenB, PeerId: f.peerA1}))
 				f.watched = events
 				return err
 			},
@@ -1245,13 +1318,13 @@ func TestServer_PerAccountScoping(t *testing.T) {
 			name: "SendSignal to another account's peer",
 			call: func(t *testing.T, f *scopedFixture) error {
 				var rpcErr error
-				f.watched = f.watchDuring(t, f.tokenA, f.netA, f.peerA1, func() {
-					_, rpcErr = f.srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+				f.watched = f.watchDuring(t, f.idA1, f.tokenA, f.netA, f.peerA1, func() {
+					_, rpcErr = f.srv.SendSignal(context.Background(), signSendSignal(t, f.idB1, &coordv1.SendSignalRequest{
 						Token:      f.tokenB,
 						FromPeerId: f.peerB1,
 						ToPeerId:   f.peerA1,
 						Payload:    []byte("scoped?"),
-					})
+					}))
 				})
 				return rpcErr
 			},
@@ -1264,13 +1337,13 @@ func TestServer_PerAccountScoping(t *testing.T) {
 			name: "SendSignal as another account's peer",
 			call: func(t *testing.T, f *scopedFixture) error {
 				var rpcErr error
-				f.watched = f.watchDuring(t, f.tokenA, f.netA, f.peerA2, func() {
-					_, rpcErr = f.srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+				f.watched = f.watchDuring(t, f.idA2, f.tokenA, f.netA, f.peerA2, func() {
+					_, rpcErr = f.srv.SendSignal(context.Background(), signSendSignal(t, f.idA1, &coordv1.SendSignalRequest{
 						Token:      f.tokenB,
 						FromPeerId: f.peerA1,
 						ToPeerId:   f.peerA2,
 						Payload:    []byte("scoped?"),
-					})
+					}))
 				})
 				return rpcErr
 			},
@@ -1282,7 +1355,7 @@ func TestServer_PerAccountScoping(t *testing.T) {
 		{
 			name: "Leave another account's peer",
 			call: func(t *testing.T, f *scopedFixture) error {
-				_, err := f.srv.Leave(context.Background(), &coordv1.LeaveRequest{Token: f.tokenB, PeerId: f.peerA1})
+				_, err := f.srv.Leave(context.Background(), signLeave(t, f.idA1, &coordv1.LeaveRequest{Token: f.tokenB, PeerId: f.peerA1}))
 				return err
 			},
 			check: func(t *testing.T, f *scopedFixture) {
@@ -1296,13 +1369,13 @@ func TestServer_PerAccountScoping(t *testing.T) {
 			name: "SendSignal across two networks of the same account",
 			call: func(t *testing.T, f *scopedFixture) error {
 				var rpcErr error
-				f.watched = f.watchDuring(t, f.tokenA, f.netA2, f.peerA3, func() {
-					_, rpcErr = f.srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+				f.watched = f.watchDuring(t, f.idA3, f.tokenA, f.netA2, f.peerA3, func() {
+					_, rpcErr = f.srv.SendSignal(context.Background(), signSendSignal(t, f.idA1, &coordv1.SendSignalRequest{
 						Token:      f.tokenA,
 						FromPeerId: f.peerA1,
 						ToPeerId:   f.peerA3,
 						Payload:    []byte("cross-net"),
-					})
+					}))
 				})
 				return rpcErr
 			},
@@ -1342,7 +1415,7 @@ func TestServer_PerAccountScoping(t *testing.T) {
 		{
 			name: "Watch own network with own peer succeeds",
 			call: func(t *testing.T, f *scopedFixture) error {
-				events, err := f.scopedWatch(t, &coordv1.WatchRequest{NetworkId: f.netA, Token: f.tokenA, PeerId: f.peerA1})
+				events, err := f.scopedWatch(t, signWatch(t, f.idA1, &coordv1.WatchRequest{NetworkId: f.netA, Token: f.tokenA, PeerId: f.peerA1}))
 				f.watched = events
 				return err
 			},
@@ -1365,13 +1438,13 @@ func TestServer_PerAccountScoping(t *testing.T) {
 			name: "SendSignal within own network succeeds",
 			call: func(t *testing.T, f *scopedFixture) error {
 				var rpcErr error
-				f.watched = f.watchDuring(t, f.tokenA, f.netA, f.peerA2, func() {
-					_, rpcErr = f.srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+				f.watched = f.watchDuring(t, f.idA2, f.tokenA, f.netA, f.peerA2, func() {
+					_, rpcErr = f.srv.SendSignal(context.Background(), signSendSignal(t, f.idA1, &coordv1.SendSignalRequest{
 						Token:      f.tokenA,
 						FromPeerId: f.peerA1,
 						ToPeerId:   f.peerA2,
 						Payload:    []byte("probe"),
-					})
+					}))
 				})
 				return rpcErr
 			},
@@ -1394,7 +1467,7 @@ func TestServer_PerAccountScoping(t *testing.T) {
 		{
 			name: "Leave own peer succeeds",
 			call: func(t *testing.T, f *scopedFixture) error {
-				_, err := f.srv.Leave(context.Background(), &coordv1.LeaveRequest{Token: f.tokenA, PeerId: f.peerA2})
+				_, err := f.srv.Leave(context.Background(), signLeave(t, f.idA2, &coordv1.LeaveRequest{Token: f.tokenA, PeerId: f.peerA2}))
 				return err
 			},
 			check: func(t *testing.T, f *scopedFixture) {
@@ -1435,7 +1508,7 @@ func TestServer_Register_PeerIDAlreadyRegisteredElsewhere(t *testing.T) {
 
 	// The holder of A's key registers it into B's own network while B's
 	// watcher is connected.
-	events := f.watchDuring(t, f.tokenB, f.netB, f.peerB1, func() {
+	events := f.watchDuring(t, f.idB1, f.tokenB, f.netB, f.peerB1, func() {
 		req := newRegisterRequest(f.idA1, f.netB, f.tokenB, "b-clone", "9.9.9.9:9999", nil)
 		signRegisterReq(t, f.idA1, req)
 		_, err = f.srv.Register(context.Background(), req)

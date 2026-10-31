@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"net/netip"
 	"sync"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/veldmesh/veld/coord/ce"
 	coordcore "github.com/veldmesh/veld/coord/core"
 	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
+	"github.com/veldmesh/veld/internal/crypto"
 )
 
 // recordingHooks records OnPeerLeft calls for assertions.
@@ -75,12 +77,16 @@ func newSweepTestServer(t *testing.T) (*Server, *Registry, *recordingHooks, *rec
 	return srv, reg, hooks, audit
 }
 
-func registerSweepPeer(t *testing.T, reg *Registry, id string, lastSeen int64) {
+// registerSweepPeer inserts a peer with a real Ed25519 key (its peer ID is
+// the arbitrary string id, so call signatures claim that ID) and returns the
+// identity behind it.
+func registerSweepPeer(t *testing.T, reg *Registry, id string, lastSeen int64) *crypto.Identity {
 	t.Helper()
+	ident := newRegisterIdentity(t)
 	rec := peerRecord{
 		ID:            id,
 		Name:          id,
-		Ed25519Public: "dGVzdA==",
+		Ed25519Public: base64.StdEncoding.EncodeToString(ident.Ed25519Public),
 		X25519Public:  "dGVzdA==",
 		LastSeen:      lastSeen,
 		RegisteredAt:  lastSeen,
@@ -88,6 +94,7 @@ func registerSweepPeer(t *testing.T, reg *Registry, id string, lastSeen int64) {
 	if _, err := reg.RegisterPeer(rec, "net1", 0); err != nil {
 		t.Fatalf("RegisterPeer %s: %v", id, err)
 	}
+	return ident
 }
 
 func TestRegistry_SweepStalePeers_RemovesOnlyStale(t *testing.T) {
@@ -287,15 +294,17 @@ func TestServer_ExpelStalePeers_DropsPendingSignals(t *testing.T) {
 	srv, reg, _, _ := newSweepTestServer(t)
 
 	now := time.Now().Unix()
-	registerSweepPeer(t, reg, "stale", now-int64((48*time.Hour).Seconds()))
-	registerSweepPeer(t, reg, "fresh", now)
+	ids := map[string]*crypto.Identity{
+		"stale": registerSweepPeer(t, reg, "stale", now-int64((48*time.Hour).Seconds())),
+		"fresh": registerSweepPeer(t, reg, "fresh", now),
+	}
 
 	// Both peers are registered but not watching: signals to them are held.
 	send := func(from, to string) {
 		t.Helper()
-		if _, err := srv.SendSignal(context.Background(), &coordv1.SendSignalRequest{
+		if _, err := srv.SendSignal(context.Background(), signSendSignal(t, ids[from], &coordv1.SendSignalRequest{
 			Token: "tok", FromPeerId: from, ToPeerId: to, Payload: []byte("candidate"),
-		}); err != nil {
+		})); err != nil {
 			t.Fatalf("SendSignal %s->%s: %v", from, to, err)
 		}
 	}
@@ -321,12 +330,12 @@ func TestServer_ExpelStalePeers_SkipsConnectedPeer(t *testing.T) {
 
 	// Peer is stale by LastSeen but currently connected via Watch.
 	old := time.Now().Add(-48 * time.Hour).Unix()
-	registerSweepPeer(t, reg, "online-stale", old)
+	ident := registerSweepPeer(t, reg, "online-stale", old)
 
 	stream := newFakeWatchStream()
 	done := make(chan error, 1)
 	go func() {
-		done <- srv.Watch(&coordv1.WatchRequest{NetworkId: "net1", Token: "tok", PeerId: "online-stale"}, stream)
+		done <- srv.Watch(signWatch(t, ident, &coordv1.WatchRequest{NetworkId: "net1", Token: "tok", PeerId: "online-stale"}), stream)
 	}()
 
 	// Wait until the server observes the peer as connected.

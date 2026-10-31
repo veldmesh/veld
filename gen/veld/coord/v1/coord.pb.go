@@ -445,11 +445,16 @@ func (x *ListPeersResponse) GetPeers() []*Peer {
 	return nil
 }
 
+// WatchRequest opens the event stream. A request naming peer_id also
+// receives that peer's signals and keeps it marked online, so it must be
+// signed by that peer's key (see Watch).
 type WatchRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	NetworkId     string                 `protobuf:"bytes,1,opt,name=network_id,json=networkId,proto3" json:"network_id,omitempty"`
 	Token         string                 `protobuf:"bytes,2,opt,name=token,proto3" json:"token,omitempty"`
-	PeerId        string                 `protobuf:"bytes,3,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"` // caller's peer ID — used to filter self-events
+	PeerId        string                 `protobuf:"bytes,3,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`                       // caller's peer ID — used to filter self-events
+	TimestampUnix int64                  `protobuf:"varint,4,opt,name=timestamp_unix,json=timestampUnix,proto3" json:"timestamp_unix,omitempty"` // client clock when signing, unix seconds
+	Signature     []byte                 `protobuf:"bytes,5,opt,name=signature,proto3" json:"signature,omitempty"`                               // call signature by peer_id's key
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -503,6 +508,20 @@ func (x *WatchRequest) GetPeerId() string {
 		return x.PeerId
 	}
 	return ""
+}
+
+func (x *WatchRequest) GetTimestampUnix() int64 {
+	if x != nil {
+		return x.TimestampUnix
+	}
+	return 0
+}
+
+func (x *WatchRequest) GetSignature() []byte {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
 }
 
 // SignalEvent carries an opaque peer-to-peer signal payload.
@@ -628,6 +647,8 @@ type SendSignalRequest struct {
 	FromPeerId    string                 `protobuf:"bytes,2,opt,name=from_peer_id,json=fromPeerId,proto3" json:"from_peer_id,omitempty"`
 	ToPeerId      string                 `protobuf:"bytes,3,opt,name=to_peer_id,json=toPeerId,proto3" json:"to_peer_id,omitempty"`
 	Payload       []byte                 `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
+	TimestampUnix int64                  `protobuf:"varint,5,opt,name=timestamp_unix,json=timestampUnix,proto3" json:"timestamp_unix,omitempty"` // client clock when signing, unix seconds
+	Signature     []byte                 `protobuf:"bytes,6,opt,name=signature,proto3" json:"signature,omitempty"`                               // call signature by from_peer_id's key
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -690,6 +711,20 @@ func (x *SendSignalRequest) GetPayload() []byte {
 	return nil
 }
 
+func (x *SendSignalRequest) GetTimestampUnix() int64 {
+	if x != nil {
+		return x.TimestampUnix
+	}
+	return 0
+}
+
+func (x *SendSignalRequest) GetSignature() []byte {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
+}
+
 type SendSignalResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -730,6 +765,8 @@ type LeaveRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Token         string                 `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
 	PeerId        string                 `protobuf:"bytes,2,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`
+	TimestampUnix int64                  `protobuf:"varint,3,opt,name=timestamp_unix,json=timestampUnix,proto3" json:"timestamp_unix,omitempty"` // client clock when signing, unix seconds
+	Signature     []byte                 `protobuf:"bytes,4,opt,name=signature,proto3" json:"signature,omitempty"`                               // call signature by peer_id's key
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -776,6 +813,20 @@ func (x *LeaveRequest) GetPeerId() string {
 		return x.PeerId
 	}
 	return ""
+}
+
+func (x *LeaveRequest) GetTimestampUnix() int64 {
+	if x != nil {
+		return x.TimestampUnix
+	}
+	return 0
+}
+
+func (x *LeaveRequest) GetSignature() []byte {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
 }
 
 type LeaveResponse struct {
@@ -849,12 +900,14 @@ const file_veld_coord_v1_coord_proto_rawDesc = "" +
 	"network_id\x18\x01 \x01(\tR\tnetworkId\x12\x14\n" +
 	"\x05token\x18\x02 \x01(\tR\x05token\">\n" +
 	"\x11ListPeersResponse\x12)\n" +
-	"\x05peers\x18\x01 \x03(\v2\x13.veld.coord.v1.PeerR\x05peers\"\\\n" +
+	"\x05peers\x18\x01 \x03(\v2\x13.veld.coord.v1.PeerR\x05peers\"\xa1\x01\n" +
 	"\fWatchRequest\x12\x1d\n" +
 	"\n" +
 	"network_id\x18\x01 \x01(\tR\tnetworkId\x12\x14\n" +
 	"\x05token\x18\x02 \x01(\tR\x05token\x12\x17\n" +
-	"\apeer_id\x18\x03 \x01(\tR\x06peerId\"I\n" +
+	"\apeer_id\x18\x03 \x01(\tR\x06peerId\x12%\n" +
+	"\x0etimestamp_unix\x18\x04 \x01(\x03R\rtimestampUnix\x12\x1c\n" +
+	"\tsignature\x18\x05 \x01(\fR\tsignature\"I\n" +
 	"\vSignalEvent\x12 \n" +
 	"\ffrom_peer_id\x18\x01 \x01(\tR\n" +
 	"fromPeerId\x12\x18\n" +
@@ -862,18 +915,22 @@ const file_veld_coord_v1_coord_proto_rawDesc = "" +
 	"\tPeerEvent\x12,\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x18.veld.coord.v1.EventTypeR\x04type\x12'\n" +
 	"\x04peer\x18\x02 \x01(\v2\x13.veld.coord.v1.PeerR\x04peer\x122\n" +
-	"\x06signal\x18\x03 \x01(\v2\x1a.veld.coord.v1.SignalEventR\x06signal\"\x83\x01\n" +
+	"\x06signal\x18\x03 \x01(\v2\x1a.veld.coord.v1.SignalEventR\x06signal\"\xc8\x01\n" +
 	"\x11SendSignalRequest\x12\x14\n" +
 	"\x05token\x18\x01 \x01(\tR\x05token\x12 \n" +
 	"\ffrom_peer_id\x18\x02 \x01(\tR\n" +
 	"fromPeerId\x12\x1c\n" +
 	"\n" +
 	"to_peer_id\x18\x03 \x01(\tR\btoPeerId\x12\x18\n" +
-	"\apayload\x18\x04 \x01(\fR\apayload\"\x14\n" +
-	"\x12SendSignalResponse\"=\n" +
+	"\apayload\x18\x04 \x01(\fR\apayload\x12%\n" +
+	"\x0etimestamp_unix\x18\x05 \x01(\x03R\rtimestampUnix\x12\x1c\n" +
+	"\tsignature\x18\x06 \x01(\fR\tsignature\"\x14\n" +
+	"\x12SendSignalResponse\"\x82\x01\n" +
 	"\fLeaveRequest\x12\x14\n" +
 	"\x05token\x18\x01 \x01(\tR\x05token\x12\x17\n" +
-	"\apeer_id\x18\x02 \x01(\tR\x06peerId\"\x0f\n" +
+	"\apeer_id\x18\x02 \x01(\tR\x06peerId\x12%\n" +
+	"\x0etimestamp_unix\x18\x03 \x01(\x03R\rtimestampUnix\x12\x1c\n" +
+	"\tsignature\x18\x04 \x01(\fR\tsignature\"\x0f\n" +
 	"\rLeaveResponse*S\n" +
 	"\tEventType\x12\b\n" +
 	"\x04JOIN\x10\x00\x12\t\n" +

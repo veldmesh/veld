@@ -823,3 +823,19 @@ func TestOnMDNSPeer(t *testing.T) {
 		t.Error("LAN host took over a known peer's name")
 	}
 }
+
+func TestAdvertisedEndpoint(t *testing.T) {
+	for in, want := range map[string]string{
+		"0.0.0.0:51820":       "",
+		"[::]:51820":          "",
+		"192.0.2.7:0":         "",
+		"":                    "",
+		":51820":              "",
+		"192.0.2.7:51820":     "192.0.2.7:51820",
+		"[2001:db8::1]:51820": "[2001:db8::1]:51820",
+	} {
+		if got := advertisedEndpoint(in); got != want {
+			t.Errorf("advertisedEndpoint(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

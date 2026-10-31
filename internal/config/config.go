@@ -53,7 +53,7 @@ type CoordConfig struct {
 	Addr        string `toml:"addr"` // e.g. "coord.example.com:50051"
 	NetworkID   string `toml:"network_id"`
 	Token       string `toml:"token"`
-	TLSInsecure bool   `toml:"tls_insecure"`
+	TLSInsecure bool   `toml:"tls_insecure"` // no TLS at all: plaintext, testing only
 	STUNServer  string `toml:"stun_server"`  // e.g. "stun.l.google.com:19302"; empty = skip STUN
 	RelayAddr   string `toml:"relay_addr"`   // e.g. "relay.example.com:7878"; empty = no relay fallback
 	RelayX25519 string `toml:"relay_x25519"` // base64 32-byte pinned relay static key; required if relay_addr set

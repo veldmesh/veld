@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -270,6 +271,13 @@ func (r *Registry) RegisterPeer(p peerRecord, networkID string, maxMachines int)
 	err := r.db.Update(func(tx *bolt.Tx) error {
 		pb := tx.Bucket(bucketPeers)
 
+		// Names resolve over DNS, so one name (ignoring case) belongs to one
+		// peer per network. A peer registering with a name another peer
+		// holds is stored without one.
+		if p.Name != "" && nameTaken(pb, networkID, p.ID, p.Name) {
+			p.Name = ""
+		}
+
 		// The peer ID is globally unique. If it already exists, only a
 		// same-network re-registration presenting the same X25519 key is
 		// accepted; anything else is rejected without touching the stored
@@ -322,14 +330,21 @@ func (r *Registry) RegisterPeer(p peerRecord, networkID string, maxMachines int)
 		if err != nil {
 			return fmt.Errorf("parse next_ip: %w", err)
 		}
-		assigned = ip
 
+		// Hand out never-used addresses first, then reuse addresses freed
+		// by peers that left. The last address in the CIDR (broadcast) is
+		// never assigned.
 		cidr, _ := netip.ParsePrefix(netRec.CIDR)
-		next := ip.Next()
-		if !cidr.Contains(next) {
-			return fmt.Errorf("network %q address space exhausted", networkID)
+		if next := ip.Next(); cidr.Contains(next) {
+			assigned = ip
+			netRec.NextIP = next.String()
+		} else {
+			free, ok := freeAddr(pb, networkID, cidr)
+			if !ok {
+				return fmt.Errorf("network %q address space exhausted", networkID)
+			}
+			assigned = free
 		}
-		netRec.NextIP = next.String()
 		netRec.MachineCount++
 
 		updatedNet, err := json.Marshal(netRec)
@@ -419,6 +434,42 @@ func (r *Registry) UpdateEndpoint(peerID, endpoint string) error {
 	}
 	r.setEndpoint(peerID, endpoint)
 	return nil
+}
+
+// nameTaken reports whether a peer of networkID other than peerID holds name,
+// ignoring case.
+func nameTaken(pb *bolt.Bucket, networkID, peerID, name string) bool {
+	taken := false
+	_ = pb.ForEach(func(_, v []byte) error {
+		var rec peerRecord
+		if json.Unmarshal(v, &rec) == nil && rec.NetworkID == networkID &&
+			rec.ID != peerID && strings.EqualFold(rec.Name, name) {
+			taken = true
+		}
+		return nil
+	})
+	return taken
+}
+
+// freeAddr returns the lowest assignable address in cidr that no peer of
+// networkID holds.
+func freeAddr(pb *bolt.Bucket, networkID string, cidr netip.Prefix) (netip.Addr, bool) {
+	used := make(map[netip.Addr]bool)
+	_ = pb.ForEach(func(_, v []byte) error {
+		var rec peerRecord
+		if json.Unmarshal(v, &rec) == nil && rec.NetworkID == networkID {
+			if a, err := netip.ParseAddr(rec.VPNAddr); err == nil {
+				used[a] = true
+			}
+		}
+		return nil
+	})
+	for a := nextIPAfterNetwork(cidr.Masked()); cidr.Contains(a.Next()); a = a.Next() {
+		if !used[a] {
+			return a, true
+		}
+	}
+	return netip.Addr{}, false
 }
 
 // RemovePeer deletes a peer and decrements the network machine count.

@@ -46,6 +46,9 @@ type Server struct {
 	// stream count). The TTL sweep never removes a connected peer.
 	connectedMu sync.Mutex
 	connected   map[string]int
+
+	// seen rejects replays of Register and call signatures.
+	seen *seenSignatures
 }
 
 // New wires all components together. The registry must already be opened.
@@ -67,7 +70,46 @@ func New(
 		subnet:    subnet,
 		hooks:     hooks,
 		connected: make(map[string]int),
+		seen:      newSeenSignatures(crypto.CallTimestampWindow * time.Second),
 	}
+}
+
+// validPeerName reports whether name is empty or a DNS label.
+func validPeerName(name string) bool {
+	if name == "" {
+		return true
+	}
+	if len(name) > 63 || name[0] == '-' || name[len(name)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// errCallAuth is returned for every failed call signature check.
+const errCallAuth = "call signature verification failed"
+
+// verifyCall checks that sig is a fresh, unused call signature over claims by
+// rec's Ed25519 key.
+func (s *Server) verifyCall(rec peerRecord, sig []byte, claims crypto.CallClaims) error {
+	pub, err := base64.StdEncoding.DecodeString(rec.Ed25519Public)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return status.Error(codes.Unauthenticated, errCallAuth)
+	}
+	now := time.Now()
+	if err := crypto.VerifyCallSignature(ed25519.PublicKey(pub), sig, claims, now.Unix()); err != nil {
+		log.Printf("%s verification failed: %v (check system clock if timestamp error)", claims.Method, err)
+		return status.Error(codes.Unauthenticated, errCallAuth)
+	}
+	if !s.seen.firstUse(sig, now) {
+		return status.Error(codes.Unauthenticated, errCallAuth)
+	}
+	return nil
 }
 
 // errNetworkNotFound and errPeerNotFound are the errors every per-account
@@ -235,6 +277,21 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 		log.Printf("Register verification failed: %v (check system clock if timestamp error)", err)
 		return nil, status.Error(codes.Unauthenticated, errRegisterAuth)
 	}
+	if !s.seen.firstUse(req.Signature, time.Now()) {
+		return nil, status.Error(codes.Unauthenticated, errRegisterAuth)
+	}
+
+	// Peers resolve each other by name over DNS and dial the endpoint, so
+	// both must be well formed.
+	if !validPeerName(req.Name) {
+		return nil, status.Errorf(codes.InvalidArgument, "name must be a DNS label: 1-63 letters, digits or hyphens, not starting or ending with a hyphen")
+	}
+	if req.Endpoint != "" {
+		ep, err := netip.ParseAddrPort(req.Endpoint)
+		if err != nil || ep.Port() == 0 || ep.Addr().IsUnspecified() || ep.Addr().IsMulticast() {
+			return nil, status.Errorf(codes.InvalidArgument, "endpoint must be ip:port")
+		}
+	}
 
 	// Validate and policy-check each advertised subnet route.
 	var parsedRoutes []netip.Prefix
@@ -360,8 +417,15 @@ func (s *Server) Watch(req *coordv1.WatchRequest, stream coordv1.Coord_WatchServ
 		return err
 	}
 	if req.PeerId != "" {
-		// A Watch may only name a peer registered in the requested network.
-		if _, err := s.authorizePeer(req.PeerId, req.NetworkId, acc.ID); err != nil {
+		// A Watch may only name a peer registered in the requested network,
+		// and only that peer may: it receives the peer's signals and keeps
+		// it marked online.
+		rec, err := s.authorizePeer(req.PeerId, req.NetworkId, acc.ID)
+		if err != nil {
+			return err
+		}
+		claims := crypto.WatchClaims(req.PeerId, req.NetworkId, req.TimestampUnix)
+		if err := s.verifyCall(rec, req.Signature, claims); err != nil {
 			return err
 		}
 	}
@@ -465,6 +529,10 @@ func (s *Server) SendSignal(ctx context.Context, req *coordv1.SendSignalRequest)
 	if err != nil {
 		return nil, err
 	}
+	claims := crypto.SendSignalClaims(req.FromPeerId, req.ToPeerId, req.Payload, req.TimestampUnix)
+	if err := s.verifyCall(from, req.Signature, claims); err != nil {
+		return nil, err
+	}
 	to, err := s.authorizePeer(req.ToPeerId, "", acc.ID)
 	if err != nil {
 		return nil, err
@@ -486,7 +554,13 @@ func (s *Server) Leave(ctx context.Context, req *coordv1.LeaveRequest) (*coordv1
 		return nil, status.Errorf(codes.Unauthenticated, "invalid token")
 	}
 
-	if _, err := s.authorizePeer(req.PeerId, "", acc.ID); err != nil {
+	rec, err := s.authorizePeer(req.PeerId, "", acc.ID)
+	if err != nil {
+		return nil, err
+	}
+	// Only the peer itself may leave: the token is shared by every peer of
+	// the account and peer IDs are public.
+	if err := s.verifyCall(rec, req.Signature, crypto.LeaveClaims(req.PeerId, req.TimestampUnix)); err != nil {
 		return nil, err
 	}
 
