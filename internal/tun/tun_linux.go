@@ -76,17 +76,17 @@ func createDevice(name string, mtu int) (wgtun.Device, error) {
 	}
 	ifr, err := unix.NewIfreq(name)
 	if err != nil {
-		unix.Close(nfd)
+		_ = unix.Close(nfd)
 		return nil, err
 	}
 	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI)
 	if err := unix.IoctlIfreq(nfd, unix.TUNSETIFF, ifr); err != nil {
-		unix.Close(nfd)
+		_ = unix.Close(nfd)
 		return nil, err
 	}
 	// Must happen before the fd is handed to the netpoller.
 	if err := unix.SetNonblock(nfd, true); err != nil {
-		unix.Close(nfd)
+		_ = unix.Close(nfd)
 		return nil, err
 	}
 	return wgtun.CreateTUNFromFile(os.NewFile(uintptr(nfd), "/dev/net/tun"), mtu)

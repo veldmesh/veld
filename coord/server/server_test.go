@@ -186,11 +186,6 @@ func signSendSignal(t *testing.T, id *crypto.Identity, req *coordv1.SendSignalRe
 	return req
 }
 
-// peerIDOf returns the peer ID (hex Ed25519 public key) of id.
-func peerIDOf(id *crypto.Identity) string {
-	return hex.EncodeToString(id.Ed25519Public)
-}
-
 func TestServer_Register_OK(t *testing.T) {
 	srv, reg := testServer(t)
 	defer reg.Close()
