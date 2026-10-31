@@ -25,6 +25,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -44,6 +45,11 @@ const (
 	signalResendWindow   = probeTimeout // bound signal retransmission
 	probeFlag            = uint32(0)    // outgoing probe
 	replyFlag            = uint32(1)    // probe reply
+
+	// maxCandidates caps the candidates taken from a peer's signal. Each
+	// one is probed for probeTimeout, so an uncapped list would let a peer
+	// direct a flood of probes at a third party.
+	maxCandidates = 16
 
 	// pendingMax caps how many distinct senders may have a sealed signal
 	// envelope held at once (before the sender's session exists). Peer IDs
@@ -79,6 +85,10 @@ type Manager struct {
 
 	mu       sync.Mutex
 	sessions map[[32]byte]*natSession
+	// answers maps a peer's probe nonce to the reply tag for it. Entries
+	// outlive the session: once one side has found the path it stops
+	// negotiating, while the other may still be probing. Guarded by mu.
+	answers map[[8]byte]probeAnswer
 	// pending holds sealed signal envelopes that arrived before the session
 	// for that peer was created. Keyed by sender peer ID; each is
 	// authenticated against the peer table when Start is called. Bounded:
@@ -96,6 +106,11 @@ type natSession struct {
 	probeNonce [8]byte             // random nonce identifies our probes
 	signalIn   chan []byte         // receives decrypted peer signal payloads
 	result     chan netip.AddrPort // receives the winning endpoint
+
+	// Set under Manager.mu once the peer's signal has arrived.
+	havePeer  bool
+	peerNonce [8]byte                 // the peer's probe nonce
+	remotes   map[netip.AddrPort]bool // candidates we probe
 
 	cancel context.CancelFunc
 }
@@ -120,6 +135,7 @@ func New(conn net.PacketConn, localPort uint16, stunServer string, identity *cry
 		identity:   identity,
 		peerTbl:    peerTbl,
 		sessions:   make(map[[32]byte]*natSession),
+		answers:    make(map[[8]byte]probeAnswer),
 		pending:    make(map[[32]byte][]byte),
 	}
 }
@@ -252,20 +268,36 @@ func (m *Manager) HandleProbe(pkt []byte, addr net.Addr) {
 	copy(nonce[:], pkt[8:16])
 
 	if flags == probeFlag {
-		// Incoming probe — reply immediately with the same nonce.
-		reply := buildProbe(replyFlag, nonce)
-		m.conn.WriteTo(reply, addr) //nolint:errcheck
+		// Incoming probe: answer only a probe from a peer we are
+		// negotiating with, identified by the nonce it sent us in its
+		// encrypted signal. The reply proves we know our own nonce too,
+		// which never appears in this peer's probes.
+		var reply []byte
+		now := time.Now()
+		m.mu.Lock()
+		if a, ok := m.answers[nonce]; ok {
+			if now.Before(a.expires) {
+				reply = buildProbe(replyFlag, a.tag)
+			} else {
+				delete(m.answers, nonce)
+			}
+		}
+		m.mu.Unlock()
+		if reply != nil {
+			m.conn.WriteTo(reply, addr) //nolint:errcheck
+		}
 		return
 	}
 
-	// Reply to one of our probes — find the matching session.
+	// Reply to one of our probes: it must come from a candidate we probed
+	// and carry the tag only the peer can compute.
 	ep, ok := addrToAddrPort(addr)
 	if !ok {
 		return
 	}
 	m.mu.Lock()
 	for _, sess := range m.sessions {
-		if sess.probeNonce == nonce {
+		if sess.havePeer && sess.remotes[ep] && replyTag(sess.probeNonce, sess.peerNonce) == nonce {
 			select {
 			case sess.result <- ep:
 			default:
@@ -274,6 +306,57 @@ func (m *Manager) HandleProbe(pkt []byte, addr net.Addr) {
 		}
 	}
 	m.mu.Unlock()
+}
+
+// probeAnswer is the reply to send to probes carrying one peer nonce.
+type probeAnswer struct {
+	tag     [8]byte
+	expires time.Time
+}
+
+// answerTTL bounds how long probes for a nonce are answered: the peer probes
+// for at most probeTimeout after receiving our signal, which we retransmit
+// for signalResendWindow.
+const answerTTL = probeTimeout + signalResendWindow
+
+// replyTag is the value a probe reply carries: a hash of the probed side's
+// nonce and the replying side's nonce. Each side learns the other's nonce
+// only from its encrypted signal, so someone who sees a cleartext probe
+// cannot forge a reply to it.
+func replyTag(probed, responder [8]byte) [8]byte {
+	h := sha256.New()
+	h.Write([]byte("veld-nat-reply-v1\x00"))
+	h.Write(probed[:])
+	h.Write(responder[:])
+	var tag [8]byte
+	copy(tag[:], h.Sum(nil))
+	return tag
+}
+
+// usableCandidates parses a peer's candidate list, dropping malformed,
+// duplicate and unroutable entries (port 0, unspecified, multicast or
+// broadcast addresses), and keeps at most maxCandidates.
+func usableCandidates(list []string) []netip.AddrPort {
+	seen := make(map[netip.AddrPort]bool)
+	var out []netip.AddrPort
+	for _, s := range list {
+		ep, err := netip.ParseAddrPort(s)
+		if err != nil {
+			continue
+		}
+		ep = netip.AddrPortFrom(ep.Addr().Unmap(), ep.Port())
+		a := ep.Addr()
+		if ep.Port() == 0 || a.IsUnspecified() || a.IsMulticast() ||
+			a == netip.AddrFrom4([4]byte{255, 255, 255, 255}) || seen[ep] {
+			continue
+		}
+		seen[ep] = true
+		out = append(out, ep)
+		if len(out) == maxCandidates {
+			break
+		}
+	}
+	return out
 }
 
 // negotiate runs one NAT negotiation session.
@@ -338,15 +421,25 @@ func (m *Manager) negotiate(sessCtx, parentCtx context.Context, sess *natSession
 	var peerNonce [8]byte
 	copy(peerNonce[:], peerNonceBytes)
 
-	var remotes []netip.AddrPort
-	for _, s := range peerMsg.Candidates {
-		if ep, err := netip.ParseAddrPort(s); err == nil {
-			remotes = append(remotes, ep)
-		}
-	}
+	remotes := usableCandidates(peerMsg.Candidates)
 	if len(remotes) == 0 {
 		return
 	}
+	now := time.Now()
+	m.mu.Lock()
+	sess.peerNonce = peerNonce
+	sess.remotes = make(map[netip.AddrPort]bool, len(remotes))
+	for _, ep := range remotes {
+		sess.remotes[ep] = true
+	}
+	sess.havePeer = true
+	for n, a := range m.answers {
+		if !now.Before(a.expires) {
+			delete(m.answers, n)
+		}
+	}
+	m.answers[peerNonce] = probeAnswer{tag: replyTag(peerNonce, sess.probeNonce), expires: now.Add(answerTTL)}
+	m.mu.Unlock()
 
 	// Probe all remote candidates simultaneously.
 	// We also need to reply to the peer's probes (done by HandleProbe).
