@@ -203,6 +203,12 @@ func (m *Manager) handleInit(noiseMsg []byte, addr net.Addr) {
 	if err != nil {
 		return
 	}
+	// The initiator names the network it is joining. A key that is a member
+	// of several networks must not be able to carry a session from one into
+	// another.
+	if result.NetworkID != m.networkID {
+		return
+	}
 
 	var peerID [32]byte
 	copy(peerID[:], result.PeerEd25519Public)

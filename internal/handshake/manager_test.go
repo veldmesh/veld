@@ -714,3 +714,32 @@ func TestManager_SimultaneousInitiation(t *testing.T) {
 		t.Fatalf("A could not decrypt B's reply: %q", plain)
 	}
 }
+
+func TestManager_HandleInit_WrongNetworkDropped(t *testing.T) {
+	idA, _ := crypto.Generate()
+	idB, _ := crypto.Generate()
+
+	tblA := peer.New()
+	entryBinA := makeTestEntry(idB, "10.0.0.2", "2.2.2.2:2000")
+	tblA.Upsert(entryBinA)
+	tblB := peer.New()
+	tblB.Upsert(makeTestEntry(idA, "10.0.0.1", "1.1.1.1:1000"))
+
+	connA, connB := newTestConn(), newTestConn()
+	mgrA := New(idA, [16]byte{1}, tblA, connA)
+	mgrB := New(idB, [16]byte{2}, tblB, connB)
+
+	mgrA.Initiate(entryBinA)
+	var init testMsg
+	select {
+	case init = <-connA.out:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for init")
+	}
+	mgrB.HandlePacket(init.data, &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 1000})
+	select {
+	case <-connB.out:
+		t.Fatal("responder answered an Init for another network")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
