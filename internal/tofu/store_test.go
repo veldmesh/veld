@@ -328,3 +328,57 @@ func TestStore_Migration_MixedFormats(t *testing.T) {
 		t.Errorf("expected 1 pin after re-pin, got %d", len(pins))
 	}
 }
+// TestStore_MovedKeyKeepsOldAddress covers moving a peer and then pinning a
+// new key at its old address: the old address must stay reserved, also
+// across a reload.
+func TestStore_MovedKeyKeepsOldAddress(t *testing.T) {
+	s := tempStore(t)
+	real, evil := genKey(t), genKey(t)
+
+	if err := s.Check("10.0.0.2", real); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Check("10.0.0.99", real); err != nil {
+		t.Fatalf("move: %v", err)
+	}
+	if err := s.Check("10.0.0.2", evil); !errors.Is(err, ErrFingerprintMismatch) {
+		t.Errorf("new key at the moved-from address: got %v, want mismatch", err)
+	}
+
+	s2, err := New(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Check("10.0.0.2", evil); !errors.Is(err, ErrFingerprintMismatch) {
+		t.Errorf("after reload: got %v, want mismatch", err)
+	}
+	// The key may move back to its old address.
+	if err := s2.Check("10.0.0.2", real); err != nil {
+		t.Errorf("move back: %v", err)
+	}
+
+	// Forgetting by any of its addresses releases all of them.
+	if err := s2.ForgetByVPNAddr("10.0.0.99"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Check("10.0.0.2", evil); err != nil {
+		t.Errorf("after forget: %v", err)
+	}
+}
+
+func TestStore_KnownKeyCannotTakePinnedAddress(t *testing.T) {
+	s := tempStore(t)
+	a, b := genKey(t), genKey(t)
+	if err := s.Check("10.0.0.1", a); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Check("10.0.0.2", b); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Check("10.0.0.1", b); !errors.Is(err, ErrFingerprintMismatch) {
+		t.Errorf("b moving onto a's address: got %v, want mismatch", err)
+	}
+	if err := s.Check("10.0.0.1", a); err != nil {
+		t.Errorf("a at its own address: %v", err)
+	}
+}
