@@ -252,7 +252,8 @@ func TestDispatcher_UDPToTun(t *testing.T) {
 	defer d.Stop()
 
 	// Encrypt a packet with B's session (sessB) and send it via UDP
-	nonce, ct, err := sessB.Encrypt([]byte("hello from B"))
+	want := buildIPv4Packet([4]byte{10, 0, 0, 2}, [4]byte{10, 0, 0, 1}, []byte("hello from B"))
+	nonce, ct, err := sessB.Encrypt(want)
 	if err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
@@ -267,8 +268,114 @@ func TestDispatcher_UDPToTun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDelivered failed: %v", err)
 	}
-	if string(buf[:n]) != "hello from B" {
-		t.Errorf("decrypted payload mismatch: got %q, want %q", buf[:n], "hello from B")
+	if string(buf[:n]) != string(want) {
+		t.Errorf("decrypted payload mismatch: got %q, want %q", buf[:n], want)
+	}
+}
+
+// buildIPv6Packet builds a minimal IPv6 packet with the given source and dest IP.
+func buildIPv6Packet(src, dst netip.Addr, payload []byte) []byte {
+	pkt := make([]byte, 40+len(payload))
+	pkt[0] = 0x60 // version=6
+	pkt[4] = byte(len(payload) >> 8)
+	pkt[5] = byte(len(payload))
+	pkt[6] = 17 // next header: UDP
+	pkt[7] = 64 // hop limit
+	s16, d16 := src.As16(), dst.As16()
+	copy(pkt[8:24], s16[:])
+	copy(pkt[24:40], d16[:])
+	copy(pkt[40:], payload)
+	return pkt
+}
+
+// deliverFromPeer sends plain as an encrypted data packet from a peer with the
+// given VPN address and subnet routes, and returns what reached the TUN (nil if
+// the dispatcher dropped it).
+func deliverFromPeer(t *testing.T, vpnAddr string, routes []netip.Prefix, plain []byte) []byte {
+	t.Helper()
+	sessA, sessB := newTestSessionPair(t)
+
+	peerTbl := peer.New()
+	var peerBID [32]byte
+	peerBID[0] = 0x02
+	entryB := &peer.Entry{ID: peerBID, VPNAddr: mustAddr(vpnAddr), SubnetRoutes: routes}
+	entryB.SetEndpoint(mustAddrPort("1.2.3.4:5000"))
+	entryB.SetSession(sessA)
+	peerTbl.Upsert(entryB)
+
+	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
+	conn := newFakeConn()
+	d := New(tunDev, conn, peerTbl)
+	d.Start()
+	defer d.Stop()
+
+	nonce, ct, err := sessB.Encrypt(plain)
+	if err != nil {
+		t.Fatalf("encrypt failed: %v", err)
+	}
+	conn.in <- udpMsg{data: buildDataPacket(nonce, ct), addr: &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5000}}
+
+	got := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 1500)
+		if n, err := tunDev.ReadDelivered(buf); err == nil {
+			got <- buf[:n]
+		}
+	}()
+	select {
+	case pkt := <-got:
+		return pkt
+	case <-time.After(200 * time.Millisecond):
+		return nil
+	}
+}
+
+// TestDispatcher_InboundSourceCheck verifies that a peer can only deliver
+// packets whose source is its own VPN address or inside its subnet routes.
+func TestDispatcher_InboundSourceCheck(t *testing.T) {
+	lan := []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")}
+	me := [4]byte{10, 0, 0, 1}
+	cases := []struct {
+		name    string
+		vpnAddr string
+		routes  []netip.Prefix
+		pkt     []byte
+		deliver bool
+	}{
+		{"own VPN address", "10.0.0.2", nil, buildIPv4Packet([4]byte{10, 0, 0, 2}, me, []byte("x")), true},
+		{"another peer's address", "10.0.0.2", nil, buildIPv4Packet([4]byte{10, 0, 0, 3}, me, []byte("x")), false},
+		{"my own address", "10.0.0.2", nil, buildIPv4Packet(me, me, []byte("x")), false},
+		{"inside advertised route", "10.0.0.2", lan, buildIPv4Packet([4]byte{192, 168, 1, 20}, me, []byte("x")), true},
+		{"outside advertised route", "10.0.0.2", lan, buildIPv4Packet([4]byte{192, 168, 2, 20}, me, []byte("x")), false},
+		{"IPv6 own address", "fd00::2", nil, buildIPv6Packet(mustAddr("fd00::2"), mustAddr("fd00::1"), []byte("x")), true},
+		{"IPv6 forged address", "fd00::2", nil, buildIPv6Packet(mustAddr("fd00::3"), mustAddr("fd00::1"), []byte("x")), false},
+		{"not an IP packet", "10.0.0.2", nil, []byte("hello"), false},
+		{"truncated IPv4 header", "10.0.0.2", nil, []byte{0x45, 0, 0, 20}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deliverFromPeer(t, tc.vpnAddr, tc.routes, tc.pkt)
+			if tc.deliver && string(got) != string(tc.pkt) {
+				t.Errorf("expected delivery, got %x", got)
+			}
+			if !tc.deliver && got != nil {
+				t.Errorf("expected drop, got %x delivered", got)
+			}
+		})
+	}
+}
+
+func TestExtractSrcIP(t *testing.T) {
+	addr, ok := extractSrcIP(buildIPv4Packet([4]byte{1, 2, 3, 4}, [4]byte{10, 0, 0, 5}, nil))
+	if !ok || addr != netip.AddrFrom4([4]byte{1, 2, 3, 4}) {
+		t.Errorf("IPv4: got %v %v, want 1.2.3.4", addr, ok)
+	}
+	addr, ok = extractSrcIP(buildIPv6Packet(mustAddr("fd00::7"), mustAddr("fd00::1"), nil))
+	if !ok || addr != mustAddr("fd00::7") {
+		t.Errorf("IPv6: got %v %v, want fd00::7", addr, ok)
+	}
+	if _, ok := extractSrcIP(make([]byte, 39)); ok {
+		t.Error("short packet should return false")
 	}
 }
 

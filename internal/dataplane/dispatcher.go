@@ -269,6 +269,11 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 		if plain == nil {
 			return
 		}
+		if !sourceAllowed(entry, plain) {
+			// Authenticated as this peer but claims another source address:
+			// drop it, so no peer can speak for another inside the tunnel.
+			return
+		}
 
 		entry.Touch()
 		d.tunMu.RLock()
@@ -356,6 +361,47 @@ func extractDestIP(pkt []byte) (netip.Addr, bool) {
 		return netip.AddrFrom16([16]byte(pkt[24:40])), true
 	}
 	return netip.Addr{}, false
+}
+
+// extractSrcIP reads the source IP from a raw IPv4 or IPv6 packet.
+func extractSrcIP(pkt []byte) (netip.Addr, bool) {
+	if len(pkt) < 1 {
+		return netip.Addr{}, false
+	}
+	switch pkt[0] >> 4 {
+	case 4:
+		if len(pkt) < 20 {
+			return netip.Addr{}, false
+		}
+		return netip.AddrFrom4([4]byte(pkt[12:16])), true
+	case 6:
+		if len(pkt) < 40 {
+			return netip.Addr{}, false
+		}
+		return netip.AddrFrom16([16]byte(pkt[8:24])), true
+	}
+	return netip.Addr{}, false
+}
+
+// sourceAllowed reports whether a decrypted packet from entry carries a source
+// address that peer owns: its VPN address or an address inside one of the
+// subnet routes it advertises. Anything else (another peer's address, an
+// unparsable packet) is dropped.
+func sourceAllowed(entry *peer.Entry, pkt []byte) bool {
+	src, ok := extractSrcIP(pkt)
+	if !ok {
+		return false
+	}
+	src = src.Unmap()
+	if src == entry.VPNAddr {
+		return true
+	}
+	for _, p := range entry.SubnetRoutes {
+		if p.Contains(src) {
+			return true
+		}
+	}
+	return false
 }
 
 // addrToAddrPort converts a net.Addr to netip.AddrPort.
