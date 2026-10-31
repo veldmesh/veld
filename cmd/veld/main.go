@@ -603,7 +603,10 @@ func writeConfig(path string, cfg *config.Config) (err error) {
 		return err
 	}
 
-	f, err := os.Create(path)
+	// The config holds the coordinator token. New files are owner-only; an
+	// existing file keeps its owner and group (a daemon user may read it
+	// through its group) but never stays readable by everyone.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
@@ -612,6 +615,15 @@ func writeConfig(path string, cfg *config.Config) (err error) {
 			err = cerr
 		}
 	}()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if perm := fi.Mode().Perm(); perm&0o007 != 0 {
+		if err := f.Chmod(perm &^ 0o007); err != nil {
+			return err
+		}
+	}
 
 	return toml.NewEncoder(f).Encode(cfg)
 }
