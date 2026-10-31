@@ -101,6 +101,9 @@ func parseSTUNResponse(data []byte, txID [12]byte) (netip.AddrPort, error) {
 		}
 		// Align to 4-byte boundary
 		padded := (attrLen + 3) &^ 3
+		if 4+padded > len(attrs) {
+			break
+		}
 		attrs = attrs[4+padded:]
 	}
 
