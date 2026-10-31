@@ -205,10 +205,7 @@ func TestBinary_Coord_StartStop(t *testing.T) {
 	}
 
 	// Leave peer A — list shrinks to 1
-	if _, err := client.Leave(ctx, &coordv1.LeaveRequest{
-		Token:  "testtoken",
-		PeerId: regA.PeerId,
-	}); err != nil {
+	if _, err := client.Leave(ctx, signedLeaveReq(idA, "testtoken", regA.PeerId)); err != nil {
 		t.Fatalf("Leave peer-a: %v", err)
 	}
 
@@ -345,9 +342,11 @@ func TestBinary_FullStack(t *testing.T) {
 	sockPath := filepath.Join(dir, "daemon.sock")
 	idPath := filepath.Join(dir, "identity.json")
 
+	// The daemon advertises listen_addr to the coordinator as its endpoint,
+	// and the coordinator rejects an endpoint with port 0, so use a real port.
 	cfgContent := fmt.Sprintf(`[node]
 identity_path = %q
-listen_addr   = "127.0.0.1:0"
+listen_addr   = "127.0.0.1:%d"
 
 [coord]
 addr         = %q
@@ -357,7 +356,7 @@ tls_insecure = true
 
 [daemon]
 socket_path = %q
-`, idPath, coordAddr, binaryNetworkID, sockPath)
+`, idPath, pickFreePort(t), coordAddr, binaryNetworkID, sockPath)
 
 	cfgPath := filepath.Join(dir, "daemon.toml")
 	if err := os.WriteFile(cfgPath, []byte(cfgContent), 0600); err != nil {
@@ -438,7 +437,8 @@ socket_path = %q
 	defer cancel()
 
 	var peers *coordv1.ListPeersResponse
-	for time.Now().Before(time.Now().Add(5 * time.Second)) {
+	peersDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(peersDeadline) {
 		peers, err = coordv1.NewCoordClient(conn).ListPeers(ctx, &coordv1.ListPeersRequest{
 			NetworkId: binaryNetworkID,
 			Token:     "binarytoken",

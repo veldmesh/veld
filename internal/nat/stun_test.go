@@ -218,3 +218,18 @@ func TestParseSTUNResponse_NoAttribute(t *testing.T) {
 		t.Errorf("expected 'no mapped address' in error, got %v", err)
 	}
 }
+
+// TestParseSTUNResponse_UnpaddedAttr checks that an attribute whose padding
+// runs past the end of the message is rejected rather than panicking.
+func TestParseSTUNResponse_UnpaddedAttr(t *testing.T) {
+	var txID [12]byte
+	copy(txID[:], []byte("txid12345678"))
+
+	pkt := buildSTUNResponse(txID, 0x8022, []byte{'x'}) // SOFTWARE, length 1
+	pkt = pkt[:20+5]
+	binary.BigEndian.PutUint16(pkt[2:4], 5)
+
+	if _, err := parseSTUNResponse(pkt, txID); err == nil {
+		t.Error("expected an error for a response without a mapped address")
+	}
+}

@@ -55,17 +55,17 @@ make docker
 docker run -p 50051:50051 -v veld-coord-data:/data veld-coord:latest
 ```
 
-> **Note on TLS:** `veld-coord` itself does not terminate TLS — it serves plaintext gRPC. The daemon connects with TLS by default and verifies the certificate against the host CA store. For a plaintext server you must either terminate TLS in front of it (e.g., a reverse proxy such as nginx, Caddy, or HAProxy) or, for testing only, set `tls_insecure = true` in the daemon's `[coord]` config section.
+> **Note on TLS:** the daemon connects with TLS by default and verifies the certificate against the host CA store. Give `veld-coord` a certificate with `-tls-cert cert.pem -tls-key key.pem`, or terminate TLS in front of it (e.g., a reverse proxy such as nginx, Caddy, or HAProxy). Without either it serves plaintext gRPC, and the daemon only connects to it with `tls_insecure = true` in its `[coord]` section — which sends the join token and all peer data in the clear, so keep that to a local test network.
 
 Or without Docker:
 ```sh
 ./veld-coord --listen :50051 --db ./peers.db
 ```
 
-> **Same TLS note applies:** the binary also serves plaintext gRPC — use a TLS-terminating proxy or set `tls_insecure = true` in the daemon config.
+> **Same TLS note applies:** pass `-tls-cert` and `-tls-key`, or put a TLS-terminating proxy in front.
 
 # On each machine
-veld login --server your-server:50051 --token <token>
+veld login --server your-server:50051 --token -   # paste the token, then Enter
 veld up
 
 ---

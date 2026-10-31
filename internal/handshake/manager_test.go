@@ -650,3 +650,96 @@ func TestManager_PendingSessionPromotion(t *testing.T) {
 		t.Error("promoted session should be the same as pending session")
 	}
 }
+// TestManager_SimultaneousInitiation covers both sides initiating at once (as
+// happens at startup): each ends up with its own initiator session active,
+// and the session it responded to must stay available so the two converge.
+func TestManager_SimultaneousInitiation(t *testing.T) {
+	idA, _ := crypto.Generate()
+	idB, _ := crypto.Generate()
+	var netID [16]byte
+
+	tblA := peer.New()
+	entryBinA := makeTestEntry(idB, "10.0.0.2", "2.2.2.2:2000")
+	tblA.Upsert(entryBinA)
+	tblB := peer.New()
+	entryAinB := makeTestEntry(idA, "10.0.0.1", "1.1.1.1:1000")
+	tblB.Upsert(entryAinB)
+
+	connA, connB := newTestConn(), newTestConn()
+	mgrA := New(idA, netID, tblA, connA)
+	mgrB := New(idB, netID, tblB, connB)
+	addrA := &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 1000}
+	addrB := &net.UDPAddr{IP: net.ParseIP("2.2.2.2"), Port: 2000}
+
+	recv := func(c *testConn) []byte {
+		t.Helper()
+		select {
+		case m := <-c.out:
+			return m.data
+		case <-time.After(time.Second):
+			t.Fatal("timeout waiting for packet")
+			return nil
+		}
+	}
+
+	mgrA.Initiate(entryBinA)
+	mgrB.Initiate(entryAinB)
+	initA, initB := recv(connA), recv(connB)
+
+	mgrB.HandlePacket(initA, addrA)
+	mgrA.HandlePacket(initB, addrB)
+	respB, respA := recv(connB), recv(connA)
+
+	mgrA.HandlePacket(respB, addrB)
+	mgrB.HandlePacket(respA, addrA)
+
+	// A sends with its active session; B only has it as pending.
+	n, ct, err := entryBinA.GetSession().Encrypt([]byte("a->b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain, _ := entryAinB.GetSession().Decrypt(n, ct); plain != nil {
+		t.Fatal("expected B's active session to differ from A's")
+	}
+	if plain, ok := mgrB.HandleDataPacket(entryAinB, n, ct); !ok || string(plain) != "a->b" {
+		t.Fatalf("B could not decrypt A's packet: %q", plain)
+	}
+
+	// B has promoted A's session, so B's reply decrypts at A.
+	n, ct, err = entryAinB.GetSession().Encrypt([]byte("b->a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain, _ := entryBinA.GetSession().Decrypt(n, ct); string(plain) != "b->a" {
+		t.Fatalf("A could not decrypt B's reply: %q", plain)
+	}
+}
+
+func TestManager_HandleInit_WrongNetworkDropped(t *testing.T) {
+	idA, _ := crypto.Generate()
+	idB, _ := crypto.Generate()
+
+	tblA := peer.New()
+	entryBinA := makeTestEntry(idB, "10.0.0.2", "2.2.2.2:2000")
+	tblA.Upsert(entryBinA)
+	tblB := peer.New()
+	tblB.Upsert(makeTestEntry(idA, "10.0.0.1", "1.1.1.1:1000"))
+
+	connA, connB := newTestConn(), newTestConn()
+	mgrA := New(idA, [16]byte{1}, tblA, connA)
+	mgrB := New(idB, [16]byte{2}, tblB, connB)
+
+	mgrA.Initiate(entryBinA)
+	var init testMsg
+	select {
+	case init = <-connA.out:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for init")
+	}
+	mgrB.HandlePacket(init.data, &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 1000})
+	select {
+	case <-connB.out:
+		t.Fatal("responder answered an Init for another network")
+	case <-time.After(100 * time.Millisecond):
+	}
+}

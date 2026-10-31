@@ -33,8 +33,8 @@ type CoordClient interface {
 	// Register assigns a VPN IP to the calling daemon and validates its Ed25519 sig:
 	// only the holder of the private key matching ed25519_public can register or
 	// update the peer whose ID is that key. The request must carry a signature —
-	// an Ed25519 signature over "veld-coord-register-v1\0" followed by the
-	// length-prefixed network_id, ed25519_public, x25519_public, endpoint, the
+	// an Ed25519 signature over "veld-coord-register-v2\0" followed by the
+	// length-prefixed network_id, name, ed25519_public, x25519_public, endpoint, the
 	// sorted subnet_routes and the timestamp_unix (big-endian uint64) — with
 	// |now - timestamp_unix| <= 120 s. A missing, stale or invalid signature is
 	// rejected with Unauthenticated before any registry write, so a rejected
@@ -126,8 +126,8 @@ type CoordServer interface {
 	// Register assigns a VPN IP to the calling daemon and validates its Ed25519 sig:
 	// only the holder of the private key matching ed25519_public can register or
 	// update the peer whose ID is that key. The request must carry a signature —
-	// an Ed25519 signature over "veld-coord-register-v1\0" followed by the
-	// length-prefixed network_id, ed25519_public, x25519_public, endpoint, the
+	// an Ed25519 signature over "veld-coord-register-v2\0" followed by the
+	// length-prefixed network_id, name, ed25519_public, x25519_public, endpoint, the
 	// sorted subnet_routes and the timestamp_unix (big-endian uint64) — with
 	// |now - timestamp_unix| <= 120 s. A missing, stale or invalid signature is
 	// rejected with Unauthenticated before any registry write, so a rejected

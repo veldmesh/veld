@@ -763,3 +763,79 @@ func TestOnVPNAddrAssigned_Callback_SelfInterfaceVisible(t *testing.T) {
 		t.Errorf("selfInterface() = %q, want %q", got, "vel0")
 	}
 }
+
+// TestOnMDNSPeer covers what an unauthenticated mDNS record may change: it
+// can suggest an endpoint for a known peer with matching keys, but cannot
+// replace a known peer, take its address or name, or (in coord mode) add a
+// peer at all.
+func TestOnMDNSPeer(t *testing.T) {
+	id, _ := crypto.Generate()
+	var networkID [16]byte
+	peerTbl := peer.New()
+	d := New(id, networkID, nil, newFakeConn(), peerTbl)
+
+	realID, _ := crypto.Generate()
+	var rid [32]byte
+	copy(rid[:], realID.Ed25519Public)
+	known := &peer.Entry{ID: rid, X25519Pub: realID.X25519Public, VPNAddr: netip.MustParseAddr("10.0.0.5"), Name: "fileserver"}
+	peerTbl.Upsert(known)
+	lanEP := netip.MustParseAddrPort("192.168.1.10:51820")
+
+	// Same keys, other VPN address: only the endpoint hint is used.
+	d.onMDNSPeer(&peer.Entry{ID: rid, X25519Pub: realID.X25519Public, VPNAddr: netip.MustParseAddr("10.0.0.99")}, lanEP, false)
+	if e, _ := peerTbl.LookupByID(rid); e != known || e.VPNAddr != netip.MustParseAddr("10.0.0.5") {
+		t.Fatal("mDNS record replaced a known peer")
+	}
+	if known.GetEndpoint() != lanEP {
+		t.Errorf("endpoint hint not applied: %v", known.GetEndpoint())
+	}
+
+	// Same ID, different X25519 key: ignored.
+	evilEP := netip.MustParseAddrPort("192.168.1.66:51820")
+	d.onMDNSPeer(&peer.Entry{ID: rid, X25519Pub: [32]byte{1}, VPNAddr: known.VPNAddr}, evilEP, false)
+	if known.GetEndpoint() != lanEP {
+		t.Error("record with a different key changed the endpoint")
+	}
+
+	// A new key claiming the known peer's address and name.
+	attacker, _ := crypto.Generate()
+	var aid [32]byte
+	copy(aid[:], attacker.Ed25519Public)
+	fake := &peer.Entry{ID: aid, X25519Pub: attacker.X25519Public, VPNAddr: known.VPNAddr, Name: "FileServer"}
+	d.onMDNSPeer(fake, evilEP, false)
+	if e, _ := peerTbl.LookupByVPN(known.VPNAddr); e != known {
+		t.Error("LAN host took over a known peer's VPN address")
+	}
+
+	// In coord mode an unknown LAN peer is not added.
+	other := &peer.Entry{ID: aid, X25519Pub: attacker.X25519Public, VPNAddr: netip.MustParseAddr("10.0.0.7"), Name: "fileserver"}
+	d.onMDNSPeer(other, evilEP, true)
+	if _, ok := peerTbl.LookupByID(aid); ok {
+		t.Error("coord mode: unknown mDNS peer added to the table")
+	}
+
+	// In LAN-only mode it is added, but without the name another peer owns.
+	d.onMDNSPeer(other, evilEP, false)
+	if _, ok := peerTbl.LookupByID(aid); !ok {
+		t.Error("LAN mode: new mDNS peer not added")
+	}
+	if e, _ := peerTbl.LookupByName("fileserver"); e != known {
+		t.Error("LAN host took over a known peer's name")
+	}
+}
+
+func TestAdvertisedEndpoint(t *testing.T) {
+	for in, want := range map[string]string{
+		"0.0.0.0:51820":       "",
+		"[::]:51820":          "",
+		"192.0.2.7:0":         "",
+		"":                    "",
+		":51820":              "",
+		"192.0.2.7:51820":     "192.0.2.7:51820",
+		"[2001:db8::1]:51820": "[2001:db8::1]:51820",
+	} {
+		if got := advertisedEndpoint(in); got != want {
+			t.Errorf("advertisedEndpoint(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

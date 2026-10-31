@@ -32,18 +32,24 @@ func New() *Table {
 // Upsert inserts or replaces the peer entry identified by e.ID.
 // If a previous entry with the same ID exists its index slots are removed first.
 // The caller must not modify e after calling Upsert.
-func (t *Table) Upsert(e *Entry) {
+//
+// Index slots belong to one peer at a time. Upsert refuses an entry whose VPN
+// address belongs to a different peer (returning false), and does not take
+// over another peer's name or endpoint: the entry is stored but is not
+// reachable by that name, and its endpoint only becomes current once a
+// handshake from it succeeds (ClaimEndpoint).
+func (t *Table) Upsert(e *Entry) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	if e.VPNAddr.IsValid() {
+		if owner, ok := t.byVPN[e.VPNAddr]; ok && owner.ID != e.ID {
+			return false
+		}
+	}
+
 	if old, ok := t.byID[e.ID]; ok {
-		delete(t.byVPN, old.VPNAddr)
-		if ep := old.GetEndpoint(); ep.IsValid() {
-			delete(t.byEndpoint, ep)
-		}
-		if old.Name != "" {
-			delete(t.byName, strings.ToLower(old.Name))
-		}
+		t.unindex(old)
 	}
 
 	t.byID[e.ID] = e
@@ -51,16 +57,52 @@ func (t *Table) Upsert(e *Entry) {
 		t.byVPN[e.VPNAddr] = e
 	}
 	if ep := e.GetEndpoint(); ep.IsValid() {
-		t.byEndpoint[ep] = e
+		if owner, ok := t.byEndpoint[ep]; !ok || owner.ID == e.ID {
+			t.byEndpoint[ep] = e
+		}
 	}
 	if e.Name != "" {
-		t.byName[strings.ToLower(e.Name)] = e
+		key := strings.ToLower(e.Name)
+		if owner, ok := t.byName[key]; !ok || owner.ID == e.ID {
+			t.byName[key] = e
+		}
+	}
+	return true
+}
+
+// unindex removes e's VPN, endpoint and name slots, but only those that still
+// point at e. t.mu must be held.
+func (t *Table) unindex(e *Entry) {
+	if t.byVPN[e.VPNAddr] == e {
+		delete(t.byVPN, e.VPNAddr)
+	}
+	if ep := e.GetEndpoint(); ep.IsValid() && t.byEndpoint[ep] == e {
+		delete(t.byEndpoint, ep)
+	}
+	if e.Name != "" {
+		if key := strings.ToLower(e.Name); t.byName[key] == e {
+			delete(t.byName, key)
+		}
 	}
 }
 
-// UpdateEndpoint atomically re-indexes the peer's UDP endpoint.
-// Returns false if no peer with id exists.
+// UpdateEndpoint re-indexes the peer's UDP endpoint from an unauthenticated
+// hint (the coordinator, NAT traversal). It does not take an endpoint that
+// another peer holds. Returns false if no peer with id exists or ep is held
+// by another peer.
 func (t *Table) UpdateEndpoint(id [32]byte, ep netip.AddrPort) bool {
+	return t.setEndpoint(id, ep, false)
+}
+
+// ClaimEndpoint re-indexes the peer's UDP endpoint after a handshake from ep
+// authenticated as id. Packets from ep now belong to id even if another peer
+// held it before (a NAT mapping can be reused); that peer keeps no endpoint
+// until it is heard from again.
+func (t *Table) ClaimEndpoint(id [32]byte, ep netip.AddrPort) bool {
+	return t.setEndpoint(id, ep, true)
+}
+
+func (t *Table) setEndpoint(id [32]byte, ep netip.AddrPort, claim bool) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -68,8 +110,16 @@ func (t *Table) UpdateEndpoint(id [32]byte, ep netip.AddrPort) bool {
 	if !ok {
 		return false
 	}
+	if ep.IsValid() {
+		if owner, ok := t.byEndpoint[ep]; ok && owner != e {
+			if !claim {
+				return false
+			}
+			owner.SetEndpoint(netip.AddrPort{})
+		}
+	}
 
-	if old := e.GetEndpoint(); old.IsValid() {
+	if old := e.GetEndpoint(); old.IsValid() && t.byEndpoint[old] == e {
 		delete(t.byEndpoint, old)
 	}
 	e.SetEndpoint(ep)
@@ -122,13 +172,7 @@ func (t *Table) Remove(id [32]byte) {
 		return
 	}
 	delete(t.byID, id)
-	delete(t.byVPN, e.VPNAddr)
-	if ep := e.GetEndpoint(); ep.IsValid() {
-		delete(t.byEndpoint, ep)
-	}
-	if e.Name != "" {
-		delete(t.byName, strings.ToLower(e.Name))
-	}
+	t.unindex(e)
 }
 
 // Len returns the number of peers in the table.

@@ -5,11 +5,14 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"time"
 
 	"github.com/veldmesh/veld/internal/peer"
 )
@@ -47,7 +50,7 @@ func NewIPCServer(socketPath string, stopFn func()) *IPCServer {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/shutdown", s.handleShutdown)
-	s.srv = &http.Server{Handler: mux}
+	s.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	return s
 }
 
@@ -60,13 +63,27 @@ func (s *IPCServer) UpdateStatus(st StatusResponse) {
 
 // Start begins listening. Returns an error if the socket cannot be created.
 func (s *IPCServer) Start() error {
-	if err := os.MkdirAll(filepath.Dir(s.socketPath), 0700); err != nil {
+	dir := filepath.Dir(s.socketPath)
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
+	}
+	// The socket accepts shutdown requests and is trusted by `veld status`:
+	// in a directory others can write to, another user could replace it
+	// between the Remove and the Listen below.
+	if fi, err := os.Stat(dir); err == nil && runtime.GOOS != "windows" && fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("socket directory %s is writable by other users; use a private directory for socket_path", dir)
 	}
 	os.Remove(s.socketPath) // remove stale socket
 	ln, err := net.Listen("unix", s.socketPath)
 	if err != nil {
 		return err
+	}
+	// Owner and group only, whatever the umask.
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(s.socketPath, 0o660); err != nil {
+			_ = ln.Close()
+			return err
+		}
 	}
 	s.listener = ln
 	go s.srv.Serve(ln)

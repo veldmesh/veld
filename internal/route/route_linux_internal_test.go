@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -161,3 +162,56 @@ func TestCloseRemovesAllAddedRoutes(t *testing.T) {
 // errFakeKernel simulates a netlink failure (e.g. EPERM without
 // CAP_NET_ADMIN, or a route collision the kernel rejects).
 var errFakeKernel = errors.New("netlink: operation not permitted")
+
+// TestRemoveMatchesGateway checks that Remove deletes only veld's own route:
+// another route for the same prefix (a VPN that reconnected after veld) must
+// not be removed by a delete that matches on destination alone.
+func TestRemoveMatchesGateway(t *testing.T) {
+	h := &recordingHandle{}
+	m := newLinuxManager(h)
+	pfx := netip.MustParsePrefix("192.168.50.0/24")
+	via := netip.MustParseAddr("10.0.0.2")
+	if err := m.Add(pfx, via); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Remove(pfx); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.deleted) != 1 || !h.deleted[0].Gw.Equal(net.IP(via.AsSlice())) {
+		t.Fatalf("Remove: got %+v, want one delete via %s", h.deleted, via)
+	}
+
+	// A prefix veld never installed is left alone.
+	if err := m.Remove(netip.MustParsePrefix("192.168.51.0/24")); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.deleted) != 1 {
+		t.Errorf("Remove of an unknown prefix issued a delete")
+	}
+}
+
+func TestEnableIPForwardRestores(t *testing.T) {
+	path := t.TempDir() + "/ip_forward"
+	old := ipForwardPath
+	ipForwardPath = path
+	defer func() { ipForwardPath = old }()
+
+	for _, prev := range []string{"0\n", "1\n"} {
+		if err := os.WriteFile(path, []byte(prev), 0644); err != nil {
+			t.Fatal(err)
+		}
+		restore, err := EnableIPForward()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := os.ReadFile(path); string(b) != "1\n" {
+			t.Errorf("prev %q: forwarding not enabled: %q", prev, b)
+		}
+		if err := restore(); err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := os.ReadFile(path); string(b) != prev {
+			t.Errorf("restore: got %q, want %q", b, prev)
+		}
+	}
+}

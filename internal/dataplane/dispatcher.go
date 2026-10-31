@@ -269,17 +269,20 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 		if plain == nil {
 			return
 		}
+		if !d.sourceAllowed(entry, plain) {
+			// Authenticated as this peer but claims another source address:
+			// drop it, so no peer can speak for another inside the tunnel.
+			return
+		}
 
 		entry.Touch()
 		d.tunMu.RLock()
 		t := d.tun
 		d.tunMu.RUnlock()
 		if t != nil {
-			if _, err := t.Write(plain); err != nil {
-				// TODO: log err before stopping -- Dispatcher has no logger yet
-				d.Stop()
-				return
-			}
+			// A failed write drops this packet only: one packet the
+			// kernel rejects must not take the whole data plane down.
+			_, _ = t.Write(plain)
 		}
 
 	case TypeKeepalive:
@@ -308,7 +311,8 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 }
 
 // decryptDataPacket decrypts a data packet using the peer's active session,
-// falling back to the pending session (WireGuard-style handshake confirmation).
+// falling back to the pending session (WireGuard-style handshake confirmation)
+// and then the previous session.
 // If the pending session decrypts successfully, it is promoted to active and
 // OnSessionEstablished is called. Returns nil if decryption fails with both.
 func (d *Dispatcher) decryptDataPacket(entry *peer.Entry, sess *session.Session, nonce uint64, payload []byte) []byte {
@@ -335,6 +339,14 @@ func (d *Dispatcher) decryptDataPacket(entry *peer.Entry, sess *session.Session,
 		}
 	}
 
+	// Packets sent under the session we just replaced may still be in flight.
+	if prev := entry.GetPreviousSession(); prev != nil && prev != sess {
+		plain, err := prev.Decrypt(nonce, payload)
+		if err == nil && plain != nil {
+			return plain
+		}
+	}
+
 	return nil
 }
 
@@ -356,6 +368,58 @@ func extractDestIP(pkt []byte) (netip.Addr, bool) {
 		return netip.AddrFrom16([16]byte(pkt[24:40])), true
 	}
 	return netip.Addr{}, false
+}
+
+// extractSrcIP reads the source IP from a raw IPv4 or IPv6 packet.
+func extractSrcIP(pkt []byte) (netip.Addr, bool) {
+	if len(pkt) < 1 {
+		return netip.Addr{}, false
+	}
+	switch pkt[0] >> 4 {
+	case 4:
+		if len(pkt) < 20 {
+			return netip.Addr{}, false
+		}
+		return netip.AddrFrom4([4]byte(pkt[12:16])), true
+	case 6:
+		if len(pkt) < 40 {
+			return netip.Addr{}, false
+		}
+		return netip.AddrFrom16([16]byte(pkt[8:24])), true
+	}
+	return netip.Addr{}, false
+}
+
+// sourceAllowed reports whether a decrypted packet from entry carries a source
+// address that peer owns: its VPN address or an address inside one of the
+// subnet routes it advertises. Anything else (another peer's address, an
+// unparsable packet) is dropped. A subnet route never vouches for an address
+// in the mesh or for another peer's address, so advertising a broad route
+// does not let a peer speak for others.
+func (d *Dispatcher) sourceAllowed(entry *peer.Entry, pkt []byte) bool {
+	src, ok := extractSrcIP(pkt)
+	if !ok {
+		return false
+	}
+	src = src.Unmap()
+	if src == entry.VPNAddr {
+		return true
+	}
+	d.tunMu.RLock()
+	t := d.tun
+	d.tunMu.RUnlock()
+	if t != nil && t.Addr().Masked().Contains(src) {
+		return false
+	}
+	if owner, ok := d.peers.LookupByVPN(src); ok && owner != entry {
+		return false
+	}
+	for _, p := range entry.SubnetRoutes {
+		if p.Contains(src) {
+			return true
+		}
+	}
+	return false
 }
 
 // addrToAddrPort converts a net.Addr to netip.AddrPort.

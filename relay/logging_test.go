@@ -96,7 +96,7 @@ func dialManual(t *testing.T, ctx context.Context, addr string, relayKey [32]byt
 	if err != nil {
 		t.Fatalf("handshake state: %v", err)
 	}
-	msg1, _, _, err := hs.WriteMessage(nil, remoteKey[:])
+	msg1, _, _, err := hs.WriteMessage(nil, relayc.Msg1Payload(remoteKey, time.Now()))
 	if err != nil {
 		t.Fatalf("handshake msg1: %v", err)
 	}

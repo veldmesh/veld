@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 
 	"github.com/vishvananda/netlink"
 	wgtun "golang.zx2c4.com/wireguard/tun"
+	"golang.org/x/sys/unix"
 )
 
 type linuxTUN struct {
@@ -32,7 +34,7 @@ func DefaultIfaceName() string { return "veld0" }
 // CreateTUN creates a Linux TUN device with the given name, assigns ip to it, and brings it up.
 // Requires CAP_NET_ADMIN or root.
 func CreateTUN(name string, ip netip.Prefix, mtu int) (TUN, error) {
-	dev, err := wgtun.CreateTUN(name, mtu)
+	dev, err := createDevice(name, mtu)
 	if err != nil {
 		return nil, fmt.Errorf("tun create %s: %w", name, err)
 	}
@@ -61,6 +63,33 @@ func CreateTUN(name string, ip netip.Prefix, mtu int) (TUN, error) {
 	}
 
 	return &linuxTUN{dev: dev, name: realName, addr: ip, mtu: mtu}, nil
+}
+
+// createDevice opens a TUN device like wgtun.CreateTUN but without
+// IFF_VNET_HDR. With a virtio header the device needs header room in front
+// of every packet and hands out GSO batches; veld reads and writes one plain
+// IP packet at a time.
+func createDevice(name string, mtu int) (wgtun.Device, error) {
+	nfd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	ifr, err := unix.NewIfreq(name)
+	if err != nil {
+		_ = unix.Close(nfd)
+		return nil, err
+	}
+	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI)
+	if err := unix.IoctlIfreq(nfd, unix.TUNSETIFF, ifr); err != nil {
+		_ = unix.Close(nfd)
+		return nil, err
+	}
+	// Must happen before the fd is handed to the netpoller.
+	if err := unix.SetNonblock(nfd, true); err != nil {
+		_ = unix.Close(nfd)
+		return nil, err
+	}
+	return wgtun.CreateTUNFromFile(os.NewFile(uintptr(nfd), "/dev/net/tun"), mtu)
 }
 
 func (t *linuxTUN) Read(p []byte) (int, error) {

@@ -141,7 +141,13 @@ func runUp(cobraCmd *cobra.Command, args []string) error {
 		daemonPath = "veld-daemon" // try from PATH
 	}
 
-	cmdArgs := []string{"--config", upConfigPath}
+	// Pass the config this command loaded: the daemon's own default path
+	// is not the CLI's.
+	cfgPath, err := getConfigPath(upConfigPath)
+	if err != nil {
+		return err
+	}
+	cmdArgs := []string{"--config", cfgPath}
 	if socketPath != "" {
 		cmdArgs = append(cmdArgs, "--socket", socketPath)
 	}
@@ -285,7 +291,7 @@ var (
 func init() {
 	loginCmd.Flags().StringVar(&loginServer, "server", "", "coordinator server address")
 	loginCmd.Flags().StringVar(&loginNetworkID, "network-id", "", "network ID")
-	loginCmd.Flags().StringVar(&loginToken, "token", "", "auth token")
+	loginCmd.Flags().StringVar(&loginToken, "token", "", `auth token; "-" reads it from stdin (default: $VELD_TOKEN)`)
 	loginCmd.Flags().StringVar(&loginConfigPath, "config", "", "config file path")
 }
 
@@ -295,11 +301,39 @@ func runLogin(cobraCmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if loginToken != "" && loginServer != "" {
-		return saveCredentials(loginServer, loginNetworkID, loginToken, cfgPath)
+	if loginServer != "" {
+		// A self-hosted coordinator: never fall back to the hosted
+		// browser flow, which would ignore --server.
+		token, err := resolveToken(loginToken)
+		if err != nil {
+			return err
+		}
+		if token == "" {
+			return errors.New(`--server needs a token: pass --token - to read it from stdin, or set VELD_TOKEN`)
+		}
+		return saveCredentials(loginServer, loginNetworkID, token, cfgPath)
 	}
 
 	return runBrowserAuthFlow(cfgPath)
+}
+
+// resolveToken returns the token to use: flag "-" reads one line from stdin,
+// an empty flag falls back to $VELD_TOKEN. Tokens given on the command line
+// are visible to other local users in the process list and end up in shell
+// history, so the flag value itself is best avoided.
+func resolveToken(flagValue string) (string, error) {
+	switch flagValue {
+	case "-":
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && line == "" {
+			return "", fmt.Errorf("read token from stdin: %w", err)
+		}
+		return strings.TrimSpace(line), nil
+	case "":
+		return os.Getenv("VELD_TOKEN"), nil
+	default:
+		return flagValue, nil
+	}
 }
 
 func saveCredentials(server, networkID, token, cfgPath string) error {
@@ -366,7 +400,7 @@ func exchangeCliAuthCode(code string) (server, networkID, token string, err erro
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return "", "", "", fmt.Errorf("auth exchange failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
@@ -386,7 +420,7 @@ func exchangeCliAuthCode(code string) (server, networkID, token string, err erro
 
 var joinCmd = &cobra.Command{
 	Use:   "join <token>",
-	Short: "Join a network using a token",
+	Short: `Join a network using a token ("-" reads it from stdin)`,
 	Args:  cobra.ExactArgs(1),
 	RunE:  runJoin,
 }
@@ -404,7 +438,10 @@ func init() {
 }
 
 func runJoin(cobraCmd *cobra.Command, args []string) error {
-	token := args[0]
+	token, err := resolveToken(args[0])
+	if err != nil {
+		return err
+	}
 	cfgPath, err := getConfigPath(joinConfigPath)
 	if err != nil {
 		return err
@@ -603,7 +640,10 @@ func writeConfig(path string, cfg *config.Config) (err error) {
 		return err
 	}
 
-	f, err := os.Create(path)
+	// The config holds the coordinator token. New files are owner-only; an
+	// existing file keeps its owner and group (a daemon user may read it
+	// through its group) but never stays readable by everyone.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
@@ -612,6 +652,15 @@ func writeConfig(path string, cfg *config.Config) (err error) {
 			err = cerr
 		}
 	}()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if perm := fi.Mode().Perm(); perm&0o007 != 0 {
+		if err := f.Chmod(perm &^ 0o007); err != nil {
+			return err
+		}
+	}
 
 	return toml.NewEncoder(f).Encode(cfg)
 }

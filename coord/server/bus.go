@@ -103,21 +103,20 @@ func (b *Bus) Publish(networkID string, ev *coordv1.PeerEvent) {
 func (b *Bus) SubscribeSignals(peerID string) <-chan signalMsg {
 	ch := make(chan signalMsg, 64)
 	b.mu.Lock()
-	b.signals[peerID] = append(b.signals[peerID], ch)
 	held := b.pending[peerID]
 	delete(b.pending, peerID)
 	cutoff := b.now().Add(-pendingSignalTTL)
-	deliver := make([]signalMsg, 0, len(held))
+	// Fill the channel before publishing it: once it is in b.signals,
+	// concurrent SendSignal calls can fill its buffer, and a send here would
+	// then block forever. Until then nobody else holds ch, so these sends
+	// cannot block: len(held) <= maxPendingPerPeer < cap(ch).
 	for _, p := range held {
 		if p.at.After(cutoff) {
-			deliver = append(deliver, p.msg)
+			ch <- p.msg
 		}
 	}
+	b.signals[peerID] = append(b.signals[peerID], ch)
 	b.mu.Unlock()
-	// No channel send under b.mu. Cannot block: len(deliver) <= maxPendingPerPeer < cap(ch).
-	for _, msg := range deliver {
-		ch <- msg
-	}
 	return ch
 }
 

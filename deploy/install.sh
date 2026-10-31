@@ -4,10 +4,12 @@
 #
 # What this script does:
 #   1. Detects OS and CPU architecture
-#   2. Downloads the latest release archive from GitHub
+#   2. Downloads the latest release archive from GitHub and verifies it
+#      against the release's checksums.txt
 #   3. Installs binaries to /usr/local/bin/
-#   4. Applies setcap CAP_NET_ADMIN to veld-daemon (Linux)
-#   5. Optionally installs systemd units and creates the veld system user
+#   4. Creates the veld system user and, on Linux, lets only root and the
+#      veld group run veld-daemon, with CAP_NET_ADMIN
+#   5. Optionally installs systemd units
 #
 # Supported platforms: linux/amd64, linux/arm64, linux/armv7, linux/armv6,
 #                      linux/mips, linux/mipsle, darwin/amd64, darwin/arm64
@@ -69,9 +71,21 @@ need install
 printf '\nFetching latest release info...\n'
 VERSION=$(curl -fsSL "$API_URL" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
 [ -n "$VERSION" ] || die "could not determine latest release version"
+# The tag goes into a URL and file names: accept only a plain version.
+printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+    || die "unexpected release tag: $VERSION"
 
 TARBALL="veld-${VERSION}-${PLATFORM}.tar.gz"
-DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${TARBALL}"
+RELEASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}"
+DOWNLOAD_URL="${RELEASE_URL}/${TARBALL}"
+
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256() { sha256sum "$1" | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+    sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
+else
+    die "required tool not found: sha256sum or shasum"
+fi
 
 printf 'Installing Veld %s on %s/%s\n\n' "$VERSION" "$OS" "$ARCH"
 
@@ -82,6 +96,14 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 info "Downloading ${TARBALL}..."
 curl -fsSL --progress-bar -o "${TMPDIR}/${TARBALL}" "$DOWNLOAD_URL"
+
+info "Verifying checksum..."
+curl -fsSL -o "${TMPDIR}/checksums.txt" "${RELEASE_URL}/checksums.txt" \
+    || die "could not download checksums.txt"
+WANT=$(awk -v f="$TARBALL" '$2 == f || $2 == "*" f { print $1 }' "${TMPDIR}/checksums.txt")
+[ -n "$WANT" ] || die "${TARBALL} is not listed in checksums.txt"
+GOT=$(sha256 "${TMPDIR}/${TARBALL}")
+[ "$GOT" = "$WANT" ] || die "checksum mismatch for ${TARBALL}"
 
 info "Extracting..."
 tar -xzf "${TMPDIR}/${TARBALL}" -C "$TMPDIR"
@@ -94,25 +116,41 @@ done
 # ── Linux-specific setup ──────────────────────────────────────────────────────
 
 if [ "$OS" = "linux" ]; then
-    # Apply CAP_NET_ADMIN so the daemon can manage TUN without running as root.
-    if command -v setcap >/dev/null 2>&1; then
-        info "Setting cap_net_admin on veld-daemon..."
-        setcap 'cap_net_admin+ep' "${INSTALL_DIR}/veld-daemon"
-    else
-        info "setcap not found — veld-daemon will require root or sudo"
-    fi
-
     # Create a dedicated system user for the daemon.
     if ! id veld >/dev/null 2>&1; then
         info "Creating system user 'veld'..."
-        useradd --system --no-create-home --shell /sbin/nologin veld 2>/dev/null \
-            || adduser -S -H -s /sbin/nologin veld 2>/dev/null \
+        useradd --system --user-group --no-create-home --shell /sbin/nologin veld 2>/dev/null \
+            || adduser -S -H -G veld -s /sbin/nologin veld 2>/dev/null \
+            || { addgroup -S veld 2>/dev/null && adduser -S -H -G veld -s /sbin/nologin veld 2>/dev/null; } \
             || info "  (could not create user — run daemon as root or set up manually)"
     fi
 
-    # Install systemd units if systemd is running.
-    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running >/dev/null 2>&1; then
+    # CAP_NET_ADMIN lets veld-daemon manage TUN devices and routes, so a
+    # user who can run it can reroute all of this host's traffic. File
+    # capabilities apply to whoever runs the binary: grant them only once
+    # the binary is restricted to root and the veld group. The systemd unit
+    # grants the capability itself and does not need this.
+    if VELD_GROUP=$(id -gn veld 2>/dev/null); then
+        chown "root:${VELD_GROUP}" "${INSTALL_DIR}/veld-daemon"
+        chmod 0750 "${INSTALL_DIR}/veld-daemon"
+        if command -v setcap >/dev/null 2>&1; then
+            info "Setting cap_net_admin on veld-daemon (root and group ${VELD_GROUP} only)..."
+            setcap 'cap_net_admin+ep' "${INSTALL_DIR}/veld-daemon"
+            info "  Add trusted users to it with: usermod -aG ${VELD_GROUP} <user>"
+        fi
+    else
+        setcap -r "${INSTALL_DIR}/veld-daemon" 2>/dev/null || true
+        info "No veld user — veld-daemon will require root or sudo"
+    fi
+
+    # Install systemd units if systemd is running. The unit files are only
+    # taken from next to this script; when it is piped into sh there is no
+    # such directory (and the current directory must not be trusted).
+    SCRIPT_DIR=""
+    if [ -f "$0" ]; then
+        SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    fi
+    if [ -n "$SCRIPT_DIR" ] && command -v systemctl >/dev/null 2>&1 && systemctl is-system-running >/dev/null 2>&1; then
         for unit in veld-coord.service veld-daemon.service; do
             src="${SCRIPT_DIR}/${unit}"
             dst="/etc/systemd/system/${unit}"
@@ -130,6 +168,9 @@ if [ "$OS" = "linux" ]; then
     # Create default config directory.
     mkdir -p /etc/veld
     chmod 0750 /etc/veld
+    if [ -n "${VELD_GROUP:-}" ]; then
+        chgrp "$VELD_GROUP" /etc/veld
+    fi
 fi
 
 # ── finish ────────────────────────────────────────────────────────────────────

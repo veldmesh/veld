@@ -39,7 +39,15 @@ type pinValue struct {
 	Fingerprint [32]byte
 	Ed25519Pub  string
 	VPNAddr     string
+	// PrevVPNAddrs are addresses this key was pinned at before it moved.
+	// They stay reserved for the key: if moving released them, whoever
+	// controls the peer list could move a peer away and then put a new key
+	// at its old address.
+	PrevVPNAddrs []string
 }
+
+// maxPrevVPNAddrs bounds how many old addresses one pin keeps reserved.
+const maxPrevVPNAddrs = 16
 
 func New(path string) (*Store, error) {
 	s := &Store{
@@ -56,9 +64,10 @@ func New(path string) (*Store, error) {
 // Check verifies the peer's Ed25519 public key against the pinned fingerprint.
 // The pin is keyed by Ed25519 pubkey, but TOFU enforcement ensures a VPN address
 // is only ever associated with one Ed25519 identity.
-// If the same pubkey appears at a different VPN address, the VPN address is updated.
-// If a different pubkey appears at a VPN address that already has a different pubkey pinned,
-// the check fails (TOFU violation / possible MITM).
+// If the same pubkey appears at a different VPN address, the VPN address is
+// updated and the old one stays reserved for that key.
+// If a pubkey appears at a VPN address that is pinned (now or before) to a
+// different pubkey, the check fails (TOFU violation / possible MITM).
 func (s *Store) Check(vpnAddr string, pub ed25519.PublicKey) error {
 	fp := Fingerprint(pub)
 	pubStr := pubKeyString(pub)
@@ -73,8 +82,23 @@ func (s *Store) Check(vpnAddr string, pub ed25519.PublicKey) error {
 		}
 		// Update VPN address if changed (peer moved).
 		if stored.VPNAddr != vpnAddr {
-			// Update reverse mapping.
-			delete(s.vpnToPub, stored.VPNAddr)
+			if owner, ok := s.vpnToPub[vpnAddr]; ok && owner != pubStr {
+				return ErrFingerprintMismatch
+			}
+			prev := []string{stored.VPNAddr}
+			for _, a := range stored.PrevVPNAddrs {
+				if a != vpnAddr && a != stored.VPNAddr {
+					prev = append(prev, a)
+				}
+			}
+			if len(prev) > maxPrevVPNAddrs {
+				// Release the oldest reservations.
+				for _, a := range prev[maxPrevVPNAddrs:] {
+					delete(s.vpnToPub, a)
+				}
+				prev = prev[:maxPrevVPNAddrs]
+			}
+			stored.PrevVPNAddrs = prev
 			stored.VPNAddr = vpnAddr
 			s.vpnToPub[vpnAddr] = pubStr
 			s.pins[pubStr] = stored
@@ -105,20 +129,33 @@ func (s *Store) Forget(pub ed25519.PublicKey) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if v, ok := s.pins[pubStr]; ok {
-		delete(s.vpnToPub, v.VPNAddr)
-		delete(s.pins, pubStr)
+		s.unpin(v)
 	}
 	return s.save()
 }
 
-// ForgetByVPNAddr removes all pins associated with a VPN address.
+// unpin removes v and every address reserved for it. s.mu must be held.
+func (s *Store) unpin(v pinValue) {
+	for _, a := range append([]string{v.VPNAddr}, v.PrevVPNAddrs...) {
+		if s.vpnToPub[a] == v.Ed25519Pub {
+			delete(s.vpnToPub, a)
+		}
+	}
+	delete(s.pins, v.Ed25519Pub)
+}
+
+// ForgetByVPNAddr removes the pin associated with a VPN address, current or
+// previous, together with every address reserved for that key.
 // Used by the CLI `veld tofu forget <vpn-addr>` command.
 func (s *Store) ForgetByVPNAddr(vpnAddr string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if pubStr, ok := s.vpnToPub[vpnAddr]; ok {
-		delete(s.vpnToPub, vpnAddr)
-		delete(s.pins, pubStr)
+		if v, ok := s.pins[pubStr]; ok {
+			s.unpin(v)
+		} else {
+			delete(s.vpnToPub, vpnAddr)
+		}
 	}
 	return s.save()
 }
@@ -135,9 +172,10 @@ func (s *Store) List() map[string]string {
 }
 
 type pinEntry struct {
-	VPNAddr     string `json:"vpn_addr"`
-	Ed25519Pub  string `json:"ed25519_pub"`
-	Fingerprint string `json:"fingerprint"`
+	VPNAddr      string   `json:"vpn_addr"`
+	Ed25519Pub   string   `json:"ed25519_pub"`
+	Fingerprint  string   `json:"fingerprint"`
+	PrevVPNAddrs []string `json:"prev_vpn_addrs,omitempty"`
 }
 
 type storeFile struct {
@@ -173,11 +211,17 @@ func (s *Store) load() error {
 				copy(fp[:], b)
 				pubStr := p.Ed25519Pub
 				s.pins[pubStr] = pinValue{
-					Fingerprint: fp,
-					Ed25519Pub:  pubStr,
-					VPNAddr:     p.VPNAddr,
+					Fingerprint:  fp,
+					Ed25519Pub:   pubStr,
+					VPNAddr:      p.VPNAddr,
+					PrevVPNAddrs: p.PrevVPNAddrs,
 				}
 				s.vpnToPub[p.VPNAddr] = pubStr
+				for _, a := range p.PrevVPNAddrs {
+					if _, taken := s.vpnToPub[a]; !taken {
+						s.vpnToPub[a] = pubStr
+					}
+				}
 			}
 			return nil
 		}
@@ -205,9 +249,10 @@ func (s *Store) save() error {
 	f := storeFile{Version: 3}
 	for _, v := range s.pins {
 		f.Pins = append(f.Pins, pinEntry{
-			VPNAddr:     v.VPNAddr,
-			Ed25519Pub:  v.Ed25519Pub,
-			Fingerprint: hex.EncodeToString(v.Fingerprint[:]),
+			VPNAddr:      v.VPNAddr,
+			Ed25519Pub:   v.Ed25519Pub,
+			Fingerprint:  hex.EncodeToString(v.Fingerprint[:]),
+			PrevVPNAddrs: v.PrevVPNAddrs,
 		})
 	}
 	data, err := json.MarshalIndent(f, "", "  ")

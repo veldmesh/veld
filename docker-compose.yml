@@ -21,6 +21,10 @@ services:
       - "${COORD_LISTEN:-0.0.0.0:50051}:50051"
     volumes:
       - coord-data:/data
+    # Passed through the environment rather than a -token flag, so it does
+    # not show up in the host's process list.
+    environment:
+      VELD_COORD_TOKEN: "${COORD_TOKEN}"
     command:
       - "-listen"
       - ":50051"
@@ -32,8 +36,6 @@ services:
       - "${COORD_NETWORK_CIDR:-10.100.0.0/24}"
       - "-network-name"
       - "${COORD_NETWORK_NAME:-default}"
-      - "-token"
-      - "${COORD_TOKEN}"
     healthcheck:
       # grpc_health_probe or a plain TCP check — use TCP since we ship scratch.
       test: ["CMD-SHELL", "true"]

@@ -77,6 +77,29 @@ jobs:
       - name: go test -race
         run: go test -race ./...
 
+  privileged:
+    name: Privileged tests (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: true
+
+      # These tests create real TUN devices and routes and skip without root,
+      # so the plain test jobs never exercise them. Build as the runner user
+      # and run only the test binaries as root.
+      - name: TUN and coexist tests as root
+        run: |
+          for pkg in tun coexist; do
+            go test -c -o "$RUNNER_TEMP/$pkg.test" "./internal/$pkg"
+            sudo "$RUNNER_TEMP/$pkg.test" -test.v -test.count=1
+          done
+
   govulncheck:
     name: govulncheck
     runs-on: ubuntu-latest
@@ -94,7 +117,7 @@ jobs:
           cache: true
 
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
 
       - name: Run govulncheck
         run: govulncheck ./...
@@ -117,7 +140,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a  # v9.3.0
         with:
-          version: latest
+          version: v2.14.0
           args: --timeout=5m
 
   build-check:

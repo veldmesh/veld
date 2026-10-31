@@ -15,12 +15,16 @@ import (
 
 func main() {
 	cfgPath := flag.String("config", config.DefaultConfigPath(), "path to config file")
+	socketPath := flag.String("socket", "", "IPC socket path (overrides daemon.socket_path)")
 	flag.Parse()
 
 	cfg, err := config.LoadFile(*cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "veld-daemon: %v\n", err)
 		os.Exit(1)
+	}
+	if *socketPath != "" {
+		cfg.Daemon.SocketPath = *socketPath
 	}
 
 	d, err := daemon.NewFromConfig(cfg)

@@ -47,10 +47,15 @@ message ListPeersResponse {
   repeated Peer peers = 1;
 }
 
+// WatchRequest opens the event stream. A request naming peer_id also
+// receives that peer's signals and keeps it marked online, so it must be
+// signed by that peer's key (see Watch).
 message WatchRequest {
-  string network_id = 1;
-  string token      = 2;
-  string peer_id    = 3;  // caller's peer ID — used to filter self-events
+  string network_id     = 1;
+  string token          = 2;
+  string peer_id        = 3;  // caller's peer ID — used to filter self-events
+  int64  timestamp_unix = 4;  // client clock when signing, unix seconds
+  bytes  signature      = 5;  // call signature by peer_id's key
 }
 
 enum EventType {
@@ -78,17 +83,21 @@ message PeerEvent {
 // SendSignalRequest relays an encrypted ICE candidate to a peer.
 // The coord server treats payload as opaque bytes — it never reads them.
 message SendSignalRequest {
-  string token       = 1;
-  string from_peer_id = 2;
-  string to_peer_id  = 3;
-  bytes  payload     = 4;
+  string token          = 1;
+  string from_peer_id   = 2;
+  string to_peer_id     = 3;
+  bytes  payload        = 4;
+  int64  timestamp_unix = 5;  // client clock when signing, unix seconds
+  bytes  signature      = 6;  // call signature by from_peer_id's key
 }
 
 message SendSignalResponse {}
 
 message LeaveRequest {
-  string token   = 1;
-  string peer_id = 2;
+  string token          = 1;
+  string peer_id        = 2;
+  int64  timestamp_unix = 3;  // client clock when signing, unix seconds
+  bytes  signature      = 4;  // call signature by peer_id's key
 }
 
 message LeaveResponse {}
@@ -97,8 +106,8 @@ service Coord {
   // Register assigns a VPN IP to the calling daemon and validates its Ed25519 sig:
   // only the holder of the private key matching ed25519_public can register or
   // update the peer whose ID is that key. The request must carry a signature —
-  // an Ed25519 signature over "veld-coord-register-v1\0" followed by the
-  // length-prefixed network_id, ed25519_public, x25519_public, endpoint, the
+  // an Ed25519 signature over "veld-coord-register-v2\0" followed by the
+  // length-prefixed network_id, name, ed25519_public, x25519_public, endpoint, the
   // sorted subnet_routes and the timestamp_unix (big-endian uint64) — with
   // |now - timestamp_unix| <= 120 s. A missing, stale or invalid signature is
   // rejected with Unauthenticated before any registry write, so a rejected
@@ -108,6 +117,15 @@ service Coord {
 
   // ListPeers returns all currently registered peers in the network.
   rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
+
+  // Calls in which a peer acts as itself (Watch naming a peer_id,
+  // SendSignal, Leave) carry a call signature: an Ed25519 signature by that
+  // peer's key over "veld-coord-call-v1\0" followed by the length-prefixed
+  // method name and peer ID, the method's arguments as a length-prefixed
+  // list (Watch: network_id; SendSignal: to_peer_id and the hex SHA-256 of
+  // the payload; Leave: none) and timestamp_unix (big-endian uint64), with
+  // |now - timestamp_unix| <= 120 s. Each signature is accepted once. The
+  // token alone only proves membership of the account.
 
   // Watch streams peer join/leave/update events until the client disconnects.
   rpc Watch(WatchRequest) returns (stream PeerEvent);

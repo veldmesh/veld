@@ -156,6 +156,13 @@ ICE-style UDP hole punching:
 For peers reachable purely within a LAN, mDNS discovery (`internal/mdns/`) avoids the coord
 server and NAT traversal entirely.
 
+mDNS records are unauthenticated. For a peer already known from the coord server or static
+config they only suggest a LAN endpoint (the Noise handshake then proves the peer's key);
+they never change its keys, VPN address or name. With a coord server, unknown LAN peers are
+ignored. In LAN-only mode any host on the LAN can join by advertising itself, but it cannot
+take a VPN address or name another peer already holds, and TOFU pins each address to the
+first key seen there.
+
 
 **Relay fallback (DERP-style).** When hole punching times out — e.g. both peers behind
 symmetric NATs — the NAT manager hands off to a relay path instead of giving up (client in `internal/relay/`, server in the top-level `relay/` package).
