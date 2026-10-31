@@ -280,11 +280,9 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 		t := d.tun
 		d.tunMu.RUnlock()
 		if t != nil {
-			if _, err := t.Write(plain); err != nil {
-				// TODO: log err before stopping -- Dispatcher has no logger yet
-				d.Stop()
-				return
-			}
+			// A failed write drops this packet only: one packet the
+			// kernel rejects must not take the whole data plane down.
+			_, _ = t.Write(plain)
 		}
 
 	case TypeKeepalive:

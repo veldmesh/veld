@@ -5,9 +5,11 @@
 package tun_test
 
 import (
+	"net"
 	"net/netip"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/veldmesh/veld/internal/tun"
 )
@@ -90,5 +92,43 @@ func TestCreateTUN_Linux_WriteRead(t *testing.T) {
 	}
 	if n != len(pkt) {
 		t.Errorf("Write: got n=%d, want %d", n, len(pkt))
+	}
+
+	// A UDP datagram sent to another address in the TUN subnet is routed into
+	// the device and must come out of Read as one plain IPv4 packet.
+	c, err := net.Dial("udp4", "10.100.98.2:9")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	go func() {
+		for i := 0; i < 20; i++ {
+			c.Write([]byte("ping"))
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+	got := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, err := dev.Read(buf)
+			if err != nil {
+				got <- "Read: " + err.Error()
+				return
+			}
+			if n >= 20 && buf[0]>>4 == 4 && buf[9] == 0x11 &&
+				netip.AddrFrom4([4]byte(buf[16:20])) == netip.MustParseAddr("10.100.98.2") {
+				got <- string(buf[n-4 : n])
+				return
+			}
+		}
+	}()
+	select {
+	case s := <-got:
+		if s != "ping" {
+			t.Errorf("read from TUN: got %q, want ping payload", s)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout reading a packet from the TUN")
 	}
 }
