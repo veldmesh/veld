@@ -27,6 +27,7 @@
 // Wire protocol (client → relay is the Noise IK initiator):
 //
 //	frame 1: Noise IK message_1, payload = 32-byte remote peer X25519 key
+//	         followed by the client clock (uint64 big-endian unix milliseconds)
 //	frame 2: Noise IK message_2 from the relay, empty payload
 //	thereafter: length-prefixed frames carrying encrypted messages
 //
@@ -155,7 +156,7 @@ func Dial(ctx context.Context, addr string, relayX25519 [32]byte, id *crypto.Ide
 		return nil, err
 	}
 
-	msg1, _, _, err := hs.WriteMessage(nil, remotePeerKey[:])
+	msg1, _, _, err := hs.WriteMessage(nil, Msg1Payload(remotePeerKey, time.Now()))
 	if err != nil {
 		_ = raw.Close()
 		return nil, fmt.Errorf("relay handshake msg1: %w", err)
@@ -177,6 +178,19 @@ func Dial(ctx context.Context, addr string, relayX25519 [32]byte, id *crypto.Ide
 	}
 	// Initiator: cs1 = send, cs2 = recv.
 	return &Conn{raw: raw, send: cs1, recv: cs2}, nil
+}
+
+// Msg1PayloadSize is the size of the message_1 payload: the remote peer's
+// X25519 key and the client clock.
+const Msg1PayloadSize = 32 + 8
+
+// Msg1Payload builds the message_1 payload. The timestamp lets the relay
+// refuse a recorded message_1 replayed later: Noise IK message_1 carries no
+// freshness of its own.
+func Msg1Payload(remotePeerKey [32]byte, now time.Time) []byte {
+	p := make([]byte, 0, Msg1PayloadSize)
+	p = append(p, remotePeerKey[:]...)
+	return binary.BigEndian.AppendUint64(p, uint64(now.UnixMilli()))
 }
 
 // WriteFrame writes msg with a 2-byte big-endian length prefix.

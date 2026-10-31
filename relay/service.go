@@ -18,6 +18,7 @@ package relay
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log"
@@ -49,6 +50,14 @@ const (
 	defaultMaxConnsPerIP = 64
 )
 
+// msg1MaxAge is how far the client clock in message_1 may be from ours.
+// Without it a recorded message_1 could be replayed at any time to evict
+// the real client's waiting connection.
+const msg1MaxAge = 30 * time.Second
+
+// maxSeenMsg1 bounds the replay cache.
+const maxSeenMsg1 = 1 << 16
+
 // maxMsg1Size bounds the unauthenticated first frame. An IK message 1 with
 // its 32-byte payload is 128 bytes.
 const maxMsg1Size = 256
@@ -79,6 +88,10 @@ type Service struct {
 	wg          sync.WaitGroup // tracks running splice goroutines
 	// verbose enables per-connection debug logging; off by default.
 	verbose bool
+
+	// seenMsg1 holds the ephemeral keys of recent message_1s, so a
+	// recorded handshake cannot be replayed within msg1MaxAge. Guarded by mu.
+	seenMsg1 map[[32]byte]time.Time
 
 	maxConns      int
 	maxConnsPerIP int
@@ -133,6 +146,7 @@ func NewService(id *crypto.Identity, ln net.Listener, opts ...Option) *Service {
 		maxConns:      defaultMaxConns,
 		maxConnsPerIP: defaultMaxConnsPerIP,
 		connsByIP:     make(map[netip.Addr]int),
+		seenMsg1:      make(map[[32]byte]time.Time),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -245,6 +259,37 @@ func (c *limitedConn) Close() error {
 	return err
 }
 
+// freshMsg1 reports whether a message_1 with this payload is recent and not
+// a replay, and records it. The ephemeral key (the first 32 bytes of msg1)
+// is fresh for every real handshake.
+func (s *Service) freshMsg1(msg1, payload []byte) bool {
+	now := time.Now()
+	sent := time.UnixMilli(int64(binary.BigEndian.Uint64(payload[32:])))
+	if d := now.Sub(sent); d > msg1MaxAge || d < -msg1MaxAge {
+		return false
+	}
+	var eph [32]byte
+	copy(eph[:], msg1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.seenMsg1[eph]; ok {
+		return false
+	}
+	if len(s.seenMsg1) >= maxSeenMsg1 {
+		for k, exp := range s.seenMsg1 {
+			if now.After(exp) {
+				delete(s.seenMsg1, k)
+			}
+		}
+		if len(s.seenMsg1) >= maxSeenMsg1 {
+			return false
+		}
+	}
+	// Remember it until its timestamp can no longer pass the check.
+	s.seenMsg1[eph] = sent.Add(msg1MaxAge)
+	return true
+}
+
 // Close stops the service, closes all pending and active connections, and
 // waits for all splice goroutines to exit before returning.
 func (s *Service) Close() error {
@@ -308,7 +353,7 @@ func (s *Service) handleConn(raw net.Conn) {
 		return
 	}
 	payload, _, _, err := hs.ReadMessage(nil, msg1)
-	if err != nil || len(payload) != 32 {
+	if err != nil || len(payload) != relayc.Msg1PayloadSize || !s.freshMsg1(msg1, payload) {
 		// Silent drop: no error reply — an error would be an oracle.
 		_ = raw.Close()
 		return
