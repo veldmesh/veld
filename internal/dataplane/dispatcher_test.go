@@ -200,6 +200,8 @@ func TestDispatcher_TunToUDP(t *testing.T) {
 	entryB.SetEndpoint(ep)
 	entryB.SetSession(sessA)
 	peerTbl.Upsert(entryB)
+	// A third peer outside the mesh prefix (static configs allow that).
+	peerTbl.Upsert(&peer.Entry{ID: [32]byte{0x03}, VPNAddr: mustAddr("192.168.1.99")})
 
 	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
 	conn := newFakeConn()
@@ -243,6 +245,8 @@ func TestDispatcher_UDPToTun(t *testing.T) {
 	entryB.SetEndpoint(ep)
 	entryB.SetSession(sessA)
 	peerTbl.Upsert(entryB)
+	// A third peer outside the mesh prefix (static configs allow that).
+	peerTbl.Upsert(&peer.Entry{ID: [32]byte{0x03}, VPNAddr: mustAddr("192.168.1.99")})
 
 	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
 	conn := newFakeConn()
@@ -302,6 +306,8 @@ func deliverFromPeer(t *testing.T, vpnAddr string, routes []netip.Prefix, plain 
 	entryB.SetEndpoint(mustAddrPort("1.2.3.4:5000"))
 	entryB.SetSession(sessA)
 	peerTbl.Upsert(entryB)
+	// A third peer outside the mesh prefix (static configs allow that).
+	peerTbl.Upsert(&peer.Entry{ID: [32]byte{0x03}, VPNAddr: mustAddr("192.168.1.99")})
 
 	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
 	conn := newFakeConn()
@@ -349,6 +355,10 @@ func TestDispatcher_InboundSourceCheck(t *testing.T) {
 		{"outside advertised route", "10.0.0.2", lan, buildIPv4Packet([4]byte{192, 168, 2, 20}, me, []byte("x")), false},
 		{"IPv6 own address", "fd00::2", nil, buildIPv6Packet(mustAddr("fd00::2"), mustAddr("fd00::1"), []byte("x")), true},
 		{"IPv6 forged address", "fd00::2", nil, buildIPv6Packet(mustAddr("fd00::3"), mustAddr("fd00::1"), []byte("x")), false},
+		{"mesh address via a broad route", "10.0.0.2", []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, buildIPv4Packet([4]byte{10, 0, 0, 3}, me, []byte("x")), false},
+		{"my own address via a broad route", "10.0.0.2", []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, buildIPv4Packet(me, me, []byte("x")), false},
+		{"outside the mesh via a broad route", "10.0.0.2", []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, buildIPv4Packet([4]byte{10, 1, 0, 3}, me, []byte("x")), true},
+		{"other peer's address inside the route", "10.0.0.2", lan, buildIPv4Packet([4]byte{192, 168, 1, 99}, me, []byte("x")), false},
 		{"not an IP packet", "10.0.0.2", nil, []byte("hello"), false},
 		{"truncated IPv4 header", "10.0.0.2", nil, []byte{0x45, 0, 0, 20}, false},
 	}
@@ -389,6 +399,8 @@ func TestDispatcher_NoSession_HoldsPacket(t *testing.T) {
 	entryB := &peer.Entry{ID: peerBID, VPNAddr: mustAddr("10.0.0.2")}
 	entryB.SetEndpoint(ep)
 	peerTbl.Upsert(entryB)
+	// A third peer outside the mesh prefix (static configs allow that).
+	peerTbl.Upsert(&peer.Entry{ID: [32]byte{0x03}, VPNAddr: mustAddr("192.168.1.99")})
 
 	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
 	conn := newFakeConn()
@@ -465,6 +477,8 @@ func TestDispatcher_RekeyThreshold(t *testing.T) {
 	entryB.SetEndpoint(ep)
 	entryB.SetSession(sessA)
 	peerTbl.Upsert(entryB)
+	// A third peer outside the mesh prefix (static configs allow that).
+	peerTbl.Upsert(&peer.Entry{ID: [32]byte{0x03}, VPNAddr: mustAddr("192.168.1.99")})
 
 	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
 	conn := newFakeConn()
@@ -511,6 +525,8 @@ func TestDispatcher_RekeyViaNeedsRekey(t *testing.T) {
 	entryB.SetEndpoint(ep)
 	entryB.SetSession(sessA)
 	peerTbl.Upsert(entryB)
+	// A third peer outside the mesh prefix (static configs allow that).
+	peerTbl.Upsert(&peer.Entry{ID: [32]byte{0x03}, VPNAddr: mustAddr("192.168.1.99")})
 
 	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
 	conn := newFakeConn()
@@ -564,6 +580,8 @@ func TestDispatcher_RekeyCallbackWiring(t *testing.T) {
 	entryB.SetEndpoint(ep)
 	entryB.SetSession(sessA)
 	peerTbl.Upsert(entryB)
+	// A third peer outside the mesh prefix (static configs allow that).
+	peerTbl.Upsert(&peer.Entry{ID: [32]byte{0x03}, VPNAddr: mustAddr("192.168.1.99")})
 
 	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
 	conn := newFakeConn()

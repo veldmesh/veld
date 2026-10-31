@@ -200,12 +200,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	// static peer config. These are installed once at startup; they're removed by Stop().
 	if cfg.Coord.Addr == "" {
 		for _, e := range peerTbl.List() {
-			for _, pfx := range e.SubnetRoutes {
-				d.logRouteCollisions(pfx)
-				if err := d.routeMgr.Add(pfx, e.VPNAddr); err != nil {
-					fmt.Printf("warning: add route %s via %s: %v\n", pfx, e.VPNAddr, err)
-				}
-			}
+			d.addPeerRoutes(e)
 		}
 	}
 
@@ -320,12 +315,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 
 		d.coordCli.OnPeerAdded = func(e *peer.Entry) {
 			// Install OS routes for any subnets this peer advertises.
-			for _, pfx := range e.SubnetRoutes {
-				d.logRouteCollisions(pfx)
-				if err := d.routeMgr.Add(pfx, e.VPNAddr); err != nil {
-					fmt.Printf("warning: add route %s via %s: %v\n", pfx, e.VPNAddr, err)
-				}
-			}
+			d.addPeerRoutes(e)
 			// Try handshake immediately if the peer advertised an endpoint.
 			if e.GetEndpoint().IsValid() {
 				d.hsMgr.Initiate(e)
@@ -432,14 +422,9 @@ func (d *Daemon) newMDNSDiscovery(cfg *intconfig.Config, conn net.PacketConn, vp
 		dataPort = uint16(laddr.Port)
 	}
 
+	coordMode := cfg.Coord.Addr != ""
 	return mdns.New(d.localID, mdnsName, vpnAddr, dataPort,
-		func(e *peer.Entry, ep netip.AddrPort) {
-			if ep.IsValid() {
-				e.SetEndpoint(ep)
-			}
-			d.peerTbl.Upsert(e)
-			d.hsMgr.Initiate(e)
-		})
+		func(e *peer.Entry, ep netip.AddrPort) { d.onMDNSPeer(e, ep, coordMode) })
 }
 
 // onVPNAddrAssigned returns the callback invoked when the coordinator
@@ -521,6 +506,58 @@ func (d *Daemon) onVPNAddrAssigned(cfg *intconfig.Config, conn net.PacketConn) f
 	}
 }
 
+// onMDNSPeer handles a peer advertised on the LAN. mDNS records are
+// unauthenticated, so they never change a known peer's identity, address or
+// name: for a peer already known (from the coordinator or static config) with
+// the same keys they only suggest an endpoint to try, and the handshake proves
+// it. With a coordinator, the coordinator decides membership and unknown LAN
+// peers are ignored. In LAN-only mode unknown peers are added, subject to the
+// peer table's rule that an address or name belongs to its first owner (and
+// to TOFU pinning on handshake).
+func (d *Daemon) onMDNSPeer(e *peer.Entry, ep netip.AddrPort, coordMode bool) {
+	if known, ok := d.peerTbl.LookupByID(e.ID); ok {
+		if known.X25519Pub != e.X25519Pub || !ep.IsValid() {
+			return
+		}
+		if !known.GetEndpoint().IsValid() {
+			d.peerTbl.UpdateEndpoint(known.ID, ep)
+		}
+		d.hsMgr.Initiate(known)
+		return
+	}
+	if coordMode {
+		return
+	}
+	if ep.IsValid() {
+		e.SetEndpoint(ep)
+	}
+	if !d.peerTbl.Upsert(e) {
+		return
+	}
+	d.hsMgr.Initiate(e)
+}
+
+// addPeerRoutes installs OS routes for the subnets e advertises, skipping
+// any that route.CheckPeerRoute refuses (default routes, the mesh itself).
+func (d *Daemon) addPeerRoutes(e *peer.Entry) {
+	var mesh netip.Prefix
+	d.mu.Lock()
+	if d.tunDev != nil {
+		mesh = d.tunDev.Addr()
+	}
+	d.mu.Unlock()
+	for _, pfx := range e.SubnetRoutes {
+		if err := route.CheckPeerRoute(pfx, mesh); err != nil {
+			fmt.Printf("warning: ignoring subnet route from %s: %v\n", e.VPNAddr, err)
+			continue
+		}
+		d.logRouteCollisions(pfx)
+		if err := d.routeMgr.Add(pfx, e.VPNAddr); err != nil {
+			fmt.Printf("warning: add route %s via %s: %v\n", pfx, e.VPNAddr, err)
+		}
+	}
+}
+
 // deriveMeshPrefix returns the prefix to configure on the TUN: the
 // network CIDR from the server with this node's assigned address, or a
 // /24 fallback (with a warning) when the server did not send one.
@@ -598,7 +635,9 @@ func buildPeerTable(peerCfgs []intconfig.PeerConfig) (*peer.Table, error) {
 				e.SetEndpoint(ep)
 			}
 		}
-		tbl.Upsert(e)
+		if !tbl.Upsert(e) {
+			return nil, fmt.Errorf("peer %q: vpn_addr %s is already used by another peer", pc.Name, vpnAddr)
+		}
 	}
 	return tbl, nil
 }

@@ -303,7 +303,10 @@ func (c *Client) handleEvent(ev *coordv1.PeerEvent, myID string) {
 		if entry == nil {
 			return
 		}
-		c.cfg.PeerTable.Upsert(entry)
+		if !c.cfg.PeerTable.Upsert(entry) {
+			// Another peer already holds this VPN address.
+			return
+		}
 		if c.OnPeerAdded != nil {
 			c.OnPeerAdded(entry)
 		}
@@ -327,10 +330,12 @@ func (c *Client) handleEvent(ev *coordv1.PeerEvent, myID string) {
 		if !ok {
 			return
 		}
-		c.cfg.PeerTable.Remove(id)
+		// The callback still needs the entry (its routes), so remove it
+		// from the table afterwards.
 		if c.OnPeerRemoved != nil {
 			c.OnPeerRemoved(id)
 		}
+		c.cfg.PeerTable.Remove(id)
 
 	case coordv1.EventType_ROUTE_UPDATE:
 		id, ok := hexToID(ev.Peer.Id)

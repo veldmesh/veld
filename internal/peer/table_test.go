@@ -243,3 +243,72 @@ func TestTable_Concurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestTable_IndexSlotsHaveOneOwner(t *testing.T) {
+	tbl := New()
+	a := &Entry{ID: makeID(1), VPNAddr: netip.MustParseAddr("10.0.0.1"), Name: "fileserver"}
+	a.SetEndpoint(netip.MustParseAddrPort("1.1.1.1:1000"))
+	if !tbl.Upsert(a) {
+		t.Fatal("Upsert a")
+	}
+
+	// Same VPN address, different peer: refused.
+	if tbl.Upsert(&Entry{ID: makeID(2), VPNAddr: a.VPNAddr}) {
+		t.Error("Upsert accepted a second peer for 10.0.0.1")
+	}
+	if e, _ := tbl.LookupByVPN(a.VPNAddr); e != a {
+		t.Error("10.0.0.1 no longer maps to a")
+	}
+
+	// Another peer claiming a's name (any case) and endpoint gets neither.
+	m := &Entry{ID: makeID(3), VPNAddr: netip.MustParseAddr("10.0.0.3"), Name: "FileServer"}
+	m.SetEndpoint(a.GetEndpoint())
+	if !tbl.Upsert(m) {
+		t.Fatal("Upsert m")
+	}
+	if e, _ := tbl.LookupByName("fileserver"); e != a {
+		t.Error("name taken over by another peer")
+	}
+	if e, _ := tbl.LookupByEndpoint(a.GetEndpoint()); e != a {
+		t.Error("endpoint taken over by an Upsert")
+	}
+	if tbl.UpdateEndpoint(m.ID, a.GetEndpoint()) {
+		t.Error("UpdateEndpoint took another peer's endpoint")
+	}
+
+	// Removing m leaves a's slots alone.
+	tbl.Remove(m.ID)
+	if e, _ := tbl.LookupByName("fileserver"); e != a {
+		t.Error("removing m dropped a's name")
+	}
+	if e, _ := tbl.LookupByEndpoint(a.GetEndpoint()); e != a {
+		t.Error("removing m dropped a's endpoint")
+	}
+}
+
+func TestTable_ClaimEndpoint(t *testing.T) {
+	tbl := New()
+	ep := netip.MustParseAddrPort("1.1.1.1:1000")
+	a := &Entry{ID: makeID(1), VPNAddr: netip.MustParseAddr("10.0.0.1")}
+	a.SetEndpoint(ep)
+	b := &Entry{ID: makeID(2), VPNAddr: netip.MustParseAddr("10.0.0.2")}
+	tbl.Upsert(a)
+	tbl.Upsert(b)
+
+	// An authenticated handshake from ep moves it to b.
+	if !tbl.ClaimEndpoint(b.ID, ep) {
+		t.Fatal("ClaimEndpoint")
+	}
+	if e, _ := tbl.LookupByEndpoint(ep); e != b {
+		t.Error("endpoint not moved to b")
+	}
+	if a.GetEndpoint().IsValid() {
+		t.Error("a still has the endpoint it lost")
+	}
+
+	// a being removed later must not drop b's mapping.
+	tbl.Remove(a.ID)
+	if e, _ := tbl.LookupByEndpoint(ep); e != b {
+		t.Error("removing a dropped b's endpoint")
+	}
+}

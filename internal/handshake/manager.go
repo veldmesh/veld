@@ -234,7 +234,7 @@ func (m *Manager) handleInit(noiseMsg []byte, addr net.Addr) {
 
 	// Record the initiator's actual source address.
 	if ep, ok := addrToAddrPort(addr); ok {
-		m.peers.UpdateEndpoint(peerID, ep)
+		m.peers.ClaimEndpoint(peerID, ep)
 	}
 
 	// Store the new session as pending. It will be promoted to active when

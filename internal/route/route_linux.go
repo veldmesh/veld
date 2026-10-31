@@ -41,7 +41,7 @@ func New() Manager {
 }
 
 func newLinuxManager(h routeHandle) *linuxManager {
-	return &linuxManager{routes: make(map[netip.Prefix]struct{}), h: h}
+	return &linuxManager{routes: make(map[netip.Prefix]netip.Addr), h: h}
 }
 
 // EnableIPForward writes "1" to /proc/sys/net/ipv4/ip_forward.
@@ -52,7 +52,7 @@ func EnableIPForward() error {
 
 type linuxManager struct {
 	mu     sync.Mutex
-	routes map[netip.Prefix]struct{}
+	routes map[netip.Prefix]netip.Addr // installed prefix -> gateway
 	h      routeHandle
 }
 
@@ -72,14 +72,22 @@ func (m *linuxManager) Add(prefix netip.Prefix, via netip.Addr) error {
 	}
 
 	m.mu.Lock()
-	m.routes[prefix] = struct{}{}
+	m.routes[prefix] = via
 	m.mu.Unlock()
 	return nil
 }
 
 func (m *linuxManager) Remove(prefix netip.Prefix) error {
+	m.mu.Lock()
+	via, ok := m.routes[prefix]
+	m.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	// Match the gateway too, so a route someone else installed for the same
+	// prefix after ours (a VPN reconnecting) is left alone.
 	dst := prefixToIPNet(prefix)
-	if err := m.h.RouteDel(&netlink.Route{Dst: dst}); err != nil && !isNotExist(err) {
+	if err := m.h.RouteDel(&netlink.Route{Dst: dst, Gw: net.IP(via.AsSlice())}); err != nil && !isNotExist(err) {
 		return fmt.Errorf("route del %s: %w", prefix, err)
 	}
 

@@ -269,7 +269,7 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 		if plain == nil {
 			return
 		}
-		if !sourceAllowed(entry, plain) {
+		if !d.sourceAllowed(entry, plain) {
 			// Authenticated as this peer but claims another source address:
 			// drop it, so no peer can speak for another inside the tunnel.
 			return
@@ -393,8 +393,10 @@ func extractSrcIP(pkt []byte) (netip.Addr, bool) {
 // sourceAllowed reports whether a decrypted packet from entry carries a source
 // address that peer owns: its VPN address or an address inside one of the
 // subnet routes it advertises. Anything else (another peer's address, an
-// unparsable packet) is dropped.
-func sourceAllowed(entry *peer.Entry, pkt []byte) bool {
+// unparsable packet) is dropped. A subnet route never vouches for an address
+// in the mesh or for another peer's address, so advertising a broad route
+// does not let a peer speak for others.
+func (d *Dispatcher) sourceAllowed(entry *peer.Entry, pkt []byte) bool {
 	src, ok := extractSrcIP(pkt)
 	if !ok {
 		return false
@@ -402,6 +404,15 @@ func sourceAllowed(entry *peer.Entry, pkt []byte) bool {
 	src = src.Unmap()
 	if src == entry.VPNAddr {
 		return true
+	}
+	d.tunMu.RLock()
+	t := d.tun
+	d.tunMu.RUnlock()
+	if t != nil && t.Addr().Masked().Contains(src) {
+		return false
+	}
+	if owner, ok := d.peers.LookupByVPN(src); ok && owner != entry {
+		return false
 	}
 	for _, p := range entry.SubnetRoutes {
 		if p.Contains(src) {

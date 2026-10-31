@@ -161,3 +161,30 @@ func TestCloseRemovesAllAddedRoutes(t *testing.T) {
 // errFakeKernel simulates a netlink failure (e.g. EPERM without
 // CAP_NET_ADMIN, or a route collision the kernel rejects).
 var errFakeKernel = errors.New("netlink: operation not permitted")
+
+// TestRemoveMatchesGateway checks that Remove deletes only veld's own route:
+// another route for the same prefix (a VPN that reconnected after veld) must
+// not be removed by a delete that matches on destination alone.
+func TestRemoveMatchesGateway(t *testing.T) {
+	h := &recordingHandle{}
+	m := newLinuxManager(h)
+	pfx := netip.MustParsePrefix("192.168.50.0/24")
+	via := netip.MustParseAddr("10.0.0.2")
+	if err := m.Add(pfx, via); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Remove(pfx); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.deleted) != 1 || !h.deleted[0].Gw.Equal(net.IP(via.AsSlice())) {
+		t.Fatalf("Remove: got %+v, want one delete via %s", h.deleted, via)
+	}
+
+	// A prefix veld never installed is left alone.
+	if err := m.Remove(netip.MustParsePrefix("192.168.51.0/24")); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.deleted) != 1 {
+		t.Errorf("Remove of an unknown prefix issued a delete")
+	}
+}
