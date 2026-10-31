@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -186,5 +187,31 @@ func TestRemoveMatchesGateway(t *testing.T) {
 	}
 	if len(h.deleted) != 1 {
 		t.Errorf("Remove of an unknown prefix issued a delete")
+	}
+}
+
+func TestEnableIPForwardRestores(t *testing.T) {
+	path := t.TempDir() + "/ip_forward"
+	old := ipForwardPath
+	ipForwardPath = path
+	defer func() { ipForwardPath = old }()
+
+	for _, prev := range []string{"0\n", "1\n"} {
+		if err := os.WriteFile(path, []byte(prev), 0644); err != nil {
+			t.Fatal(err)
+		}
+		restore, err := EnableIPForward()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := os.ReadFile(path); string(b) != "1\n" {
+			t.Errorf("prev %q: forwarding not enabled: %q", prev, b)
+		}
+		if err := restore(); err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := os.ReadFile(path); string(b) != prev {
+			t.Errorf("restore: got %q, want %q", b, prev)
+		}
 	}
 }

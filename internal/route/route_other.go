@@ -11,7 +11,9 @@ import "net/netip"
 func New() Manager { return &noopManager{} }
 
 // EnableIPForward is a no-op on non-Linux platforms.
-func EnableIPForward() error { return nil }
+func EnableIPForward() (restore func() error, err error) {
+	return func() error { return nil }, nil
+}
 
 type noopManager struct{}
 

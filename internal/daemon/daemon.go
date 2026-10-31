@@ -45,6 +45,8 @@ type Daemon struct {
 	dnsSrv    *dns.Resolver
 	mdnsDisco *mdns.Discovery
 	routeMgr  route.Manager
+	// restoreIPForward puts IP forwarding back as it was before startup.
+	restoreIPForward func() error
 	ipcSrv    *IPCServer
 	peerTbl   *peer.Table
 	localID   *crypto.Identity
@@ -191,8 +193,12 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 
 	// If this node advertises subnet routes, enable IP forwarding on Linux.
 	if len(cfg.Node.SubnetRoutes) > 0 {
-		if err := route.EnableIPForward(); err != nil {
+		restore, err := route.EnableIPForward()
+		if err != nil {
 			fmt.Printf("warning: enable ip_forward: %v\n", err)
+		} else {
+			fmt.Printf("enabled IPv4 forwarding for subnet routes %v (restored on exit)\n", cfg.Node.SubnetRoutes)
+			d.restoreIPForward = restore
 		}
 	}
 
@@ -692,6 +698,9 @@ func (d *Daemon) Stop() {
 	}
 	if d.routeMgr != nil {
 		_ = d.routeMgr.Close()
+	}
+	if d.restoreIPForward != nil {
+		_ = d.restoreIPForward()
 	}
 	if d.ipcSrv != nil {
 		d.ipcSrv.Stop()
