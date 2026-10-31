@@ -13,8 +13,11 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 
 	coordce "github.com/veldmesh/veld/coord/ce"
 	coordcore "github.com/veldmesh/veld/coord/core"
@@ -30,6 +33,8 @@ func main() {
 	networkName := flag.String("network-name", "default", "name for auto-created network")
 	tokenStr := flag.String("token", "", "auth token to pre-register (prefer -token-file or $VELD_COORD_TOKEN: flags are visible in the process list)")
 	tokenFile := flag.String("token-file", "", "file holding the auth token to pre-register")
+	tlsCert := flag.String("tls-cert", "", "TLS certificate file (PEM); serve gRPC over TLS with -tls-key")
+	tlsKey := flag.String("tls-key", "", "TLS private key file (PEM)")
 	peerTTL := flag.Duration("peer-ttl", coordserver.DefaultPeerTTL,
 		"peer registration TTL; peers not seen for this long are pruned (0 disables the sweep)")
 	sweepInterval := flag.Duration("sweep-interval", coordserver.DefaultSweepInterval,
@@ -94,10 +99,29 @@ func main() {
 	}
 
 	rl := coordserver.NewIPRateLimiter(20, 40)
-	grpcSrv := grpc.NewServer(
+	opts := []grpc.ServerOption{
 		grpc.ChainUnaryInterceptor(coordserver.UnaryRateLimitInterceptor(rl)),
 		grpc.ChainStreamInterceptor(coordserver.StreamRateLimitInterceptor(rl)),
-	)
+		// Bound what one connection can hold open: Watch streams are
+		// long-lived, and the rate limit only gates their start.
+		grpc.MaxConcurrentStreams(64),
+		grpc.KeepaliveParams(keepalive.ServerParameters{MaxConnectionIdle: 15 * time.Minute}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 20 * time.Second, PermitWithoutStream: true}),
+	}
+	switch {
+	case *tlsCert != "" && *tlsKey != "":
+		creds, err := credentials.NewServerTLSFromFile(*tlsCert, *tlsKey)
+		if err != nil {
+			log.Fatalf("tls: %v", err)
+		}
+		opts = append(opts, grpc.Creds(creds))
+	case *tlsCert != "" || *tlsKey != "":
+		log.Fatalf("-tls-cert and -tls-key must be set together")
+	default:
+		// The token and every peer's keys and endpoints cross this link.
+		log.Printf("warning: serving plaintext gRPC: use -tls-cert/-tls-key or a TLS-terminating proxy in front")
+	}
+	grpcSrv := grpc.NewServer(opts...)
 	coordv1.RegisterCoordServer(grpcSrv, srv)
 
 	log.Printf("veld-coord listening on %s", *listenAddr)
