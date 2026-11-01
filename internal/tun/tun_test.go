@@ -161,7 +161,7 @@ func TestMemTUN_Read_Unblocks_OnClose(t *testing.T) {
 }
 
 func TestCreateTUN_PlatformBehavior(t *testing.T) {
-	_, err := tun.CreateTUN("tuntst0", mustPrefix(t, "10.100.99.1/24"), 1420)
+	_, err := tun.CreateTUN("tuntst0", mustPrefix(t, "10.100.99.1/24"), 1420, false)
 	if err == nil {
 		t.Log("CreateTUN succeeded (Linux + root); this is expected only in privileged environments")
 	}

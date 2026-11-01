@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Veld Authors.
 // SPDX-License-Identifier: MIT
-//go:build !linux || !darwin || !windows || userspace
+//go:build userspace
 
 package tun
 
@@ -27,11 +27,11 @@ type NetstackTUN struct {
 	closed   bool
 }
 
-// CreateNetstackTUN creates a userspace TUN device backed by gVisor netstack.
+// createNetstackTUN creates a userspace TUN device backed by gVisor netstack.
 // It does not require root, CAP_NET_ADMIN, or a TUN device.
 // The addr parameter specifies the VPN address and prefix (e.g., "10.100.0.1/24").
 // The netstack will be configured with this address and default routes.
-func CreateNetstackTUN(name string, addr netip.Prefix, mtu int) (TUN, error) {
+func createNetstackTUN(name string, addr netip.Prefix, mtu int) (TUN, error) {
 	if mtu <= 0 {
 		mtu = 1420
 	}
@@ -62,6 +62,12 @@ func CreateNetstackTUN(name string, addr netip.Prefix, mtu int) (TUN, error) {
 		addr:     addr,
 		mtu:      mtu,
 	}, nil
+}
+
+// CreateNetstackTUN is the exported version of createNetstackTUN for use in tests
+// and external callers that have the userspace build tag.
+func CreateNetstackTUN(name string, addr netip.Prefix, mtu int) (TUN, error) {
+	return createNetstackTUN(name, addr, mtu)
 }
 
 // Read reads an outbound IP packet from the netstack.
@@ -135,7 +141,8 @@ func (t *NetstackTUN) Dial(network, address string) (net.Conn, error) {
 }
 
 // ListenTCP listens for incoming TCP connections on the VPN address.
-func (t *NetstackTUN) ListenTCP(addr *net.TCPAddr) (*wgnetstack.GoNetTCPListener, error) {
+// Returns a gVisor netstack TCP listener (implements net.Listener).
+func (t *NetstackTUN) ListenTCP(addr *net.TCPAddr) (net.Listener, error) {
 	if t.netstack == nil {
 		return nil, errors.New("netstack not initialized")
 	}
@@ -143,7 +150,8 @@ func (t *NetstackTUN) ListenTCP(addr *net.TCPAddr) (*wgnetstack.GoNetTCPListener
 }
 
 // ListenTCPAddrPort listens for incoming TCP connections on the VPN address.
-func (t *NetstackTUN) ListenTCPAddrPort(addr netip.AddrPort) (*wgnetstack.GoNetTCPListener, error) {
+// Returns a gVisor netstack TCP listener (implements net.Listener).
+func (t *NetstackTUN) ListenTCPAddrPort(addr netip.AddrPort) (net.Listener, error) {
 	if t.netstack == nil {
 		return nil, errors.New("netstack not initialized")
 	}
@@ -151,7 +159,8 @@ func (t *NetstackTUN) ListenTCPAddrPort(addr netip.AddrPort) (*wgnetstack.GoNetT
 }
 
 // ListenUDP listens for incoming UDP packets on the VPN address.
-func (t *NetstackTUN) ListenUDP(laddr *net.UDPAddr) (*wgnetstack.GoNetUDPConn, error) {
+// Returns a gVisor netstack UDP connection (implements net.PacketConn).
+func (t *NetstackTUN) ListenUDP(laddr *net.UDPAddr) (net.PacketConn, error) {
 	if t.netstack == nil {
 		return nil, errors.New("netstack not initialized")
 	}
@@ -159,7 +168,8 @@ func (t *NetstackTUN) ListenUDP(laddr *net.UDPAddr) (*wgnetstack.GoNetUDPConn, e
 }
 
 // ListenUDPAddrPort listens for incoming UDP packets on the VPN address.
-func (t *NetstackTUN) ListenUDPAddrPort(laddr netip.AddrPort) (*wgnetstack.GoNetUDPConn, error) {
+// Returns a gVisor netstack UDP connection (implements net.PacketConn).
+func (t *NetstackTUN) ListenUDPAddrPort(laddr netip.AddrPort) (net.PacketConn, error) {
 	if t.netstack == nil {
 		return nil, errors.New("netstack not initialized")
 	}

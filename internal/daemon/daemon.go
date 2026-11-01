@@ -124,7 +124,7 @@ func resolveTunMTU(cfg *intconfig.Config) int {
 }
 
 // NewFromConfig creates a Daemon with real OS TUN and UDP socket.
-// Requires CAP_NET_ADMIN on Linux.
+// Requires CAP_NET_ADMIN on Linux unless userspace mode is enabled.
 func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	localID, err := intconfig.LoadOrGenerate(cfg.Node.IdentityPath)
 	if err != nil {
@@ -159,7 +159,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	if cfg.Coord.Addr == "" {
 		if vpnPrefix.IsValid() {
 			ifaceName := resolveIfaceName(fmt.Printf, cfg.Node.IfaceName)
-			tunDev, err = createTUN(ifaceName, vpnPrefix, resolveTunMTU(cfg))
+			tunDev, err = createTUN(ifaceName, vpnPrefix, resolveTunMTU(cfg), cfg.Node.Userspace)
 			if err != nil {
 				return nil, fmt.Errorf("create tun: %w", err)
 			}
@@ -187,25 +187,32 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	d := New(localID, networkID, tunDev, conn, peerTbl)
 	d.routeMgr = route.New()
 
-	// Commercial VPN coexistence: detect VPN tunnels and routing conflicts
-	// at startup and log actionable guidance (kill switches, split tunneling,
-	// CIDR overlaps). Detection never blocks startup.
-	coexist.Report(fmt.Printf, d.selfInterface(), vpnPrefix)
+	// In userspace mode, skip OS-level operations: no routes, no IP forwarding,
+	// no coexistence checks, no mDNS (needs a real interface).
+	userspace := cfg.Node.Userspace
 
-	// If this node advertises subnet routes, enable IP forwarding on Linux.
-	if len(cfg.Node.SubnetRoutes) > 0 {
-		restore, err := route.EnableIPForward()
-		if err != nil {
-			fmt.Printf("warning: enable ip_forward: %v\n", err)
-		} else {
-			fmt.Printf("enabled IPv4 forwarding for subnet routes %v (restored on exit)\n", cfg.Node.SubnetRoutes)
-			d.restoreIPForward = restore
+	if !userspace {
+		// Commercial VPN coexistence: detect VPN tunnels and routing conflicts
+		// at startup and log actionable guidance (kill switches, split tunneling,
+		// CIDR overlaps). Detection never blocks startup.
+		coexist.Report(fmt.Printf, d.selfInterface(), vpnPrefix)
+
+		// If this node advertises subnet routes, enable IP forwarding on Linux.
+		if len(cfg.Node.SubnetRoutes) > 0 {
+			restore, err := route.EnableIPForward()
+			if err != nil {
+				fmt.Printf("warning: enable ip_forward: %v\n", err)
+			} else {
+				fmt.Printf("enabled IPv4 forwarding for subnet routes %v (restored on exit)\n", cfg.Node.SubnetRoutes)
+				d.restoreIPForward = restore
+			}
 		}
 	}
 
 	// In static mode, install OS routes for any subnet routes declared in the
 	// static peer config. These are installed once at startup; they're removed by Stop().
-	if cfg.Coord.Addr == "" {
+	// Skip in userspace mode: no OS routes.
+	if cfg.Coord.Addr == "" && !userspace {
 		for _, e := range peerTbl.List() {
 			d.addPeerRoutes(e)
 		}
@@ -334,7 +341,10 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 
 		d.coordCli.OnPeerAdded = func(e *peer.Entry) {
 			// Install OS routes for any subnets this peer advertises.
-			d.addPeerRoutes(e)
+			// Skip in userspace mode: no OS routes.
+			if !userspace {
+				d.addPeerRoutes(e)
+			}
 			// Try handshake immediately if the peer advertised an endpoint.
 			if e.GetEndpoint().IsValid() {
 				d.hsMgr.Initiate(e)
@@ -351,10 +361,13 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 
 		d.coordCli.OnPeerRemoved = func(id [32]byte) {
 			// Remove OS routes that were installed for this peer's subnets.
-			if e, ok := peerTbl.LookupByID(id); ok {
-				for _, pfx := range e.SubnetRoutes {
-					if err := d.routeMgr.Remove(pfx); err != nil {
-						fmt.Printf("warning: remove route %s: %v\n", pfx, err)
+			// Skip in userspace mode: no OS routes.
+			if !userspace {
+				if e, ok := peerTbl.LookupByID(id); ok {
+					for _, pfx := range e.SubnetRoutes {
+						if err := d.routeMgr.Remove(pfx); err != nil {
+							fmt.Printf("warning: remove route %s: %v\n", pfx, err)
+						}
 					}
 				}
 			}
@@ -373,7 +386,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 
 		// When the coordinator assigns a VPN address, create the TUN so the
 		// data plane comes up. Extracted for direct testability.
-		d.coordCli.OnVPNAddrAssigned = d.onVPNAddrAssigned(cfg, conn)
+		d.coordCli.OnVPNAddrAssigned = d.onVPNAddrAssigned(cfg, conn, userspace)
 	}
 
 	// Wire up IPC server
@@ -404,7 +417,8 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	// mDNS needs a VPN address; in coord mode the address arrives after
 	// registration, so discovery is wired there instead (see
 	// onVPNAddrAssigned).
-	if vpnPrefix.IsValid() {
+	// Skip mDNS in userspace mode: it requires a real network interface.
+	if vpnPrefix.IsValid() && !userspace {
 		disc, err := d.newMDNSDiscovery(cfg, conn, vpnPrefix.Addr())
 		if err != nil {
 			fmt.Printf("warning: mDNS discovery failed to initialize: %v\n", err)
@@ -455,7 +469,7 @@ func (d *Daemon) newMDNSDiscovery(cfg *intconfig.Config, conn net.PacketConn, vp
 // address is a no-op. TUN creation failure is non-fatal: the daemon keeps
 // running without a data plane and still reports the assigned address in
 // its status.
-func (d *Daemon) onVPNAddrAssigned(cfg *intconfig.Config, conn net.PacketConn) func(vpnAddr netip.Addr, networkCIDR string) {
+func (d *Daemon) onVPNAddrAssigned(cfg *intconfig.Config, conn net.PacketConn, userspace bool) func(vpnAddr netip.Addr, networkCIDR string) {
 	return func(vpnAddr netip.Addr, networkCIDR string) {
 		// Same address and TUN already up: nothing to do.
 		d.mu.Lock()
@@ -471,7 +485,7 @@ func (d *Daemon) onVPNAddrAssigned(cfg *intconfig.Config, conn net.PacketConn) f
 		// Create the new TUN first. If creation fails, keep the old TUN
 		// running (the old address keeps working until the next re-registration).
 		ifaceName := resolveIfaceName(fmt.Printf, cfg.Node.IfaceName)
-		newTun, err := createTUN(ifaceName, prefix, resolveTunMTU(cfg))
+		newTun, err := createTUN(ifaceName, prefix, resolveTunMTU(cfg), userspace)
 		if err != nil {
 			log.Printf("warning: failed to create TUN in coord mode: %v (data plane disabled)", err)
 			if existing != nil {
@@ -511,13 +525,16 @@ func (d *Daemon) onVPNAddrAssigned(cfg *intconfig.Config, conn net.PacketConn) f
 		// Now that we have a VPN address, start mDNS LAN discovery: it was
 		// not wired at construction time since coord mode has no address
 		// until registration completes.
-		if disc, err := d.newMDNSDiscovery(cfg, conn, vpnAddr); err != nil {
-			log.Printf("warning: mDNS discovery failed to initialize: %v", err)
-		} else if disc != nil {
-			d.mu.Lock()
-			d.mdnsDisco = disc
-			d.mu.Unlock()
-			disc.Start()
+		// Skip mDNS in userspace mode: it requires a real network interface.
+		if !userspace {
+			if disc, err := d.newMDNSDiscovery(cfg, conn, vpnAddr); err != nil {
+				log.Printf("warning: mDNS discovery failed to initialize: %v", err)
+			} else if disc != nil {
+				d.mu.Lock()
+				d.mdnsDisco = disc
+				d.mu.Unlock()
+				disc.Start()
+			}
 		}
 
 		// Update IPC status now that we have a VPN address.

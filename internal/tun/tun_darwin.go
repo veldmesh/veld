@@ -25,9 +25,9 @@ type darwinTUN struct {
 // "utun" prefix and reads the real name back after creation.
 func DefaultIfaceName() string { return "utun" }
 
-// CreateTUN creates a macOS utun device, assigns ip to it, and brings it up.
+// createTUN creates a macOS utun device, assigns ip to it, and brings it up.
 // Requires root or an entitlement that allows virtual network interface creation.
-func CreateTUN(name string, ip netip.Prefix, mtu int) (TUN, error) {
+func createTUN(name string, ip netip.Prefix, mtu int) (TUN, error) {
 	dev, err := wgtun.CreateTUN(name, mtu)
 	if err != nil {
 		return nil, fmt.Errorf("tun create %s: %w", name, err)

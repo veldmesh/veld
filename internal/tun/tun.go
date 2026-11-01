@@ -21,6 +21,17 @@ type TUN interface {
 // ErrClosed is returned by Read/Write after Close is called.
 var ErrClosed = errors.New("tun: device closed")
 
+// CreateTUN creates a TUN device. If userspace is true, it creates a userspace
+// netstack TUN (no root, no TUN device, no OS routes). Otherwise it creates
+// a kernel TUN device (requires CAP_NET_ADMIN on Linux, root on macOS,
+// administrator on Windows).
+func CreateTUN(name string, addr netip.Prefix, mtu int, userspace bool) (TUN, error) {
+	if userspace {
+		return createNetstackTUN(name, addr, mtu)
+	}
+	return createTUN(name, addr, mtu)
+}
+
 // MemTUN is an in-memory TUN device for testing.
 //
 // It separates the two directions of packet flow so dispatcher goroutines

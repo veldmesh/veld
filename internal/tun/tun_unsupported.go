@@ -16,7 +16,7 @@ var errUnsupported = errors.New("tun: CreateTUN not supported on this OS (suppor
 // handling uniform across builds.
 func DefaultIfaceName() string { return "veld0" }
 
-// CreateTUN is not implemented on this platform.
-func CreateTUN(_ string, _ netip.Prefix, _ int) (TUN, error) {
+// createTUN is not implemented on this platform.
+func createTUN(_ string, _ netip.Prefix, _ int) (TUN, error) {
 	return nil, errUnsupported
 }
