@@ -4,12 +4,14 @@
 // veld-tray — system tray status indicator for the Veld VPN daemon.
 //
 // Platforms:
-//   Linux   requires libayatana-appindicator3 or libgtk-3 (CGO)
-//   macOS   native AppKit via CGO
-//   Windows native Win32 via CGO
+//
+//	Linux   requires libayatana-appindicator3 or libgtk-3 (CGO)
+//	macOS   native AppKit via CGO
+//	Windows native Win32 via CGO
 //
 // Build:
-//   go build -o veld-tray .
+//
+//	go build -o veld-tray .
 //
 // The binary communicates with veld-daemon over its local Unix socket IPC.
 // No coord server connection is required.

@@ -839,3 +839,38 @@ func TestAdvertisedEndpoint(t *testing.T) {
 		}
 	}
 }
+
+func TestAdvertisedPeerName(t *testing.T) {
+	long := strings.Repeat("a", peerNameMaxLen+10)
+	longHyphenAtCut := strings.Repeat("a", peerNameMaxLen-1) + "-b"
+
+	tests := []struct {
+		name       string
+		configured string
+		hostname   string
+		want       string
+	}{
+		{"configured wins over hostname", "lab-box", "gateway", "lab-box"},
+		{"empty configured uses hostname", "", "gateway", "gateway"},
+		{"uppercase is lowercased", "Lab-Box", "", "lab-box"},
+		{"dots and underscores become hyphens", "", "box.local_net", "box-local-net"},
+		{"invalid runs are kept as hyphens", "a b", "", "a-b"},
+		{"leading and trailing invalid chars trimmed", "__edge__", "", "edge"},
+		{"all invalid falls back to node", "!!!", "", "node"},
+		{"nothing configured and no hostname falls back to node", "", "", "node"},
+		{"long name truncated to label length", long, "", strings.Repeat("a", peerNameMaxLen)},
+		{"hyphen exposed by truncation is trimmed", longHyphenAtCut, "", strings.Repeat("a", peerNameMaxLen-1)},
+		{"each non-ascii byte becomes a hyphen", "héllo", "", "h--llo"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := advertisedPeerName(tt.configured, tt.hostname)
+			if got != tt.want {
+				t.Errorf("advertisedPeerName(%q, %q) = %q, want %q", tt.configured, tt.hostname, got, tt.want)
+			}
+			if len(got) > peerNameMaxLen {
+				t.Errorf("advertisedPeerName(%q, %q) = %q, longer than %d", tt.configured, tt.hostname, got, peerNameMaxLen)
+			}
+		})
+	}
+}

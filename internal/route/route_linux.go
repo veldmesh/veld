@@ -17,10 +17,10 @@ import (
 
 // DefaultRouteMetric is the metric Veldmesh asks the kernel for on its
 // routes: 0, the value the kernel would use for an unqualified route add,
-// made explicit. It is not a coexistence advantage — order-independence
-// against a VPN claiming the same prefix comes solely from the
-// replace-on-conflict install in Add. (On IPv6 the kernel coerces metric 0
-// to 1024, IP6_RT_PRIO_USER, on install.)
+// made explicit. A VPN route for the same prefix at a higher metric is not
+// displaced; the kernel prefers the lowest metric, so veld's route wins while
+// it is installed. (On IPv6 the kernel coerces metric 0 to 1024,
+// IP6_RT_PRIO_USER, on install.)
 const DefaultRouteMetric = 0
 
 // routeHandle is the netlink write surface used by the manager. The seam
@@ -76,13 +76,13 @@ func (m *linuxManager) Add(prefix netip.Prefix, via netip.Addr) error {
 	dst := prefixToIPNet(prefix)
 	gw := net.IP(via.AsSlice())
 
-	// Replace, not add: if a commercial VPN already installed a route for
-	// this prefix (VPN connected first), veld takes the prefix over; if the
-	// VPN displaced veld's route later (veld connected first), the next
-	// Add — a peer rejoin or daemon restart — heals it. That
-	// replace-on-conflict is what makes the install order-independent.
-	// There is no background route watcher; restart veld if peers become
-	// unreachable after a VPN reconnects.
+	// Replace, not add, so a stale route veld left at the same prefix and
+	// metric is overwritten instead of failing with "file exists". The kernel
+	// matches a replace on prefix, TOS and metric only: a VPN route at another
+	// metric is left in place and outranked by this one, and is still there
+	// after Close. A VPN route at the same metric is displaced, and is not
+	// restored on Close. There is no background route watcher; restart veld if
+	// peers become unreachable after a VPN reconnects.
 	if err := m.h.RouteReplace(&netlink.Route{Dst: dst, Gw: gw, Priority: DefaultRouteMetric}); err != nil {
 		return fmt.Errorf("route replace %s via %s: %w", prefix, via, err)
 	}

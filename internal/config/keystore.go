@@ -17,10 +17,10 @@ import (
 
 // KeystoreFile represents the JSON schema for storing an identity.
 type KeystoreFile struct {
-	Version          int    `json:"version"`
-	Ed25519Private   string `json:"ed25519_private"`
-	X25519Private    string `json:"x25519_private"`
-	X25519PubkeySig  string `json:"x25519_pubkey_sig"`
+	Version         int    `json:"version"`
+	Ed25519Private  string `json:"ed25519_private"`
+	X25519Private   string `json:"x25519_private"`
+	X25519PubkeySig string `json:"x25519_pubkey_sig"`
 }
 
 // LoadOrGenerate loads the identity from path, or generates and saves a new one if the file doesn't exist.

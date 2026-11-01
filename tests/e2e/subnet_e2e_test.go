@@ -14,10 +14,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
-	coordcore "github.com/veldmesh/veld/coord/core"
 	coordce "github.com/veldmesh/veld/coord/ce"
+	coordcore "github.com/veldmesh/veld/coord/core"
 	coordserver "github.com/veldmesh/veld/coord/server"
+	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
 	"github.com/veldmesh/veld/internal/crypto"
 )
 

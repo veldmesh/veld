@@ -237,8 +237,12 @@ func TestServer_Register_ReusesFreedAddressWhenExhausted(t *testing.T) {
 	idX := newRegisterIdentity(t)
 	reqX := newRegisterRequest(idX, "test-net", "test-token", "", "", nil)
 	signRegisterReq(t, idX, reqX)
-	if _, err := srv.Register(context.Background(), reqX); err == nil || !strings.Contains(err.Error(), "exhausted") {
-		t.Fatalf("Register into a full network: got %v, want address space exhausted", err)
+	_, err := srv.Register(context.Background(), reqX)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("Register into a full network: code = %v, want %v (err %v)", status.Code(err), codes.ResourceExhausted, err)
+	}
+	if got := status.Convert(err).Message(); got != "no free addresses in network" {
+		t.Fatalf("Register into a full network: message = %q, want %q", got, "no free addresses in network")
 	}
 
 	// One peer leaves; a new peer gets its address.

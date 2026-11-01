@@ -5,10 +5,11 @@ package dataplane
 import "encoding/binary"
 
 // Wire format for UDP packets:
-//   [4B] packet_type
-//   [4B] sender_index (reserved, 0 for now)
-//   [8B] nonce
-//   [NB] ChaCha20-Poly1305 ciphertext + 16B auth tag
+//
+//	[4B] packet_type
+//	[4B] sender_index (reserved, 0 for now)
+//	[8B] nonce
+//	[NB] ChaCha20-Poly1305 ciphertext + 16B auth tag
 const HeaderSize = 16
 
 const (

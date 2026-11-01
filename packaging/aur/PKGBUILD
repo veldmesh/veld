@@ -12,7 +12,9 @@ conflicts=()
 source_x86_64=("${pkgname}-v${pkgver}-linux_amd64.tar.gz::https://github.com/veldmesh/veld/releases/download/v${pkgver}/${pkgname}-v${pkgver}-linux_amd64.tar.gz")
 source_aarch64=("${pkgname}-v${pkgver}-linux_arm64.tar.gz::https://github.com/veldmesh/veld/releases/download/v${pkgver}/${pkgname}-v${pkgver}-linux_arm64.tar.gz")
 
-# Update with: sha256sum veld-v<version>-linux_{amd64,arm64}.tar.gz
+# Release builds rewrite pkgver, pkgrel and these checksums from the release's
+# checksums.txt via packaging/aur/update-pkgbuild.sh (run by the release
+# workflow, which attaches the result as a release asset). Do not edit by hand.
 sha256sums_x86_64=('SKIP')
 sha256sums_aarch64=('SKIP')
 

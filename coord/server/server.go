@@ -332,6 +332,9 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 			})
 			return nil, status.Errorf(codes.ResourceExhausted, "machine limit reached")
 		}
+		if errors.Is(err, ErrAddressSpaceExhausted) {
+			return nil, status.Errorf(codes.ResourceExhausted, "no free addresses in network")
+		}
 		return nil, status.Errorf(codes.Internal, "register peer: %v", err)
 	}
 

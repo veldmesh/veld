@@ -35,6 +35,8 @@ func main() {
 	tokenFile := flag.String("token-file", "", "file holding the auth token to pre-register")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate file (PEM); serve gRPC over TLS with -tls-key")
 	tlsKey := flag.String("tls-key", "", "TLS private key file (PEM)")
+	proxyProtoFrom := flag.String("proxy-protocol-from", "",
+		"accept PROXY protocol (v1/v2) headers only from these CIDRs, e.g. the load balancer's address; empty disables")
 	peerTTL := flag.Duration("peer-ttl", coordserver.DefaultPeerTTL,
 		"peer registration TTL; peers not seen for this long are pruned (0 disables the sweep)")
 	sweepInterval := flag.Duration("sweep-interval", coordserver.DefaultSweepInterval,
@@ -96,6 +98,14 @@ func main() {
 	ln, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
+	}
+	// Wrap the raw listener so PROXY headers are read before any TLS handshake.
+	ln, err = coordserver.WrapProxyProtocolListener(ln, *proxyProtoFrom)
+	if err != nil {
+		log.Fatalf("-proxy-protocol-from: %v", err)
+	}
+	if *proxyProtoFrom != "" {
+		log.Printf("accepting PROXY protocol headers from %s", *proxyProtoFrom)
 	}
 
 	rl := coordserver.NewIPRateLimiter(20, 40)

@@ -3,8 +3,13 @@
 package handshake
 
 import (
+	"encoding/hex"
+	"encoding/json"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -12,7 +17,6 @@ import (
 	"github.com/veldmesh/veld/internal/crypto"
 	"github.com/veldmesh/veld/internal/peer"
 )
-
 
 // testConn is a minimal net.PacketConn for testing.
 type testConn struct {
@@ -650,6 +654,7 @@ func TestManager_PendingSessionPromotion(t *testing.T) {
 		t.Error("promoted session should be the same as pending session")
 	}
 }
+
 // TestManager_SimultaneousInitiation covers both sides initiating at once (as
 // happens at startup): each ends up with its own initiator session active,
 // and the session it responded to must stay available so the two converge.
@@ -741,5 +746,142 @@ func TestManager_HandleInit_WrongNetworkDropped(t *testing.T) {
 	case <-connB.out:
 		t.Fatal("responder answered an Init for another network")
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// A forged Resp from the peer's address must not cancel the pending
+// handshake: the genuine Resp that follows still establishes the session.
+func TestManager_ForgedRespKeepsHandshake(t *testing.T) {
+	idA, _ := crypto.Generate()
+	idB, _ := crypto.Generate()
+	var netID [16]byte
+
+	tblA := peer.New()
+	entryBinA := makeTestEntry(idB, "10.0.0.2", "2.2.2.2:2000")
+	tblA.Upsert(entryBinA)
+	tblB := peer.New()
+	tblB.Upsert(makeTestEntry(idA, "10.0.0.1", "1.1.1.1:1000"))
+
+	connA, connB := newTestConn(), newTestConn()
+	established := make(chan struct{}, 1)
+	mgrA := New(idA, netID, tblA, connA)
+	mgrA.OnSessionEstablished = func(*peer.Entry) { established <- struct{}{} }
+	mgrB := New(idB, netID, tblB, connB)
+
+	mgrA.Initiate(entryBinA)
+	initPkt := <-connA.out
+	mgrB.HandlePacket(initPkt.data, &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 1000})
+	var respPkt testMsg
+	select {
+	case respPkt = <-connB.out:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for resp packet")
+	}
+
+	addrB := &net.UDPAddr{IP: net.ParseIP("2.2.2.2"), Port: 2000}
+	forged := append([]byte(nil), respPkt.data...)
+	for i := headerSize; i < len(forged); i++ {
+		forged[i] = byte(i)
+	}
+	mgrA.HandlePacket(forged, addrB)
+	if entryBinA.GetSession() != nil {
+		t.Fatal("forged Resp must not establish a session")
+	}
+
+	mgrA.HandlePacket(respPkt.data, addrB)
+	select {
+	case <-established:
+	case <-time.After(time.Second):
+		t.Fatal("genuine Resp after a forged one did not establish the session")
+	}
+
+	// The handshake is complete: replaying the Resp does nothing.
+	mgrA.HandlePacket(respPkt.data, addrB)
+	select {
+	case <-established:
+		t.Error("replayed Resp established a second session")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+// Init timestamps survive a restart: a new manager using the same replay
+// state file rejects an Init the previous one accepted.
+func TestManager_ReplayStateSurvivesRestart(t *testing.T) {
+	idA, _ := crypto.Generate()
+	idB, _ := crypto.Generate()
+	var netID [16]byte
+	path := filepath.Join(t.TempDir(), "handshake-replay.json")
+
+	tblA := peer.New()
+	entryBinA := makeTestEntry(idB, "10.0.0.2", "2.2.2.2:2000")
+	tblA.Upsert(entryBinA)
+	connA := newTestConn()
+	New(idA, netID, tblA, connA).Initiate(entryBinA)
+	initPkt := <-connA.out
+	addrA := &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 1000}
+
+	run := func() (*Manager, *testConn) {
+		tblB := peer.New()
+		tblB.Upsert(makeTestEntry(idA, "10.0.0.1", "1.1.1.1:1000"))
+		connB := newTestConn()
+		mgrB := New(idB, netID, tblB, connB)
+		if err := mgrB.UseReplayState(path); err != nil {
+			t.Fatalf("UseReplayState: %v", err)
+		}
+		return mgrB, connB
+	}
+
+	mgr1, conn1 := run()
+	mgr1.HandlePacket(initPkt.data, addrA)
+	select {
+	case <-conn1.out:
+	case <-time.After(time.Second):
+		t.Fatal("first Init was not answered")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("replay state not saved: %v", err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
+		t.Errorf("replay state mode = %o, want 600", info.Mode().Perm())
+	}
+
+	mgr2, conn2 := run()
+	mgr2.HandlePacket(initPkt.data, addrA)
+	select {
+	case <-conn2.out:
+		t.Fatal("Init replayed after a restart was answered")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestManager_UseReplayState_DropsOldAndDamaged(t *testing.T) {
+	dir := t.TempDir()
+	var fresh, old [32]byte
+	fresh[0], old[0] = 1, 2
+	now := time.Now().UnixNano()
+	data, _ := json.Marshal(replayFile{Version: 1, Peers: map[string]int64{
+		hex.EncodeToString(fresh[:]): now,
+		hex.EncodeToString(old[:]):   now - int64(time.Hour),
+		"not-hex":                    now,
+	}})
+	path := filepath.Join(dir, "replay.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := New(nil, [16]byte{}, peer.New(), newTestConn())
+	if err := m.UseReplayState(path); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.initTimestamps) != 1 || m.initTimestamps[fresh] != now {
+		t.Errorf("loaded %v, want only the fresh entry", m.initTimestamps)
+	}
+
+	damaged := filepath.Join(dir, "damaged.json")
+	if err := os.WriteFile(damaged, []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := New(nil, [16]byte{}, peer.New(), newTestConn()).UseReplayState(damaged); err != nil {
+		t.Errorf("damaged file should not be fatal: %v", err)
 	}
 }

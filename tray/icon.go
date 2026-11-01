@@ -19,7 +19,7 @@ var (
 )
 
 func init() {
-	iconConnected = makeCircleIcon(color.RGBA{R: 52, G: 199, B: 89, A: 255})    // green
+	iconConnected = makeCircleIcon(color.RGBA{R: 52, G: 199, B: 89, A: 255})      // green
 	iconDisconnected = makeCircleIcon(color.RGBA{R: 142, G: 142, B: 147, A: 255}) // gray
 }
 

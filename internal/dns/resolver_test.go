@@ -161,9 +161,9 @@ func buildQuery(id uint16, qname string, qtype uint16) []byte {
 		buf = append(buf, byte(len(label)))
 		buf = append(buf, label...)
 	}
-	buf = append(buf, 0)                        // root label
+	buf = append(buf, 0)                           // root label
 	buf = append(buf, byte(qtype>>8), byte(qtype)) // QTYPE
-	buf = append(buf, 0x00, 0x01)              // QCLASS=IN
+	buf = append(buf, 0x00, 0x01)                  // QCLASS=IN
 	return buf
 }
 

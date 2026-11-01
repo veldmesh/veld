@@ -206,7 +206,7 @@ func TestParseSTUNResponse_NoAttribute(t *testing.T) {
 	// Valid header with msgLen=0 and no attributes
 	pkt := make([]byte, 20)
 	binary.BigEndian.PutUint16(pkt[0:2], 0x0101) // Binding Response
-	binary.BigEndian.PutUint16(pkt[2:4], 0)       // msgLen = 0
+	binary.BigEndian.PutUint16(pkt[2:4], 0)      // msgLen = 0
 	binary.BigEndian.PutUint32(pkt[4:8], stunMagicCookie)
 	copy(pkt[8:20], txID[:])
 

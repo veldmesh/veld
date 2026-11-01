@@ -45,7 +45,7 @@ func QuerySTUN(ctx context.Context, stunAddr string) (netip.AddrPort, error) {
 	// Build STUN Binding Request (20-byte header, no attributes)
 	var req [20]byte
 	binary.BigEndian.PutUint16(req[0:2], 0x0001) // Binding Request
-	binary.BigEndian.PutUint16(req[2:4], 0)       // Message Length: 0
+	binary.BigEndian.PutUint16(req[2:4], 0)      // Message Length: 0
 	binary.BigEndian.PutUint32(req[4:8], stunMagicCookie)
 	var txID [12]byte
 	rand.Read(txID[:])
