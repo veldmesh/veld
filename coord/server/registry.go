@@ -36,13 +36,14 @@ var (
 
 // networkRecord is the on-disk representation of a network.
 type networkRecord struct {
-	ID           string `json:"id"`
-	CIDR         string `json:"cidr"`
-	Name         string `json:"name"`
-	AccountID    string `json:"account_id"`
-	NextIP       string `json:"next_ip"` // next IP to assign (e.g. "10.0.0.2")
-	MachineCount int    `json:"machine_count"`
-	CreatedAt    int64  `json:"created_at"`
+	ID            string           `json:"id"`
+	CIDR          string           `json:"cidr"`
+	Name          string           `json:"name"`
+	AccountID     string           `json:"account_id"`
+	NextIP        string           `json:"next_ip"` // next IP to assign (e.g. "10.0.0.2")
+	MachineCount  int              `json:"machine_count"`
+	CreatedAt     int64            `json:"created_at"`
+	AssignedAddrs map[string]int64 `json:"assigned_addrs"` // VPN addr -> last freed timestamp (0 = currently assigned)
 }
 
 // peerRecord is the on-disk representation of a peer.
@@ -179,13 +180,14 @@ func (r *Registry) CreateNetwork(net coordcore.Network, accountID string) error 
 		// First assignable IP is network address + 1 (skip network address itself)
 		firstIP := nextIPAfterNetwork(net.CIDR)
 		rec := networkRecord{
-			ID:           net.ID,
-			CIDR:         net.CIDR.String(),
-			Name:         net.Name,
-			AccountID:    accountID,
-			NextIP:       firstIP.String(),
-			MachineCount: 0,
-			CreatedAt:    time.Now().Unix(),
+			ID:            net.ID,
+			CIDR:          net.CIDR.String(),
+			Name:          net.Name,
+			AccountID:     accountID,
+			NextIP:        firstIP.String(),
+			MachineCount:  0,
+			CreatedAt:     time.Now().Unix(),
+			AssignedAddrs: make(map[string]int64),
 		}
 		data, err := json.Marshal(rec)
 		if err != nil {
@@ -316,7 +318,7 @@ func (r *Registry) RegisterPeer(p peerRecord, networkID string, maxMachines int)
 			return nil
 		}
 
-		// New peer: check limit, assign next IP, increment machine count — all atomic.
+		// New peer: check limit, assign IP, increment machine count — all atomic.
 		nb := tx.Bucket(bucketNetworks)
 		netData := nb.Get([]byte(networkID))
 		if netData == nil {
@@ -331,25 +333,85 @@ func (r *Registry) RegisterPeer(p peerRecord, networkID string, maxMachines int)
 			return ErrMachineLimit
 		}
 
-		ip, err := netip.ParseAddr(netRec.NextIP)
-		if err != nil {
-			return fmt.Errorf("parse next_ip: %w", err)
+		// Backward compatibility: if AssignedAddrs is nil (old DB), initialize it
+		// and populate with currently assigned peers' addresses as "currently assigned" (timestamp 0).
+		if netRec.AssignedAddrs == nil {
+			netRec.AssignedAddrs = make(map[string]int64)
+			_ = pb.ForEach(func(_, v []byte) error {
+				var rec peerRecord
+				if json.Unmarshal(v, &rec) == nil && rec.NetworkID == networkID {
+					if a, err := netip.ParseAddr(rec.VPNAddr); err == nil {
+						netRec.AssignedAddrs[a.String()] = 0
+					}
+				}
+				return nil
+			})
 		}
 
-		// Hand out never-used addresses first, then reuse addresses freed
-		// by peers that left. The last address in the CIDR (broadcast) is
-		// never assigned.
 		cidr, _ := netip.ParsePrefix(netRec.CIDR)
-		if next := ip.Next(); cidr.Contains(next) {
-			assigned = ip
-			netRec.NextIP = next.String()
-		} else {
-			free, ok := freeAddr(pb, networkID, cidr)
-			if !ok {
-				return fmt.Errorf("network %q: %w", networkID, ErrAddressSpaceExhausted)
+
+		// Build set of currently used addresses.
+		used := make(map[netip.Addr]bool)
+		_ = pb.ForEach(func(_, v []byte) error {
+			var rec peerRecord
+			if json.Unmarshal(v, &rec) == nil && rec.NetworkID == networkID {
+				if a, err := netip.ParseAddr(rec.VPNAddr); err == nil {
+					used[a] = true
+				}
 			}
-			assigned = free
+			return nil
+		})
+
+		// Allocation order:
+		// 1. Lowest address never assigned in this network (not in AssignedAddrs)
+		// 2. If none, the address that was freed longest ago (in AssignedAddrs with timestamp > 0, oldest first)
+		var neverUsed netip.Addr
+		var oldestFreed netip.Addr
+		var oldestFreedTime int64 = -1
+
+		for a := nextIPAfterNetwork(cidr.Masked()); cidr.Contains(a.Next()); a = a.Next() {
+			if used[a] {
+				continue
+			}
+			addrStr := a.String()
+			if freedAt, ok := netRec.AssignedAddrs[addrStr]; ok {
+				if freedAt > 0 {
+					// Freed address - track the oldest freed
+					if oldestFreedTime == -1 || freedAt < oldestFreedTime {
+						oldestFreedTime = freedAt
+						oldestFreed = a
+					}
+				}
+				// freedAt == 0 means currently assigned, but we already checked used[]
+			} else {
+				// Never assigned - this is our first choice
+				neverUsed = a
+				break // lowest never-used address found
+			}
 		}
+
+		if neverUsed != (netip.Addr{}) {
+			assigned = neverUsed
+		} else if oldestFreed != (netip.Addr{}) {
+			assigned = oldestFreed
+		} else {
+			return fmt.Errorf("network %q: %w", networkID, ErrAddressSpaceExhausted)
+		}
+
+		// Mark the assigned address as currently assigned (timestamp 0)
+		netRec.AssignedAddrs[assigned.String()] = 0
+
+		// Also advance NextIP if the assigned address is at or beyond NextIP
+		// (maintains backward compatibility for NextIP-based logic)
+		if nextIP, err := netip.ParseAddr(netRec.NextIP); err == nil {
+			if !nextIP.IsValid() || !cidr.Contains(nextIP) || assigned.Compare(nextIP) >= 0 {
+				next := assigned.Next()
+				if cidr.Contains(next) {
+					netRec.NextIP = next.String()
+				}
+			}
+		}
+
 		netRec.MachineCount++
 
 		updatedNet, err := json.Marshal(netRec)
@@ -438,7 +500,7 @@ func (r *Registry) UpdateEndpoint(peerID, endpoint string) error {
 		return err
 	}
 	r.setEndpoint(peerID, endpoint)
-	return nil
+	return err
 }
 
 // nameTaken reports whether a peer of networkID other than peerID holds name,
@@ -456,8 +518,8 @@ func nameTaken(pb *bolt.Bucket, networkID, peerID, name string) bool {
 	return taken
 }
 
-// freeAddr returns the lowest assignable address in cidr that no peer of
-// networkID holds.
+// freeAddr is kept for backward compatibility but is no longer used for allocation.
+// It returns the lowest assignable address in cidr that no peer of networkID holds.
 func freeAddr(pb *bolt.Bucket, networkID string, cidr netip.Prefix) (netip.Addr, bool) {
 	used := make(map[netip.Addr]bool)
 	_ = pb.ForEach(func(_, v []byte) error {
@@ -490,22 +552,29 @@ func (r *Registry) RemovePeer(peerID string) (peerRecord, error) {
 		if err := json.Unmarshal(data, &removed); err != nil {
 			return err
 		}
+		freedAddr := removed.VPNAddr
+		networkID := removed.NetworkID
 		if err := pb.Delete([]byte(peerID)); err != nil {
 			return err
 		}
 
-		// Decrement machine count.
+		// Decrement machine count and record the freed address timestamp.
 		nb := tx.Bucket(bucketNetworks)
-		netData := nb.Get([]byte(removed.NetworkID))
+		netData := nb.Get([]byte(networkID))
 		if netData != nil {
 			var netRec networkRecord
 			if err := json.Unmarshal(netData, &netRec); err == nil {
 				if netRec.MachineCount > 0 {
 					netRec.MachineCount--
 				}
+				// Record when this address was freed.
+				if netRec.AssignedAddrs == nil {
+					netRec.AssignedAddrs = make(map[string]int64)
+				}
+				netRec.AssignedAddrs[freedAddr] = time.Now().Unix()
 				updated, err := json.Marshal(netRec)
 				if err == nil {
-					if err := nb.Put([]byte(removed.NetworkID), updated); err != nil {
+					if err := nb.Put([]byte(networkID), updated); err != nil {
 						return err
 					}
 				}

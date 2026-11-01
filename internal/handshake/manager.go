@@ -58,6 +58,12 @@ type Manager struct {
 	// silently discarded. If nil, TOFU pinning is disabled.
 	TOFUCheck func(vpnAddr string, pub ed25519.PublicKey) error
 
+	// OnTOFUMismatch is called when a handshake is dropped due to TOFU fingerprint
+	// mismatch. vpnAddr is the peer's VPN address; fingerprint is the mismatched
+	// fingerprint (SHA-256 of the Ed25519 public key). This callback is for logging
+	// and monitoring; the handshake is still silently dropped on the wire.
+	OnTOFUMismatch func(vpnAddr string, fingerprint [32]byte)
+
 	// initTimestamps tracks the greatest accepted Init timestamp per peer ID.
 	// Used to reject replayed handshake initiations. Entries older than
 	// crypto.MaxTimestampSkew are pruned: an Init that old fails the
@@ -319,6 +325,9 @@ func (m *Manager) handleInit(noiseMsg []byte, addr net.Addr) {
 	// TOFU check: verify the initiator's fingerprint matches prior connections.
 	if m.TOFUCheck != nil {
 		if err := m.TOFUCheck(entry.VPNAddr.String(), result.PeerEd25519Public); err != nil {
+			if m.OnTOFUMismatch != nil {
+				m.OnTOFUMismatch(entry.VPNAddr.String(), crypto.FingerprintBytes(result.PeerEd25519Public))
+			}
 			return // silently drop -- fingerprint mismatch
 		}
 	}
@@ -375,6 +384,9 @@ func (m *Manager) handleResp(noiseMsg []byte, addr net.Addr) {
 	// TOFU check: verify the responder's fingerprint matches prior connections.
 	if m.TOFUCheck != nil {
 		if err := m.TOFUCheck(entry.VPNAddr.String(), result.PeerEd25519Public); err != nil {
+			if m.OnTOFUMismatch != nil {
+				m.OnTOFUMismatch(entry.VPNAddr.String(), crypto.FingerprintBytes(result.PeerEd25519Public))
+			}
 			return // silently drop -- fingerprint mismatch
 		}
 	}

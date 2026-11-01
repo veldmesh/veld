@@ -243,3 +243,34 @@ rejected by default in the CE/free tier (`RejectSubnetPolicy`).
   closed-source and plugs into the coord server through the same five interfaces.
 
 See `DEVELOPMENT.md` for the crypto invariants, testing approach, and build targets.
+### 3.7 VPN address allocation
+
+The coordinator assigns VPN addresses from the network's CIDR. To minimize TOFU
+mismatches when a peer leaves and a new one joins, the allocation order is:
+
+1. **Never-used addresses first** — the lowest address in the CIDR that has never been
+   assigned to any peer in this network.
+2. **Oldest-freed addresses second** — if every address has been used at least once,
+   the address that was freed the longest time ago.
+3. **Exhaustion** — if every assignable address is currently held by a peer, the
+   coordinator returns `ErrAddressSpaceExhausted`.
+
+Re-registration of an existing peer (same Ed25519 identity) always keeps its current
+VPN address. The coordinator records every address ever assigned and when it was last
+freed; this record survives a coordinator restart. Existing databases without this
+record are backward compatible — currently assigned peers' addresses are treated as
+"assigned" and all others as "never used."
+
+### 3.8 TOFU mismatch logging
+
+When a handshake is dropped because the peer's Ed25519 fingerprint does not match the
+locally pinned fingerprint for that VPN address, the daemon logs a single line per
+VPN address, rate-limited to once per 10 minutes per address:
+
+```
+tofu: dropped handshake for 10.100.0.5: it is pinned to a different key. If that node was replaced or reinstalled, run "veld tofu forget 10.100.0.5" on this node.
+```
+
+The log message includes the VPN address and a remediation hint. No key material is
+logged beyond what is already visible in the TOFU store. The handshake itself is
+silently dropped on the wire (no error response) — this is a logging-only addition.

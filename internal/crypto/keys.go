@@ -130,6 +130,11 @@ func (id *Identity) Fingerprint() string {
 	return hex.EncodeToString(hash[:])
 }
 
+// FingerprintBytes returns the raw 32-byte SHA-256 fingerprint of an Ed25519 public key.
+func FingerprintBytes(pub ed25519.PublicKey) [32]byte {
+	return sha256.Sum256(pub)
+}
+
 // SignForPeer returns an Ed25519 signature over (ourX25519Public || theirX25519Public || unixTimestampNanoseconds).
 // Used in the Noise IK handshake payload.
 func (id *Identity) SignForPeer(theirX25519Public [32]byte, timestampNano int64) ([64]byte, error) {
