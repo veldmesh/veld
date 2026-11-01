@@ -384,3 +384,61 @@ func TestNoiseHandshake_NetworkIDPropagated(t *testing.T) {
 		t.Errorf("responder's network ID doesn't match: got %v, want %v", responderResult.NetworkID, networkID)
 	}
 }
+
+// A response that fails to verify must not use up the initiator's state:
+// the genuine response that follows still completes the handshake.
+func TestInitiatorHS_BadResponseKeepsHandshake(t *testing.T) {
+	idA, _ := Generate()
+	idB, _ := Generate()
+	var networkID [16]byte
+
+	initiator, err := NewInitiatorHS(idA, idB.X25519Public, networkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responder, _ := NewResponderHS(idB, func(pub []byte) ([32]byte, bool) {
+		return idA.X25519Public, string(pub) == string(idA.Ed25519Public)
+	})
+	now := time.Now().UnixNano()
+	msg1, err := initiator.BuildMessage1(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := responder.ProcessMessage1(msg1, now); err != nil {
+		t.Fatal(err)
+	}
+	msg2, respResult, err := responder.BuildMessage2(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bad := append([]byte(nil), msg2...)
+	bad[len(bad)-1] ^= 0xff
+	for _, m := range [][]byte{bad, make([]byte, len(msg2)), msg2[:10]} {
+		if _, err := initiator.ProcessMessage2(m, now); !errors.Is(err, ErrHandshakeDrop) {
+			t.Fatalf("bad response: got %v, want ErrHandshakeDrop", err)
+		}
+	}
+
+	initResult, err := initiator.ProcessMessage2(msg2, now)
+	if err != nil {
+		t.Fatalf("genuine response after bad ones: %v", err)
+	}
+	ct, err := initResult.SendCS.Encrypt(nil, nil, []byte("ping"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pt, err := respResult.RecvCS.Decrypt(nil, nil, ct)
+	if err != nil || string(pt) != "ping" {
+		t.Fatalf("session keys do not match: %q, %v", pt, err)
+	}
+}
+
+func TestInitiatorHS_ResponseBeforeMessage1(t *testing.T) {
+	idA, _ := Generate()
+	idB, _ := Generate()
+	initiator, _ := NewInitiatorHS(idA, idB.X25519Public, [16]byte{})
+	if _, err := initiator.ProcessMessage2(make([]byte, 160), time.Now().UnixNano()); !errors.Is(err, ErrHandshakeDrop) {
+		t.Fatalf("got %v, want ErrHandshakeDrop", err)
+	}
+}

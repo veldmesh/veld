@@ -3,6 +3,7 @@
 package crypto
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
@@ -32,11 +33,19 @@ type HandshakeResult struct {
 type PeerLookupFn func(ed25519Pub []byte) (x25519Pub [32]byte, known bool)
 
 // InitiatorHS is the initiator side of a Noise IK handshake.
+//
+// The Noise state is not kept between messages. BuildMessage1 records the
+// ephemeral key seed and the payload, and ProcessMessage2 rebuilds the state
+// from them for every response it is given. A response that fails to verify
+// therefore leaves the handshake untouched, and the genuine response can
+// still complete it.
 type InitiatorHS struct {
-	hs         *noise.HandshakeState
 	localID    *Identity
 	peerX25519 [32]byte
 	networkID  [16]byte
+
+	ephSeed  [32]byte // randomness for the ephemeral key
+	payload1 []byte   // message 1 payload; nil until BuildMessage1
 }
 
 // ResponderHS is the responder side of a Noise IK handshake.
@@ -55,20 +64,27 @@ func noiseSuite() noise.CipherSuite {
 
 // NewInitiatorHS creates an initiator-side Noise IK handshake directed at peerX25519.
 func NewInitiatorHS(localID *Identity, peerX25519 [32]byte, networkID [16]byte) (*InitiatorHS, error) {
-	hs, err := noise.NewHandshakeState(noise.Config{
+	h := &InitiatorHS{localID: localID, peerX25519: peerX25519, networkID: networkID}
+	if _, err := rand.Read(h.ephSeed[:]); err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+// state returns a fresh initiator handshake state. Every call yields the
+// same ephemeral key, so writing the same payload reproduces message 1.
+func (h *InitiatorHS) state() (*noise.HandshakeState, error) {
+	return noise.NewHandshakeState(noise.Config{
 		CipherSuite: noiseSuite(),
+		Random:      bytes.NewReader(h.ephSeed[:]),
 		Pattern:     noise.HandshakeIK,
 		Initiator:   true,
 		StaticKeypair: noise.DHKey{
-			Private: localID.X25519Private[:],
-			Public:  localID.X25519Public[:],
+			Private: h.localID.X25519Private[:],
+			Public:  h.localID.X25519Public[:],
 		},
-		PeerStatic: peerX25519[:],
+		PeerStatic: h.peerX25519[:],
 	})
-	if err != nil {
-		return nil, err
-	}
-	return &InitiatorHS{hs: hs, localID: localID, peerX25519: peerX25519, networkID: networkID}, nil
 }
 
 // BuildMessage1 constructs the initiator's first Noise IK handshake message.
@@ -91,15 +107,22 @@ func (h *InitiatorHS) BuildMessage1(nowNano int64) ([]byte, error) {
 	copy(payload[96:112], h.networkID[:])
 	binary.BigEndian.PutUint64(payload[112:120], uint64(nowNano))
 
-	msg, _, _, err := h.hs.WriteMessage(nil, payload)
+	hs, err := h.state()
 	if err != nil {
 		return nil, err
 	}
+	msg, _, _, err := hs.WriteMessage(nil, payload)
+	if err != nil {
+		return nil, err
+	}
+	h.payload1 = payload
 	return msg, nil
 }
 
 // ProcessMessage2 decrypts and validates the responder's reply, returning session keys.
 // Returns ErrHandshakeDrop on ANY validation failure -- caller must send no response.
+// A failed call does not change h, so it is safe to try several candidate
+// responses, including concurrently.
 //
 // Payload (112 bytes, decrypted by Noise):
 //
@@ -108,7 +131,17 @@ func (h *InitiatorHS) BuildMessage1(nowNano int64) ([]byte, error) {
 //	session_id  [ 8]  random
 //	timestamp   [ 8]  big-endian uint64 (nanoseconds since epoch)
 func (h *InitiatorHS) ProcessMessage2(msg []byte, _ int64) (*HandshakeResult, error) {
-	payload, cs1, cs2, err := h.hs.ReadMessage(nil, msg)
+	if h.payload1 == nil {
+		return nil, ErrHandshakeDrop
+	}
+	hs, err := h.state()
+	if err != nil {
+		return nil, ErrHandshakeDrop
+	}
+	if _, _, _, err := hs.WriteMessage(nil, h.payload1); err != nil {
+		return nil, ErrHandshakeDrop
+	}
+	payload, cs1, cs2, err := hs.ReadMessage(nil, msg)
 	if err != nil {
 		return nil, ErrHandshakeDrop
 	}
