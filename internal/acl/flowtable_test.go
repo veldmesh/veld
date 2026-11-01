@@ -220,6 +220,135 @@ func TestFlowTable_ExpireOldFlows(t *testing.T) {
 	}
 }
 
+func TestFlowTable_ExpireOldFlows_ClosedState(t *testing.T) {
+	config := DefaultFlowTableConfig()
+	config.TCPIdleTimeout = 1 * time.Hour // Long timeout, we test closed state reaping
+	ft := NewFlowTable(config)
+
+	f := Flow{
+		SrcIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 1},
+		DstIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 2},
+		SrcPort: 12345,
+		DstPort: 22,
+		Proto:   ProtoTCP,
+		IPv6:    false,
+	}
+
+	ft.Lookup(f, true, FlowStateNew)
+	if ft.Len() != 1 {
+		t.Fatalf("expected 1 flow, got %d", ft.Len())
+	}
+
+	// Set flow state to closed (simulating FIN/RST detection)
+	ok := ft.UpdateState(f, FlowStateClosed)
+	if !ok {
+		t.Fatal("UpdateState to FlowStateClosed failed")
+	}
+
+	// ExpireOldFlows should immediately reap closed flows
+	expired := ft.ExpireOldFlows()
+	if expired != 1 {
+		t.Errorf("expected 1 closed flow reaped, got %d", expired)
+	}
+	if ft.Len() != 0 {
+		t.Errorf("expected 0 flows after reaping closed flow, got %d", ft.Len())
+	}
+}
+
+func TestFlowTable_RemoveFlow(t *testing.T) {
+	ft := NewFlowTable(DefaultFlowTableConfig())
+
+	f := Flow{
+		SrcIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 1},
+		DstIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 2},
+		SrcPort: 12345,
+		DstPort: 22,
+		Proto:   ProtoTCP,
+		IPv6:    false,
+	}
+
+	// Create a flow
+	_, _, created := ft.Lookup(f, true, FlowStateNew)
+	if !created {
+		t.Fatal("expected new entry to be created")
+	}
+
+	// Get the normalized key
+	key, _ := NormalizeFlowKey(f)
+
+	// RemoveFlow should return true and remove the entry
+	removed := ft.RemoveFlow(key)
+	if !removed {
+		t.Fatal("RemoveFlow should return true for existing flow")
+	}
+	if ft.Len() != 0 {
+		t.Errorf("expected 0 flows after removal, got %d", ft.Len())
+	}
+
+	// RemoveFlow on non-existent key should return false
+	removed = ft.RemoveFlow(key)
+	if removed {
+		t.Error("RemoveFlow should return false for non-existent flow")
+	}
+}
+
+func TestFlowTable_RemoveFlow_UpdatesEvictionList(t *testing.T) {
+	ft := NewFlowTable(DefaultFlowTableConfig())
+
+	// Add two flows
+	f1 := Flow{
+		SrcIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 1},
+		DstIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 2},
+		SrcPort: 12345,
+		DstPort: 22,
+		Proto:   ProtoTCP,
+		IPv6:    false,
+	}
+
+	f2 := Flow{
+		SrcIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 3},
+		DstIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 4},
+		SrcPort: 12346,
+		DstPort: 80,
+		Proto:   ProtoTCP,
+		IPv6:    false,
+	}
+
+	ft.Lookup(f1, true, FlowStateNew)
+	ft.Lookup(f2, true, FlowStateNew)
+
+	if ft.Len() != 2 {
+		t.Fatalf("expected 2 flows, got %d", ft.Len())
+	}
+
+	// Remove the first flow
+	key1, _ := NormalizeFlowKey(f1)
+	removed := ft.RemoveFlow(key1)
+	if !removed {
+		t.Fatal("RemoveFlow should return true for existing flow")
+	}
+
+	// The second flow should still exist
+	if ft.Len() != 1 {
+		t.Errorf("expected 1 flow after removal, got %d", ft.Len())
+	}
+
+	_, _, _ = ft.Lookup(f2, false, FlowStateNew)
+	if ft.Len() != 1 {
+		t.Error("f2 should still exist after f1 removal")
+	}
+
+	// Remove the second flow
+	key2, _ := NormalizeFlowKey(f2)
+	removed = ft.RemoveFlow(key2)
+	if !removed {
+		t.Error("RemoveFlow should return true for f2")
+	}
+	if ft.Len() != 0 {
+		t.Errorf("expected 0 flows after removing both, got %d", ft.Len())
+	}
+}
+
 func TestFlowTable_Eviction(t *testing.T) {
 	config := DefaultFlowTableConfig()
 	config.MaxFlows = 10 // Very small for testing
@@ -271,8 +400,8 @@ func TestFlowTable_EvictionIsLRU(t *testing.T) {
 		Proto:   ProtoTCP,
 		IPv6:    false,
 	}
-	entry, _, _ := ft.Lookup(f0, false, FlowStateNew)
-	if entry == nil {
+	e0, _, _ := ft.Lookup(f0, false, FlowStateNew)
+	if e0 == nil {
 		t.Fatal("flow 0 should exist")
 	}
 
@@ -288,8 +417,8 @@ func TestFlowTable_EvictionIsLRU(t *testing.T) {
 	ft.Lookup(f5, true, FlowStateNew)
 
 	// Flow 0 should still exist (was recently accessed)
-	entry, _, _ = ft.Lookup(f0, false, FlowStateNew)
-	if entry == nil {
+	e0, _, _ = ft.Lookup(f0, false, FlowStateNew)
+	if e0 == nil {
 		t.Error("flow 0 should not have been evicted (recently accessed)")
 	}
 
@@ -302,8 +431,8 @@ func TestFlowTable_EvictionIsLRU(t *testing.T) {
 		Proto:   ProtoTCP,
 		IPv6:    false,
 	}
-	entry, _, _ = ft.Lookup(f1, false, FlowStateNew)
-	if entry != nil {
+	e1, _, _ := ft.Lookup(f1, false, FlowStateNew)
+	if e1 != nil {
 		t.Error("flow 1 should have been evicted (oldest idle)")
 	}
 }

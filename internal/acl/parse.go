@@ -25,6 +25,7 @@ const (
 	KindOther                // other packet (reply, data, etc.)
 	KindFragment             // IPv4 fragment without transport header
 	KindError                // ICMP error (unreachable, time exceeded, etc.)
+	KindEnd                  // connection end (TCP FIN/RST)
 )
 
 // ParsePacket parses an IPv4 or IPv6 packet and returns the flow, kind, and any error.
@@ -268,11 +269,19 @@ func parseTCP(flow Flow, tcp []byte) (Flow, Kind, error) {
 	flags := tcp[13]
 	syn := (flags & 0x02) != 0
 	ack := (flags & 0x10) != 0
+	fin := (flags & 0x01) != 0
+	rst := (flags & 0x04) != 0
 
 	// Connection start: SYN without ACK
 	if syn && !ack {
 		return flow, KindStart, nil
 	}
+
+	// Connection end: FIN or RST
+	if fin || rst {
+		return flow, KindEnd, nil
+	}
+
 	return flow, KindOther, nil
 }
 

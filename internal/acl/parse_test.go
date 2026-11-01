@@ -79,6 +79,183 @@ func TestParsePacket_IPv4TCP_SYNACK(t *testing.T) {
 	}
 }
 
+func TestParsePacket_IPv4TCP_FIN(t *testing.T) {
+	// IPv4 + TCP with FIN flag (connection end)
+	pkt := make([]byte, 40)
+	pkt[0] = 0x45
+	pkt[1] = 0x00
+	binary.BigEndian.PutUint16(pkt[2:4], 40)
+	binary.BigEndian.PutUint16(pkt[4:6], 0)
+	binary.BigEndian.PutUint16(pkt[6:8], 0)
+	pkt[8] = 64
+	pkt[9] = 6
+	binary.BigEndian.PutUint32(pkt[12:16], 0x0a000001)
+	binary.BigEndian.PutUint32(pkt[16:20], 0x0a000002)
+	binary.BigEndian.PutUint16(pkt[20:22], 12345)
+	binary.BigEndian.PutUint16(pkt[22:24], 22)
+	binary.BigEndian.PutUint32(pkt[24:28], 100)
+	binary.BigEndian.PutUint32(pkt[28:32], 200)
+	pkt[32] = 0x50
+	pkt[33] = 0x01 // Flags = FIN
+
+	flow, kind, err := ParsePacket(pkt)
+	if err != nil {
+		t.Fatalf("ParsePacket: %v", err)
+	}
+	if kind != KindEnd {
+		t.Errorf("kind: got %v, want %v (FIN is connection end)", kind, KindEnd)
+	}
+	if flow.SrcPort != 12345 || flow.DstPort != 22 {
+		t.Errorf("ports: got %d/%d", flow.SrcPort, flow.DstPort)
+	}
+}
+
+func TestParsePacket_IPv4TCP_RST(t *testing.T) {
+	// IPv4 + TCP with RST flag (connection end)
+	pkt := make([]byte, 40)
+	pkt[0] = 0x45
+	pkt[1] = 0x00
+	binary.BigEndian.PutUint16(pkt[2:4], 40)
+	binary.BigEndian.PutUint16(pkt[4:6], 0)
+	binary.BigEndian.PutUint16(pkt[6:8], 0)
+	pkt[8] = 64
+	pkt[9] = 6
+	binary.BigEndian.PutUint32(pkt[12:16], 0x0a000001)
+	binary.BigEndian.PutUint32(pkt[16:20], 0x0a000002)
+	binary.BigEndian.PutUint16(pkt[20:22], 12345)
+	binary.BigEndian.PutUint16(pkt[22:24], 22)
+	binary.BigEndian.PutUint32(pkt[24:28], 100)
+	binary.BigEndian.PutUint32(pkt[28:32], 200)
+	pkt[32] = 0x50
+	pkt[33] = 0x04 // Flags = RST
+
+	flow, kind, err := ParsePacket(pkt)
+	if err != nil {
+		t.Fatalf("ParsePacket: %v", err)
+	}
+	if kind != KindEnd {
+		t.Errorf("kind: got %v, want %v (RST is connection end)", kind, KindEnd)
+	}
+	if flow.SrcPort != 12345 || flow.DstPort != 22 {
+		t.Errorf("ports: got %d/%d", flow.SrcPort, flow.DstPort)
+	}
+}
+
+func TestParsePacket_IPv4TCP_FINACK(t *testing.T) {
+	// IPv4 + TCP with FIN+ACK flags (connection end)
+	pkt := make([]byte, 40)
+	pkt[0] = 0x45
+	pkt[1] = 0x00
+	binary.BigEndian.PutUint16(pkt[2:4], 40)
+	binary.BigEndian.PutUint16(pkt[4:6], 0)
+	binary.BigEndian.PutUint16(pkt[6:8], 0)
+	pkt[8] = 64
+	pkt[9] = 6
+	binary.BigEndian.PutUint32(pkt[12:16], 0x0a000001)
+	binary.BigEndian.PutUint32(pkt[16:20], 0x0a000002)
+	binary.BigEndian.PutUint16(pkt[20:22], 12345)
+	binary.BigEndian.PutUint16(pkt[22:24], 22)
+	binary.BigEndian.PutUint32(pkt[24:28], 100)
+	binary.BigEndian.PutUint32(pkt[28:32], 200)
+	pkt[32] = 0x50
+	pkt[33] = 0x11 // Flags = FIN|ACK
+
+	_, kind, err := ParsePacket(pkt)
+	if err != nil {
+		t.Fatalf("ParsePacket: %v", err)
+	}
+	if kind != KindEnd {
+		t.Errorf("kind: got %v, want %v (FIN|ACK is connection end)", kind, KindEnd)
+	}
+}
+
+func TestParsePacket_IPv4TCP_RSTACK(t *testing.T) {
+	// IPv4 + TCP with RST+ACK flags (connection end)
+	pkt := make([]byte, 40)
+	pkt[0] = 0x45
+	pkt[1] = 0x00
+	binary.BigEndian.PutUint16(pkt[2:4], 40)
+	binary.BigEndian.PutUint16(pkt[4:6], 0)
+	binary.BigEndian.PutUint16(pkt[6:8], 0)
+	pkt[8] = 64
+	pkt[9] = 6
+	binary.BigEndian.PutUint32(pkt[12:16], 0x0a000001)
+	binary.BigEndian.PutUint32(pkt[16:20], 0x0a000002)
+	binary.BigEndian.PutUint16(pkt[20:22], 12345)
+	binary.BigEndian.PutUint16(pkt[22:24], 22)
+	binary.BigEndian.PutUint32(pkt[24:28], 100)
+	binary.BigEndian.PutUint32(pkt[28:32], 200)
+	pkt[32] = 0x50
+	pkt[33] = 0x14 // Flags = RST|ACK
+
+	_, kind, err := ParsePacket(pkt)
+	if err != nil {
+		t.Fatalf("ParsePacket: %v", err)
+	}
+	if kind != KindEnd {
+		t.Errorf("kind: got %v, want %v (RST|ACK is connection end)", kind, KindEnd)
+	}
+}
+
+func TestParsePacket_IPv6TCP_FIN(t *testing.T) {
+	// IPv6 header (40 bytes) + TCP header (20 bytes) with FIN
+	pkt := make([]byte, 60)
+	pkt[0] = 0x60
+	pkt[1] = 0x00
+	pkt[2] = 0x00
+	pkt[3] = 0x00
+	binary.BigEndian.PutUint16(pkt[4:6], 20)
+	pkt[6] = 6
+	pkt[7] = 64
+	copy(pkt[8:24], []byte{0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01})
+	copy(pkt[24:40], []byte{0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02})
+	binary.BigEndian.PutUint16(pkt[40:42], 12345)
+	binary.BigEndian.PutUint16(pkt[42:44], 22)
+	binary.BigEndian.PutUint32(pkt[44:48], 100)
+	binary.BigEndian.PutUint32(pkt[48:52], 200)
+	pkt[52] = 0x50
+	pkt[53] = 0x01 // FIN
+
+	flow, kind, err := ParsePacket(pkt)
+	if err != nil {
+		t.Fatalf("ParsePacket: %v", err)
+	}
+	if kind != KindEnd {
+		t.Errorf("kind: got %v, want %v (FIN is connection end)", kind, KindEnd)
+	}
+	if !flow.IPv6 {
+		t.Error("IPv6 should be true")
+	}
+}
+
+func TestParsePacket_IPv6TCP_RST(t *testing.T) {
+	// IPv6 header (40 bytes) + TCP header (20 bytes) with RST
+	pkt := make([]byte, 60)
+	pkt[0] = 0x60
+	pkt[1] = 0x00
+	pkt[2] = 0x00
+	pkt[3] = 0x00
+	binary.BigEndian.PutUint16(pkt[4:6], 20)
+	pkt[6] = 6
+	pkt[7] = 64
+	copy(pkt[8:24], []byte{0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01})
+	copy(pkt[24:40], []byte{0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02})
+	binary.BigEndian.PutUint16(pkt[40:42], 12345)
+	binary.BigEndian.PutUint16(pkt[42:44], 22)
+	binary.BigEndian.PutUint32(pkt[44:48], 100)
+	binary.BigEndian.PutUint32(pkt[48:52], 200)
+	pkt[52] = 0x50
+	pkt[53] = 0x04 // RST
+
+	_, kind, err := ParsePacket(pkt)
+	if err != nil {
+		t.Fatalf("ParsePacket: %v", err)
+	}
+	if kind != KindEnd {
+		t.Errorf("kind: got %v, want %v (RST is connection end)", kind, KindEnd)
+	}
+}
+
 func TestParsePacket_IPv4UDP(t *testing.T) {
 	// IPv4 + UDP
 	pkt := make([]byte, 28)
