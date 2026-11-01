@@ -146,8 +146,8 @@ func TestVerifyRegisterSignature_TimestampWindow(t *testing.T) {
 		{"now", now, false},
 		{"exactly 120 s stale", now - 120, false},
 		{"exactly 120 s in the future", now + 120, false},
-		{"121 s stale", now - 121, true},
-		{"121 s in the future", now + 121, true},
+		{"121 s stale", now - (RegisterTimestampWindow + 1), true},
+		{"121 s in the future", now + (RegisterTimestampWindow + 1), true},
 		{"an hour stale", now - 3600, true},
 	}
 	for _, tc := range cases {
