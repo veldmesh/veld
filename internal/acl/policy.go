@@ -53,9 +53,10 @@ const (
 
 // PortRange represents a port or port range for a specific protocol.
 type PortRange struct {
-	Proto Proto
-	Start uint16
-	End   uint16
+	Proto       Proto
+	Start       uint16
+	End         uint16
+	matchICMPv6 bool // true when "icmp" keyword should match both ICMPv4 and ICMPv6
 }
 
 // ContainsPort returns true if the port range contains the given port.
@@ -65,6 +66,20 @@ func (pr PortRange) ContainsPort(port uint16) bool {
 	}
 	// For ICMP and "any", port is ignored (always matches)
 	return true
+}
+
+// MatchesProto returns true if the port range matches the given protocol.
+func (pr PortRange) MatchesProto(proto Proto) bool {
+	if pr.Proto == ProtoAny {
+		return true
+	}
+	if pr.Proto == proto {
+		return true
+	}
+	if pr.matchICMPv6 && (proto == ProtoICMP || proto == ProtoICMPv6) {
+		return true
+	}
+	return false
 }
 
 // Rule represents a single ACL rule.
@@ -307,7 +322,8 @@ func parsePortRange(s string) (PortRange, error) {
 		return PortRange{Proto: ProtoAny, Start: 0, End: 65535}, nil
 	}
 	if strings.EqualFold(s, "icmp") {
-		return PortRange{Proto: ProtoICMP, Start: 0, End: 65535}, nil
+		// "icmp" matches both ICMPv4 (proto 1) and ICMPv6 (proto 58)
+		return PortRange{Proto: ProtoICMP, Start: 0, End: 65535, matchICMPv6: true}, nil
 	}
 
 	// Format: proto/port or proto/start-end
@@ -326,7 +342,7 @@ func parsePortRange(s string) (PortRange, error) {
 		pr.Proto = ProtoUDP
 	case "icmp":
 		pr.Proto = ProtoICMP
-		return PortRange{Proto: ProtoICMP, Start: 0, End: 65535}, nil
+		return PortRange{Proto: ProtoICMP, Start: 0, End: 65535, matchICMPv6: true}, nil
 	default:
 		return pr, fmt.Errorf("unknown protocol: %q", protoStr)
 	}
@@ -378,11 +394,26 @@ func isUnmatchable(rule Rule, peers map[string]PeerKey, tags map[string][]string
 	fromSet := resolveSubject(rule.From, peers, tags)
 	toSet := resolveSubject(rule.To, peers, tags)
 
+	// Check if from and to resolve to the exact same single peer
 	if len(fromSet) == 1 && len(toSet) == 1 {
 		for k := range fromSet {
 			if _, ok := toSet[k]; ok {
 				return true
 			}
+		}
+	}
+
+	// Check if from and to sets are disjoint (no overlap)
+	if len(fromSet) > 0 && len(toSet) > 0 {
+		disjoint := true
+		for k := range fromSet {
+			if _, ok := toSet[k]; ok {
+				disjoint = false
+				break
+			}
+		}
+		if disjoint {
+			return true
 		}
 	}
 	return false

@@ -226,6 +226,84 @@ func TestDecide_ICMP(t *testing.T) {
 	}
 }
 
+func TestDecide_ICMPKeywordMatchesICMPv6(t *testing.T) {
+	// Test that "icmp" keyword in TOML matches both ICMPv4 and ICMPv6
+	p := &Policy{
+		Version: 1,
+		Default: DefaultDeny,
+		Peers: map[string]PeerKey{
+			"alice": {1},
+			"bob":   {2},
+		},
+		Rules: []Rule{
+			{From: "alice", To: "bob", Ports: []PortRange{{Proto: ProtoICMP, Start: 0, End: 65535, matchICMPv6: true}}},
+		},
+	}
+
+	compiled := p.Compile()
+
+	// alice -> bob ICMPv4 should be allowed
+	dec := compiled.Decide([32]byte{1}, [32]byte{2}, ProtoICMP, 0)
+	if dec.Action != ActionAllow {
+		t.Errorf("ICMPv4: got %v, want allow", dec.Action)
+	}
+
+	// alice -> bob ICMPv6 should also be allowed (this is the fix)
+	dec = compiled.Decide([32]byte{1}, [32]byte{2}, ProtoICMPv6, 0)
+	if dec.Action != ActionAllow {
+		t.Errorf("ICMPv6: got %v, want allow (icmp keyword should match both)", dec.Action)
+	}
+
+	// alice -> bob TCP should be denied
+	dec = compiled.Decide([32]byte{1}, [32]byte{2}, ProtoTCP, 22)
+	if dec.Action != ActionDeny {
+		t.Errorf("TCP: got %v, want deny", dec.Action)
+	}
+}
+
+func TestDecide_ICMPKeywordParsedFromTOML(t *testing.T) {
+	// Test that "icmp" keyword parsed from TOML matches both ICMPv4 and ICMPv6
+	src := `
+version = 1
+default = "deny"
+[peers]
+alice = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bob   = "ed25519:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+[[rule]]
+from = "alice"
+to   = "bob"
+ports = ["icmp"]
+`
+	p, _, err := ParsePolicy(src)
+	if err != nil {
+		t.Fatalf("ParsePolicy: %v", err)
+	}
+
+	compiled := p.Compile()
+
+	// Use the actual parsed peer keys
+	aliceKey := p.Peers["alice"]
+	bobKey := p.Peers["bob"]
+
+	// alice -> bob ICMPv4 should be allowed
+	dec := compiled.Decide(aliceKey, bobKey, ProtoICMP, 0)
+	if dec.Action != ActionAllow {
+		t.Errorf("ICMPv4: got %v, want allow", dec.Action)
+	}
+
+	// alice -> bob ICMPv6 should also be allowed (this is the fix)
+	dec = compiled.Decide(aliceKey, bobKey, ProtoICMPv6, 0)
+	if dec.Action != ActionAllow {
+		t.Errorf("ICMPv6: got %v, want allow (icmp keyword should match both)", dec.Action)
+	}
+
+	// alice -> bob TCP should be denied
+	dec = compiled.Decide(aliceKey, bobKey, ProtoTCP, 22)
+	if dec.Action != ActionDeny {
+		t.Errorf("TCP: got %v, want deny", dec.Action)
+	}
+}
+
 func TestDecide_OutboundOnly(t *testing.T) {
 	p := &Policy{
 		Version: 1,
@@ -348,4 +426,31 @@ func TestDecide_FirstMatchWins(t *testing.T) {
 	if dec.RuleIndex != 0 {
 		t.Errorf("tcp/22: rule index got %d, want 0 (first match)", dec.RuleIndex)
 	}
+}
+
+func TestDecide_DisjointTagsWarning(t *testing.T) {
+	// Test that disjoint tags produce a warning
+	src := `
+version = 1
+default = "deny"
+[peers]
+alice = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bob   = "ed25519:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+carol = "ed25519:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC="
+[tags]
+admins = ["alice"]
+servers = ["bob"]
+[[rule]]
+from = "tag:admins"
+to   = "tag:servers"
+ports = ["tcp/22"]
+`
+	p, warnings, err := ParsePolicy(src)
+	if err != nil {
+		t.Fatalf("ParsePolicy: %v", err)
+	}
+	if len(warnings) == 0 {
+		t.Fatal("expected warning for disjoint tags")
+	}
+	_ = p
 }

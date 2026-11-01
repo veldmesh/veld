@@ -68,8 +68,8 @@ func (p *Policy) Compile() *CompiledPolicy {
 	dstRules := make(map[[32]byte][]compiledRule)
 
 	for ruleIdx, rule := range p.Rules {
-		srcSet := resolveSubjectToPeers(rule.From, p.Peers, p.Tags)
-		dstSet := resolveSubjectToPeers(rule.To, p.Peers, p.Tags)
+		srcSet := resolveSubject(rule.From, p.Peers, p.Tags)
+		dstSet := resolveSubject(rule.To, p.Peers, p.Tags)
 
 		for dstID := range dstSet {
 			// Create a compiled rule for this destination
@@ -120,7 +120,7 @@ func (cp *CompiledPolicy) Decide(src, dst [32]byte, proto Proto, port uint16) De
 
 		// Check if protocol/port matches
 		for _, pr := range rule.ports {
-			if pr.Proto == ProtoAny || pr.Proto == proto {
+			if pr.MatchesProto(proto) {
 				if pr.ContainsPort(port) {
 					return Decision{Action: ActionAllow, RuleIndex: rule.ruleIndex}
 				}
@@ -129,30 +129,6 @@ func (cp *CompiledPolicy) Decide(src, dst [32]byte, proto Proto, port uint16) De
 	}
 
 	return Decision{Action: cp.defaultAction, RuleIndex: -1}
-}
-
-// resolveSubjectToPeers resolves a subject (peer name, tag:*, or *) to a set of peer IDs.
-func resolveSubjectToPeers(subject string, peers map[string]PeerKey, tags map[string][]string) map[[32]byte]struct{} {
-	result := make(map[[32]byte]struct{})
-	if subject == "*" {
-		for _, k := range peers {
-			result[k] = struct{}{}
-		}
-		return result
-	}
-	if len(subject) >= 4 && subject[:4] == "tag:" {
-		tagName := subject[4:]
-		for _, pn := range tags[tagName] {
-			if key, ok := peers[pn]; ok {
-				result[key] = struct{}{}
-			}
-		}
-		return result
-	}
-	if key, ok := peers[subject]; ok {
-		result[key] = struct{}{}
-	}
-	return result
 }
 
 // PolicyDecider is an interface for policy decision making.
