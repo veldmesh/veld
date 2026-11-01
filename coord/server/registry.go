@@ -518,27 +518,6 @@ func nameTaken(pb *bolt.Bucket, networkID, peerID, name string) bool {
 	return taken
 }
 
-// freeAddr is kept for backward compatibility but is no longer used for allocation.
-// It returns the lowest assignable address in cidr that no peer of networkID holds.
-func freeAddr(pb *bolt.Bucket, networkID string, cidr netip.Prefix) (netip.Addr, bool) {
-	used := make(map[netip.Addr]bool)
-	_ = pb.ForEach(func(_, v []byte) error {
-		var rec peerRecord
-		if json.Unmarshal(v, &rec) == nil && rec.NetworkID == networkID {
-			if a, err := netip.ParseAddr(rec.VPNAddr); err == nil {
-				used[a] = true
-			}
-		}
-		return nil
-	})
-	for a := nextIPAfterNetwork(cidr.Masked()); cidr.Contains(a.Next()); a = a.Next() {
-		if !used[a] {
-			return a, true
-		}
-	}
-	return netip.Addr{}, false
-}
-
 // RemovePeer deletes a peer and decrements the network machine count.
 // The peer's in-memory endpoint, if any, is dropped.
 func (r *Registry) RemovePeer(peerID string) (peerRecord, error) {
