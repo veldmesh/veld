@@ -36,13 +36,43 @@ func parseIPNet(s string) *net.IPNet {
 	return ipnet
 }
 
+// routesFor returns every IPv4 route for dst on link.
+func routesFor(t *testing.T, link netlink.Link, dst string) []netlink.Route {
+	t.Helper()
+	routes, err := netlink.RouteList(link, netlink.FAMILY_V4)
+	if err != nil {
+		t.Fatalf("list routes: %v", err)
+	}
+	var out []netlink.Route
+	for _, r := range routes {
+		if r.Dst != nil && r.Dst.String() == dst {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// routeVia returns the route for dst whose gateway is gw, or nil.
+func routeVia(rs []netlink.Route, gw netip.Addr) *netlink.Route {
+	for i := range rs {
+		if rs[i].Gw.Equal(gw.AsSlice()) {
+			return &rs[i]
+		}
+	}
+	return nil
+}
+
 // TestRouteReplaceTakesOverVPNRoute is the end-to-end coexistence test for
 // the "commercial VPN connected first" ordering:
 //
 //  1. a conflicting route with a non-zero metric is installed (as a VPN would),
 //  2. the route manager adds veld's route for the same prefix,
-//  3. veld's route must hold the prefix with metric DefaultRouteMetric,
-//  4. Close removes it again, leaving nothing behind.
+//  3. veld's route is installed at DefaultRouteMetric alongside the VPN's
+//     route, which is left untouched; the kernel prefers veld's lower metric,
+//  4. Close removes only veld's route; the VPN's route survives.
+//
+// A replace only displaces a route with the same prefix and metric, so a VPN
+// route at a different metric is outranked rather than overwritten.
 func TestRouteReplaceTakesOverVPNRoute(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("route installation requires root")
@@ -96,36 +126,40 @@ func TestRouteReplaceTakesOverVPNRoute(t *testing.T) {
 		t.Fatalf("Add: %v", err)
 	}
 
-	routes, err := netlink.RouteList(dummy, netlink.FAMILY_V4)
+	rs := routesFor(t, dummy, testDst)
+	if len(rs) != 2 {
+		t.Fatalf("after Add: %d routes for %s, want 2 (veld's alongside the VPN's)", len(rs), testDst)
+	}
+	veldRoute := routeVia(rs, gwVeld)
+	if veldRoute == nil {
+		t.Fatalf("after Add: no route for %s via veld gateway %v", testDst, gwVeld)
+	}
+	if veldRoute.Priority != route.DefaultRouteMetric {
+		t.Errorf("veld route metric = %d, want %d", veldRoute.Priority, route.DefaultRouteMetric)
+	}
+	vpnFound := routeVia(rs, gwVPN)
+	if vpnFound == nil {
+		t.Errorf("VPN route via %v was removed by Add; it must be left in place", gwVPN)
+	} else if vpnFound.Priority != vpnRoute.Priority {
+		t.Errorf("VPN route metric = %d, want %d (unchanged)", vpnFound.Priority, vpnRoute.Priority)
+	}
+
+	got, err := netlink.RouteGet(net.ParseIP("10.99.77.1"))
 	if err != nil {
-		t.Fatalf("list routes: %v", err)
+		t.Fatalf("route get: %v", err)
 	}
-	var found *netlink.Route
-	for i := range routes {
-		if routes[i].Dst != nil && routes[i].Dst.String() == testDst {
-			found = &routes[i]
-		}
-	}
-	if found == nil {
-		t.Fatalf("route %s not present after Add", testDst)
-	}
-	if found.Priority != route.DefaultRouteMetric {
-		t.Errorf("route metric = %d, want %d", found.Priority, route.DefaultRouteMetric)
-	}
-	if !found.Gw.Equal(gwVeld.AsSlice()) {
-		t.Errorf("route gw = %v, want %v (veld's replace took over the prefix)", found.Gw, gwVeld)
+	if len(got) == 0 || !got[0].Gw.Equal(gwVeld.AsSlice()) {
+		t.Errorf("kernel selects route via %v, want veld's %v", got, gwVeld)
 	}
 
 	if err := m.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	routes, err = netlink.RouteList(dummy, netlink.FAMILY_V4)
-	if err != nil {
-		t.Fatalf("list routes: %v", err)
+	rs = routesFor(t, dummy, testDst)
+	if routeVia(rs, gwVeld) != nil {
+		t.Errorf("veld route for %s leaked after Close", testDst)
 	}
-	for _, r := range routes {
-		if r.Dst != nil && r.Dst.String() == testDst {
-			t.Errorf("route %s leaked after Close", testDst)
-		}
+	if routeVia(rs, gwVPN) == nil {
+		t.Errorf("VPN route for %s removed by Close; it must survive", testDst)
 	}
 }

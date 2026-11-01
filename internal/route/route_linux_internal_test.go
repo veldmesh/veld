@@ -55,13 +55,12 @@ func newTestManager(h *recordingHandle) *linuxManager {
 // TestAddReplacesWithExplicitMetric verifies what Add asks the kernel for on
 // Linux, the two properties of the install:
 //
-//  1. The route is installed via replace, not add — a conflicting route a
-//     commercial VPN installed *before* veld started is taken over, and a
-//     route a VPN installs *later* is healed by the next Add (peer rejoin
-//     or daemon restart). This replace-on-conflict is the
-//     order-independence mechanism.
+//  1. The route is installed via replace, not add, so a stale route veld
+//     left at the same prefix and metric is overwritten rather than failing
+//     with "file exists".
 //  2. The route carries metric DefaultRouteMetric — the metric the kernel
-//     would use for an unqualified route add, made explicit.
+//     would use for an unqualified route add, made explicit. The lowest
+//     metric wins for a prefix, which is what lets veld outrank a VPN route.
 func TestAddReplacesWithExplicitMetric(t *testing.T) {
 	h := &recordingHandle{}
 	m := newTestManager(h)

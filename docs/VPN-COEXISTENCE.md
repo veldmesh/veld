@@ -22,15 +22,19 @@ range — it installs only the routes for its mesh CIDR and the subnets its
 peers advertise. On Linux, routes are installed with `ip route replace`
 semantics (netlink `RTM_NEWROUTE` with `NLM_F_REPLACE`):
 
-- **Replace on conflict.** If a VPN already installed a route for the same
-  prefix (VPN connected first), veld's `Add` takes the prefix over instead
-  of failing with "file exists" — and if the VPN displaces veld's route
-  later (veld connected first), the next veld start or peer rejoin claims
-  it back. This is what makes the install order-independent.
+- **Replace, not add.** `Add` never fails with "file exists" on a stale route
+  veld left at the same prefix and metric. The kernel matches a replace on
+  prefix and metric only, so:
+  - A VPN route for the same prefix at a higher metric (the usual case) is
+    left in place. Veld's metric-0 route is preferred by the kernel, so veld
+    wins while it is installed, and the VPN's route is still there after
+    veld closes.
+  - A VPN route at metric 0 for the same prefix is displaced. Veld does not
+    restore it on close, so the VPN must reinstall its route.
 - **Explicit default metric.** Veldmesh requests metric 0 — the metric the
-  kernel would use anyway for an unqualified route add, made explicit.
-  It is not a coexistence advantage; the replace-on-conflict above is the
-  sole order-independence mechanism. (On IPv6 the kernel raises metric 0
+  kernel would use anyway for an unqualified route add, made explicit. The
+  lowest metric wins for a prefix, which is what lets veld outrank a VPN route
+  at a higher metric. (On IPv6 the kernel raises metric 0
   to 1024, `IP6_RT_PRIO_USER`, on install.)
 
 **Platform support for route management.** Subnet route installation,
