@@ -21,6 +21,7 @@ require (
 )
 
 require (
+	github.com/google/btree v1.0.1 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/miekg/dns v1.1.55 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
@@ -29,7 +30,9 @@ require (
 	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/time v0.0.0-20220210224613-90d013bbcef8 // indirect
 	golang.org/x/tools v0.49.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
+	gvisor.dev/gvisor v0.0.0-20230927004350-cbd86285d259 // indirect
 )

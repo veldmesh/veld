@@ -45,6 +45,7 @@ type NodeConfig struct {
 	IfaceName    string   `toml:"iface_name"`    // TUN interface name; empty = platform default ("veld0" Linux, "Veld" Windows, "utun" macOS)
 	MTU          int      `toml:"mtu"`           // 0 → default 1420
 	SubnetRoutes []string `toml:"subnet_routes"` // CIDR prefixes this node advertises
+	Userspace    bool     `toml:"userspace"`     // run with userspace netstack TUN (no root, no TUN device, no OS routes)
 }
 
 // CoordConfig holds settings for connecting to a coord server.

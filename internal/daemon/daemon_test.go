@@ -447,7 +447,7 @@ func TestOnVPNAddrAssigned_Callback_CreateTUNFailure(t *testing.T) {
 
 	// Call the callback directly. In an environment without /dev/net/tun
 	// CreateTUN fails; the callback must log and return, not panic.
-	cb := d.onVPNAddrAssigned(cfg, conn)
+	cb := d.onVPNAddrAssigned(cfg, conn, false)
 	cb(netip.MustParseAddr("10.10.0.1"), "10.10.0.0/24")
 
 	// The TUN should still be nil (creation failed in this container).
@@ -491,7 +491,7 @@ func TestOnVPNAddrAssigned_Callback_SameAddress_NoOp(t *testing.T) {
 	d.mu.Unlock()
 
 	// Call callback with the SAME address: no-op.
-	cb := d.onVPNAddrAssigned(cfg, conn)
+	cb := d.onVPNAddrAssigned(cfg, conn, false)
 	cb(netip.MustParseAddr("10.0.0.1"), "10.0.0.0/24")
 
 	// The TUN must be the same object and still open.
@@ -539,16 +539,16 @@ func TestOnVPNAddrAssigned_Callback_AddressChange_RecreatesTUN(t *testing.T) {
 	// Override createTUN to return a new MemTUN with the new address.
 	originalCreateTUN := createTUN
 	newTun := tun.NewMemTUN("vel-test", netip.MustParsePrefix("10.0.0.2/24"), 1420)
-	createTUN = func(iface string, prefix netip.Prefix, mtu int) (tun.TUN, error) {
+	createTUN = func(name string, prefix netip.Prefix, mtu int, userspace bool) (tun.TUN, error) {
 		if prefix.Addr() == netip.MustParseAddr("10.0.0.2") {
 			return newTun, nil
 		}
-		return originalCreateTUN(iface, prefix, mtu)
+		return originalCreateTUN(name, prefix, mtu, userspace)
 	}
 	defer func() { createTUN = originalCreateTUN }()
 
 	// Call callback with a DIFFERENT address (10.0.0.2).
-	cb := d.onVPNAddrAssigned(cfg, conn)
+	cb := d.onVPNAddrAssigned(cfg, conn, false)
 	cb(netip.MustParseAddr("10.0.0.2"), "10.0.0.0/24")
 
 	// The old TUN must be closed.
@@ -603,16 +603,16 @@ func TestOnVPNAddrAssigned_Callback_CreateTUNFailure_KeepsOldTUN(t *testing.T) {
 
 	// Override createTUN to fail for the new address.
 	originalCreateTUN := createTUN
-	createTUN = func(iface string, prefix netip.Prefix, mtu int) (tun.TUN, error) {
+	createTUN = func(name string, prefix netip.Prefix, mtu int, userspace bool) (tun.TUN, error) {
 		if prefix.Addr() == netip.MustParseAddr("10.0.0.2") {
 			return nil, &tunErr{"simulated failure"}
 		}
-		return originalCreateTUN(iface, prefix, mtu)
+		return originalCreateTUN(name, prefix, mtu, userspace)
 	}
 	defer func() { createTUN = originalCreateTUN }()
 
 	// Call callback with a DIFFERENT address (10.0.0.2) — creation should fail.
-	cb := d.onVPNAddrAssigned(cfg, conn)
+	cb := d.onVPNAddrAssigned(cfg, conn, false)
 	cb(netip.MustParseAddr("10.0.0.2"), "10.0.0.0/24")
 
 	// The old TUN must still be open.
@@ -713,12 +713,12 @@ func TestOnVPNAddrAssigned_Callback_WiresMDNS(t *testing.T) {
 	// Override createTUN to succeed so we can test mDNS wiring.
 	originalCreateTUN := createTUN
 	newTun := tun.NewMemTUN("vel-test", netip.MustParsePrefix("10.10.0.1/24"), 1420)
-	createTUN = func(iface string, prefix netip.Prefix, mtu int) (tun.TUN, error) {
+	createTUN = func(name string, prefix netip.Prefix, mtu int, userspace bool) (tun.TUN, error) {
 		return newTun, nil
 	}
 	defer func() { createTUN = originalCreateTUN }()
 
-	cb := d.onVPNAddrAssigned(cfg, conn)
+	cb := d.onVPNAddrAssigned(cfg, conn, false)
 	cb(netip.MustParseAddr("10.10.0.1"), "10.10.0.0/24")
 
 	disc := d.mdnsDiscovery()

@@ -45,7 +45,7 @@ func TestCreateTUN_Linux(t *testing.T) {
 		t.Fatalf("parse prefix: %v", err)
 	}
 
-	dev, err := tun.CreateTUN("tuntst0", prefix, 1420)
+	dev, err := tun.CreateTUN("tuntst0", prefix, 1420, false)
 	if err != nil {
 		t.Fatalf("CreateTUN: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestCreateTUN_Linux_WriteRead(t *testing.T) {
 		t.Fatalf("parse prefix: %v", err)
 	}
 
-	dev, err := tun.CreateTUN("tuntst1", prefix, 1420)
+	dev, err := tun.CreateTUN("tuntst1", prefix, 1420, false)
 	if err != nil {
 		t.Fatalf("CreateTUN: %v", err)
 	}
