@@ -64,6 +64,8 @@ Or without Docker:
 
 > **Same TLS note applies:** pass `-tls-cert` and `-tls-key`, or put a TLS-terminating proxy in front.
 
+> **Behind a load balancer:** if the coordination server sits behind a TCP load balancer that sends PROXY protocol (v1/v2), pass `-proxy-protocol-from` with the balancer's CIDR (e.g. `-proxy-protocol-from 10.0.0.0/24`). Rate limiting then sees each client's real address instead of the balancer's. Headers are accepted only from those CIDRs; other peers must not send one. Empty (the default) disables it.
+
 # On each machine
 veld login --server your-server:50051 --token -   # paste the token, then Enter
 veld up

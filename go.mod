@@ -9,6 +9,7 @@ require (
 	github.com/flynn/noise v1.1.0
 	github.com/golang/protobuf v1.5.4
 	github.com/hashicorp/mdns v1.0.6
+	github.com/pires/go-proxyproto v0.15.0
 	github.com/spf13/cobra v1.8.1
 	github.com/vishvananda/netlink v1.3.0
 	go.etcd.io/bbolt v1.3.10
