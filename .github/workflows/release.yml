@@ -214,6 +214,24 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
 
+      # The AUR PKGBUILD gets this release's real checksums from the signed
+      # checksums.txt. It is generated from a copy, so the checkout is untouched.
+      # Skipped for pre-releases: their hyphenated tag is not a valid pkgver.
+      - name: Generate AUR PKGBUILD
+        if: ${{ !contains(github.ref_name, '-') }}
+        run: |
+          cp packaging/aur/PKGBUILD release-assets/PKGBUILD
+          sh packaging/aur/update-pkgbuild.sh "${GITHUB_REF_NAME#v}" \
+            release-assets/checksums.txt release-assets/PKGBUILD
+
+      - name: Upload AUR PKGBUILD
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" release-assets/PKGBUILD \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
       - name: Upload checksums artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
