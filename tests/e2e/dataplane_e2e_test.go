@@ -164,8 +164,10 @@ func TestDataplane_EndToEnd(t *testing.T) {
 	dispA.Start()
 	dispB.Start()
 	defer func() {
-		dispA.Stop(); dispB.Stop()
-		dispA.Wait(); dispB.Wait()
+		dispA.Stop()
+		dispB.Stop()
+		dispA.Wait()
+		dispB.Wait()
 	}()
 
 	// Inject a packet into tunA → dispA should encrypt and send to connA → connB → dispB → tunB.

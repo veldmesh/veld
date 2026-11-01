@@ -18,7 +18,6 @@ import (
 	"github.com/veldmesh/veld/internal/peer"
 )
 
-
 // testConn is a minimal net.PacketConn for testing.
 type testConn struct {
 	out    chan testMsg
@@ -655,6 +654,7 @@ func TestManager_PendingSessionPromotion(t *testing.T) {
 		t.Error("promoted session should be the same as pending session")
 	}
 }
+
 // TestManager_SimultaneousInitiation covers both sides initiating at once (as
 // happens at startup): each ends up with its own initiator session active,
 // and the session it responded to must stay available so the two converge.

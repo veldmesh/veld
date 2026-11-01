@@ -180,7 +180,7 @@ func buildARecord(ip4 []byte) []byte {
 	buf = appendU16(buf, dnsTypeA)
 	buf = appendU16(buf, dnsClassIN)
 	buf = append(buf, 0, 0, 0, dnsTTL) // TTL (4 bytes)
-	buf = appendU16(buf, 4)             // RDLENGTH
+	buf = appendU16(buf, 4)            // RDLENGTH
 	buf = append(buf, ip4...)
 	return buf
 }

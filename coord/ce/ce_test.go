@@ -13,10 +13,10 @@ import (
 
 // Verify each CE type satisfies its interface
 var (
-	_ coordcore.PlanEnforcer  = (*FreeEnforcer)(nil)
-	_ coordcore.AccountStore  = (*TokenAccountStore)(nil)
-	_ coordcore.AuditLogger   = (*NoopAuditLogger)(nil)
-	_ coordcore.SubnetPolicy  = (*RejectSubnetPolicy)(nil)
+	_ coordcore.PlanEnforcer   = (*FreeEnforcer)(nil)
+	_ coordcore.AccountStore   = (*TokenAccountStore)(nil)
+	_ coordcore.AuditLogger    = (*NoopAuditLogger)(nil)
+	_ coordcore.SubnetPolicy   = (*RejectSubnetPolicy)(nil)
 	_ coordcore.LifecycleHooks = (*NoopHooks)(nil)
 )
 

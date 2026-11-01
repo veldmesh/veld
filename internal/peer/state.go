@@ -33,14 +33,14 @@ type Entry struct {
 	Name         string         // peer name as registered (e.g. "server1")
 	SubnetRoutes []netip.Prefix // LAN prefixes this peer advertises (e.g. 192.168.1.0/24)
 
-	mu            sync.Mutex
-	endpoint      netip.AddrPort
-	session       *internalsession.Session
+	mu             sync.Mutex
+	endpoint       netip.AddrPort
+	session        *internalsession.Session
 	pendingSession *internalsession.Session
-	prevSession   *internalsession.Session
-	state         State
-	lastSeen      time.Time
-	holdQueue     [][]byte
+	prevSession    *internalsession.Session
+	state          State
+	lastSeen       time.Time
+	holdQueue      [][]byte
 }
 
 // GetEndpoint returns the peer's current UDP endpoint.

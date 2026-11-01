@@ -178,16 +178,16 @@ func TestKeystoreCorrupted(t *testing.T) {
 
 	// Create a valid keystore file structure
 	validKsf := map[string]interface{}{
-		"version":            1,
-		"ed25519_private":    base64.StdEncoding.EncodeToString(id.Ed25519Private),
-		"x25519_private":     base64.StdEncoding.EncodeToString(id.X25519Private[:]),
-		"x25519_pubkey_sig":  base64.StdEncoding.EncodeToString(id.X25519Sig[:]),
+		"version":           1,
+		"ed25519_private":   base64.StdEncoding.EncodeToString(id.Ed25519Private),
+		"x25519_private":    base64.StdEncoding.EncodeToString(id.X25519Private[:]),
+		"x25519_pubkey_sig": base64.StdEncoding.EncodeToString(id.X25519Sig[:]),
 	}
 
 	tests := []struct {
-		name        string
-		modify      func(map[string]interface{})
-		wantErrMsg  string
+		name       string
+		modify     func(map[string]interface{})
+		wantErrMsg string
 	}{
 		{
 			name: "short Ed25519 private key (32 bytes instead of 64)",

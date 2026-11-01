@@ -87,8 +87,10 @@ func TestStaticConfig_TwoPeers_Exchange(t *testing.T) {
 	dA.Start()
 	dB.Start()
 	defer func() {
-		dA.Stop(); dB.Stop()
-		dA.Wait(); dB.Wait()
+		dA.Stop()
+		dB.Stop()
+		dA.Wait()
+		dB.Wait()
 	}()
 
 	// Inject a packet into tunA destined for 10.100.0.2.

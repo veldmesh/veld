@@ -242,8 +242,10 @@ func TestCoordClient_LeaveRemovesPeer(t *testing.T) {
 		_, ok := tblA.LookupByID(bID)
 		return ok
 	}) {
-		cA.Stop(); cA.Wait()
-		cB.Stop(); cB.Wait()
+		cA.Stop()
+		cA.Wait()
+		cB.Stop()
+		cB.Wait()
 		t.Fatal("timeout: A did not discover B")
 	}
 

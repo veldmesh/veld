@@ -11,8 +11,8 @@ import (
 	"os"
 
 	"github.com/vishvananda/netlink"
-	wgtun "golang.zx2c4.com/wireguard/tun"
 	"golang.org/x/sys/unix"
+	wgtun "golang.zx2c4.com/wireguard/tun"
 )
 
 type linuxTUN struct {

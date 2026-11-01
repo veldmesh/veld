@@ -328,6 +328,7 @@ func TestStore_Migration_MixedFormats(t *testing.T) {
 		t.Errorf("expected 1 pin after re-pin, got %d", len(pins))
 	}
 }
+
 // TestStore_MovedKeyKeepsOldAddress covers moving a peer and then pinning a
 // new key at its old address: the old address must stay reserved, also
 // across a reload.
