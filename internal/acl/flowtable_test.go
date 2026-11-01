@@ -530,8 +530,8 @@ func TestFlowTable_BoundEnforcement_SingleGoroutine(t *testing.T) {
 	config.MaxFlows = 10000
 	ft := NewFlowTable(config)
 
-	// Add 100000 connection starts (10x the limit)
-	for i := 0; i < 100000; i++ {
+	// Add 1,000,000 connection starts (100x the limit)
+	for i := 0; i < 1_000_000; i++ {
 		f := Flow{
 			SrcIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: byte(i)},
 			DstIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 100},
@@ -559,8 +559,8 @@ func TestFlowTable_BoundEnforcement_Concurrent(t *testing.T) {
 	ft := NewFlowTable(config)
 
 	var wg sync.WaitGroup
-	numGoroutines := 4
-	perGoroutine := 25000 // 4 * 25000 = 100,000 > 50,000
+	numGoroutines := 8
+	perGoroutine := 125000 // 8 * 125000 = 1,000,000 > 50,000
 
 	for g := 0; g < numGoroutines; g++ {
 		wg.Add(1)

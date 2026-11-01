@@ -264,7 +264,6 @@ func (ft *FlowTable) Lookup(f Flow, createIfMissing bool, initialState FlowState
 			ft.unlinkEntry(entry)
 			ft.evictMu.Unlock()
 			ft.flowCount.Add(-1)
-			ok = false
 		} else {
 			entry.LastSeen = now
 			if entry.State == FlowStateNew && initialState == FlowStateEstablished {
@@ -306,30 +305,36 @@ func (ft *FlowTable) Lookup(f Flow, createIfMissing bool, initialState FlowState
 // evictOneLocked evicts a single oldest flow.
 // Called with shard lock held.
 func (ft *FlowTable) evictOneLocked() {
-	// Pop the oldest entry from the eviction list
-	ft.evictMu.Lock()
-	e := ft.popOldestEntry()
-	ft.evictMu.Unlock()
+	for {
+		// Pop the oldest entry from the eviction list
+		ft.evictMu.Lock()
+		e := ft.popOldestEntry()
+		ft.evictMu.Unlock()
 
-	if e == nil {
-		return
-	}
-
-	// Try to remove the entry from its shard
-	key, _ := NormalizeFlowKey(e.Flow)
-	shardIdx := hashFlowKey(key) & uint64(ft.shardMask)
-	targetShard := ft.shards[shardIdx]
-
-	// Use TryLock to avoid deadlock if target shard is the same as current
-	if targetShard.mu.TryLock() {
-		// Double-check the entry still exists
-		if _, ok := targetShard.flows[key]; ok {
-			delete(targetShard.flows, key)
-			ft.flowCount.Add(-1)
+		if e == nil {
+			return
 		}
-		targetShard.mu.Unlock()
+
+		// Try to remove the entry from its shard
+		key, _ := NormalizeFlowKey(e.Flow)
+		shardIdx := hashFlowKey(key) & uint64(ft.shardMask)
+		targetShard := ft.shards[shardIdx]
+
+		// Use TryLock to avoid deadlock if target shard is the same as current
+		if targetShard.mu.TryLock() {
+			// Double-check the entry still exists
+			if _, ok := targetShard.flows[key]; ok {
+				delete(targetShard.flows, key)
+				ft.flowCount.Add(-1)
+			}
+			targetShard.mu.Unlock()
+			return // Successfully evicted one entry
+		}
+		// If we couldn't lock (same shard as caller), re-link the entry and try the next oldest
+		ft.evictMu.Lock()
+		ft.linkEntryFront(e)
+		ft.evictMu.Unlock()
 	}
-	// If we couldn't lock, the entry will be evicted on next attempt
 }
 
 // UpdateState updates the state of a flow entry.
