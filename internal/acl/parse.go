@@ -37,9 +37,10 @@ func ParsePacket(pkt []byte) (Flow, Kind, error) {
 	}
 
 	version := pkt[0] >> 4
-	if version == 4 {
+	switch version {
+	case 4:
 		return parseIPv4(pkt)
-	} else if version == 6 {
+	case 6:
 		return parseIPv6(pkt)
 	}
 	return flow, KindOther, errors.New("unknown IP version")
@@ -367,9 +368,10 @@ func parseICMPError(flow Flow, icmp []byte) (Flow, Kind, error) {
 
 	// Parse quoted IP header
 	version := quoted[0] >> 4
-	if version == 4 {
+	switch version {
+	case 4:
 		return parseICMPErrorIPv4(flow, quoted)
-	} else if version == 6 {
+	case 6:
 		return parseICMPErrorIPv6(flow, quoted)
 	}
 	return flow, KindError, nil

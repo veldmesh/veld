@@ -51,7 +51,6 @@ func DefaultFlowTableConfig() FlowTableConfig {
 // FlowTable is a thread-safe flow table for connection tracking.
 // It uses a sharded map for scalability and a time-ordered list for LRU eviction.
 type FlowTable struct {
-	mu        sync.RWMutex
 	shards    []*flowShard
 	shardMask int
 	config    FlowTableConfig
@@ -334,6 +333,24 @@ func (ft *FlowTable) UpdateState(f Flow, state FlowState) bool {
 	return true
 }
 
+// RemoveFlow removes a flow entry by its normalized key.
+// Returns true if the flow was found and removed.
+func (ft *FlowTable) RemoveFlow(key FlowKey) bool {
+	shardIdx := hashFlowKey(key) & uint64(ft.shardMask)
+	shard := ft.shards[shardIdx]
+
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	entry, ok := shard.flows[key]
+	if !ok {
+		return false
+	}
+	delete(shard.flows, key)
+	ft.removeFromList(entry)
+	return true
+}
+
 // GetTimeout returns the idle timeout for a flow based on its protocol.
 func (ft *FlowTable) GetTimeout(proto Proto) time.Duration {
 	switch proto {
@@ -348,8 +365,9 @@ func (ft *FlowTable) GetTimeout(proto Proto) time.Duration {
 	}
 }
 
-// ExpireOldFlows removes flows that have been idle longer than their timeout.
-// Returns the number of expired flows.
+// ExpireOldFlows removes flows that have been idle longer than their timeout,
+// and also removes flows in closed state (TCP FIN/RST).
+// Returns the number of expired/removed flows.
 func (ft *FlowTable) ExpireOldFlows() int {
 	now := time.Now()
 	count := 0
@@ -357,7 +375,9 @@ func (ft *FlowTable) ExpireOldFlows() int {
 		shard.mu.Lock()
 		for key, entry := range shard.flows {
 			timeout := ft.GetTimeout(entry.Proto)
-			if now.Sub(entry.LastSeen) > timeout {
+			expired := now.Sub(entry.LastSeen) > timeout
+			closed := entry.State == FlowStateClosed
+			if expired || closed {
 				delete(shard.flows, key)
 				ft.removeFromList(entry)
 				count++
