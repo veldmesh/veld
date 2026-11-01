@@ -222,6 +222,17 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	}
 	d.hsMgr.TOFUCheck = tofuStore.Check
 
+	// Handshake replay state lives there too, so a restart keeps rejecting
+	// Inits it has already seen.
+	replayPath := filepath.Join(filepath.Dir(cfg.Node.IdentityPath), "handshake-replay.json")
+	if err := d.hsMgr.UseReplayState(replayPath); err != nil {
+		if tunDev != nil {
+			_ = tunDev.Close()
+		}
+		_ = conn.Close()
+		return nil, fmt.Errorf("load handshake replay state: %w", err)
+	}
+
 	// Wire up coord client and NAT manager if configured.
 	if cfg.Coord.Addr != "" {
 		d.mu.Lock()

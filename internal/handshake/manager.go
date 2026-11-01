@@ -5,8 +5,12 @@ package handshake
 import (
 	"crypto/ed25519"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"time"
 
@@ -55,8 +59,15 @@ type Manager struct {
 	TOFUCheck func(vpnAddr string, pub ed25519.PublicKey) error
 
 	// initTimestamps tracks the greatest accepted Init timestamp per peer ID.
-	// Used to reject replayed handshake initiations.
+	// Used to reject replayed handshake initiations. Entries older than
+	// crypto.MaxTimestampSkew are pruned: an Init that old fails the
+	// signature's freshness check anyway.
 	initTimestamps map[[32]byte]int64
+
+	// replayPath, if set, is where initTimestamps is saved after every
+	// accepted Init, so a restart does not forget them. saveMu orders writes.
+	replayPath string
+	saveMu     sync.Mutex
 
 	mu      sync.Mutex
 	pending map[[32]byte]*pendingHS
@@ -98,6 +109,12 @@ func (m *Manager) Initiate(entry *peer.Entry) {
 	}
 
 	hs, err := crypto.NewInitiatorHS(m.localID, entry.X25519Pub, m.networkID)
+	var msg1 []byte
+	if err == nil {
+		// Build message 1 before publishing hs in m.pending, so a response
+		// handled concurrently never sees a half-built handshake.
+		msg1, err = hs.BuildMessage1(time.Now().UnixNano())
+	}
 	if err != nil {
 		if exists {
 			// Restore previous state on failure.
@@ -115,14 +132,6 @@ func (m *Manager) Initiate(entry *peer.Entry) {
 	m.mu.Unlock()
 
 	entry.SetState(peer.StateHandshaking)
-
-	msg1, err := hs.BuildMessage1(time.Now().UnixNano())
-	if err != nil {
-		m.mu.Lock()
-		delete(m.pending, entry.ID)
-		m.mu.Unlock()
-		return
-	}
 
 	ep := entry.GetEndpoint()
 	if !ep.IsValid() {
@@ -179,11 +188,80 @@ func (m *Manager) HandleDataPacket(entry *peer.Entry, nonce uint64, ciphertext [
 
 // OnPeerRemoved cleans up handshake state for a peer that has been removed.
 // Call this when the peer table removes a peer (e.g., on Leave or expiration).
+// The peer's last Init timestamp is kept until it ages out, so an Init
+// recorded before the removal cannot be replayed if the peer comes back.
 func (m *Manager) OnPeerRemoved(peerID [32]byte) {
 	m.mu.Lock()
 	delete(m.pending, peerID)
-	delete(m.initTimestamps, peerID)
 	m.mu.Unlock()
+}
+
+// replayFile is the on-disk form of initTimestamps.
+type replayFile struct {
+	Version int              `json:"version"`
+	Peers   map[string]int64 `json:"peers"` // hex peer ID -> Init timestamp (ns)
+}
+
+// UseReplayState loads saved Init timestamps from path and saves them there
+// from now on. A missing file is not an error. Call it before the manager
+// handles any packet.
+func (m *Manager) UseReplayState(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	var f replayFile
+	if err == nil {
+		// A damaged file only loses the saved timestamps; start without them.
+		_ = json.Unmarshal(data, &f)
+	}
+	cutoff := time.Now().Add(-crypto.MaxTimestampSkew).UnixNano()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, ts := range f.Peers {
+		b, err := hex.DecodeString(k)
+		if err != nil || len(b) != 32 || ts < cutoff {
+			continue
+		}
+		var id [32]byte
+		copy(id[:], b)
+		if ts > m.initTimestamps[id] {
+			m.initTimestamps[id] = ts
+		}
+	}
+	m.replayPath = path
+	return nil
+}
+
+// pruneTimestampsLocked drops Init timestamps too old to matter and returns
+// a copy of the rest for saving. m.mu must be held.
+func (m *Manager) pruneTimestampsLocked() map[string]int64 {
+	cutoff := time.Now().Add(-crypto.MaxTimestampSkew).UnixNano()
+	out := make(map[string]int64, len(m.initTimestamps))
+	for id, ts := range m.initTimestamps {
+		if ts < cutoff {
+			delete(m.initTimestamps, id)
+			continue
+		}
+		out[hex.EncodeToString(id[:])] = ts
+	}
+	return out
+}
+
+// saveReplayState writes peers to m.replayPath. Errors are ignored: the
+// in-memory state still protects this run.
+func (m *Manager) saveReplayState(peers map[string]int64) {
+	data, err := json.Marshal(replayFile{Version: 1, Peers: peers})
+	if err != nil {
+		return
+	}
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+	tmp := m.replayPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, m.replayPath)
 }
 
 func (m *Manager) handleInit(noiseMsg []byte, addr net.Addr) {
@@ -229,7 +307,14 @@ func (m *Manager) handleInit(noiseMsg []byte, addr net.Addr) {
 		return // replayed or stale Init
 	}
 	m.initTimestamps[peerID] = ts
+	var snapshot map[string]int64
+	if m.replayPath != "" {
+		snapshot = m.pruneTimestampsLocked()
+	}
 	m.mu.Unlock()
+	if snapshot != nil {
+		m.saveReplayState(snapshot)
+	}
 
 	// TOFU check: verify the initiator's fingerprint matches prior connections.
 	if m.TOFUCheck != nil {
@@ -266,13 +351,14 @@ func (m *Manager) handleResp(noiseMsg []byte, addr net.Addr) {
 
 	m.mu.Lock()
 	phs, ok := m.pending[entry.ID]
+	m.mu.Unlock()
 	if !ok {
-		m.mu.Unlock()
 		return
 	}
-	delete(m.pending, entry.ID)
-	m.mu.Unlock()
 
+	// ProcessMessage2 leaves phs.hs unchanged on failure, so a response that
+	// does not verify is dropped and the handshake stays pending for the
+	// genuine one.
 	result, err := phs.hs.ProcessMessage2(noiseMsg, time.Now().UnixNano())
 	if err != nil {
 		return
@@ -292,6 +378,16 @@ func (m *Manager) handleResp(noiseMsg []byte, addr net.Addr) {
 			return // silently drop -- fingerprint mismatch
 		}
 	}
+
+	// Complete the handshake only once, and only if it is still the current
+	// attempt: a retry may have replaced it while the response was in flight.
+	m.mu.Lock()
+	if m.pending[entry.ID] != phs {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.pending, entry.ID)
+	m.mu.Unlock()
 
 	// Initiator side: the handshake is confirmed when we successfully process
 	// the Resp. Promote the session immediately.

@@ -150,6 +150,10 @@ func (id *Identity) SignForPeer(theirX25519Public [32]byte, timestampNano int64)
 	return sigArray, nil
 }
 
+// MaxTimestampSkew is how far a handshake timestamp may be from the local
+// clock, in either direction, for VerifyPeerSig to accept it.
+const MaxTimestampSkew = 30 * time.Second
+
 // NormalizeTimestamp interprets the raw 8-byte handshake timestamp as either
 // seconds or nanoseconds since epoch and returns the value in nanoseconds.
 // Values > 1e12 are treated as nanoseconds; values <= 1e12 are treated as seconds
@@ -188,7 +192,7 @@ func VerifyPeerSig(peerEd25519Public ed25519.PublicKey, peerX25519Public, ourX25
 	// Time window check: normalize timestamp to nanoseconds for comparison
 	tsNano := NormalizeTimestamp(timestampRaw)
 	now := time.Now().UnixNano()
-	if diff := now - tsNano; diff < -30_000_000_000 || diff > 30_000_000_000 {
+	if diff := now - tsNano; diff < -int64(MaxTimestampSkew) || diff > int64(MaxTimestampSkew) {
 		return fmt.Errorf("timestamp out of window: peer timestamp %d (normalized %d), now %d (diff %d nanoseconds, max +/-30s)", timestampRaw, tsNano, now, diff)
 	}
 
