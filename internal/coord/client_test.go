@@ -283,7 +283,11 @@ func TestClient_WatchLeave_RemovesPeerFromTable(t *testing.T) {
 		t.Fatal("timeout: OnPeerRemoved not called for LEAVE event")
 	}
 
-	if _, ok := tblA.LookupByID(bID); ok {
+	// The client removes the entry right after the callback returns.
+	if !waitFor(t, 3*time.Second, func() bool {
+		_, ok := tblA.LookupByID(bID)
+		return !ok
+	}) {
 		t.Error("peer B still in table after LEAVE")
 	}
 }
