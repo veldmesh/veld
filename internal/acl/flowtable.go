@@ -3,7 +3,7 @@
 package acl
 
 import (
-	"math/rand/v2"
+	"hash/maphash"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,7 +59,7 @@ type FlowTable struct {
 	evictList *evictList   // doubly-linked list for LRU eviction
 	evictMu   sync.Mutex   // protects evictList
 	flowCount atomic.Int64 // atomic counter for total flows
-	hashSeed  uint64       // random seed for hashFlowKey to prevent adversarial shard targeting
+	hashSeed  maphash.Seed // random seed for hashFlowKey to prevent adversarial shard targeting
 }
 
 // flowShard is a single shard of the flow table.
@@ -105,7 +105,7 @@ func NewFlowTable(config FlowTableConfig) *FlowTable {
 		shardMask: numShards - 1,
 		config:    config,
 		evictList: &evictList{},
-		hashSeed:  rand.Uint64(),
+		hashSeed:  maphash.MakeSeed(),
 	}
 	for i := range ft.shards {
 		ft.shards[i] = &flowShard{
@@ -167,25 +167,23 @@ func compareIPs(a, b [16]byte, ipv6 bool) int {
 	return 0
 }
 
-// hashFlowKey computes a hash for a flow key.
+// hashFlowKey computes a hash for a flow key using maphash.
+// This ensures all key fields (IPs, ports, proto) affect the low bits used for shard selection.
 func (ft *FlowTable) hashFlowKey(key FlowKey) uint64 {
-	h := ft.hashSeed
-	h ^= uint64(key.Proto) << 48
-	h ^= uint64(key.SrcPort) << 32
-	h ^= uint64(key.DstPort) << 16
+	var h maphash.Hash
+	h.SetSeed(ft.hashSeed)
+	// Write all key fields - maphash handles the mixing
+	h.Write(key.SrcIP[:])
+	h.Write(key.DstIP[:])
+	h.Write([]byte{byte(key.Proto)})
+	h.Write([]byte{byte(key.SrcPort >> 8), byte(key.SrcPort)})
+	h.Write([]byte{byte(key.DstPort >> 8), byte(key.DstPort)})
 	if key.IPv6 {
-		h ^= 1
+		h.Write([]byte{1})
+	} else {
+		h.Write([]byte{0})
 	}
-	// Mix in IP addresses
-	for i := 0; i < 16; i += 4 {
-		h ^= uint64(binaryBigEndian(key.SrcIP[i:i+4])) * 0x9e3779b97f4a7c15
-		h ^= uint64(binaryBigEndian(key.DstIP[i:i+4])) * 0x9e3779b97f4a7c15
-	}
-	return h
-}
-
-func binaryBigEndian(b []byte) uint32 {
-	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+	return h.Sum64()
 }
 
 // isEntryExpired checks if a flow entry has exceeded its idle timeout.

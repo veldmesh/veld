@@ -120,6 +120,7 @@ func resolveSubjectToPeers(subject string, peers map[string]PeerKey, tags map[st
 // src, dst are Ed25519 public keys (32 bytes).
 // proto is the IP protocol (TCP=6, UDP=17, ICMP=1, ICMPv6=58).
 // port is the destination port (ignored for ICMP).
+// Scans rules linearly; fine for v1 since Decide runs per new flow, not per packet.
 func (cp *CompiledPolicy) Decide(src, dst [32]byte, proto Proto, port uint16) Decision {
 	// Evaluate rules in file order (first match wins)
 	for _, rule := range cp.rules {

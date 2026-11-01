@@ -730,3 +730,65 @@ func TestFlowTable_EvictionPicksOldestIdle(t *testing.T) {
 		t.Error("flow 1 should have been evicted (oldest idle)")
 	}
 }
+
+// TestFlowTable_ShardDistribution verifies that flows between the same IP pair
+// with different source ports are distributed across multiple shards.
+// This prevents the issue where the old hash function would put all flows
+// between one IP pair in a single shard regardless of port differences.
+func TestFlowTable_ShardDistribution(t *testing.T) {
+	config := DefaultFlowTableConfig()
+	config.MaxFlows = 20000 // Large enough to hold all test flows
+	ft := NewFlowTable(config)
+
+	// Use a fixed IP pair, vary source port
+	srcIP := [16]byte{12: 10, 13: 0, 14: 0, 15: 1} // 10.0.0.1
+	dstIP := [16]byte{12: 10, 13: 0, 14: 0, 15: 2} // 10.0.0.2
+
+	numFlows := 10000
+	for i := 0; i < numFlows; i++ {
+		f := Flow{
+			SrcIP:   srcIP,
+			DstIP:   dstIP,
+			SrcPort: uint16(i),
+			DstPort: 22,
+			Proto:   ProtoTCP,
+			IPv6:    false,
+		}
+		ft.Lookup(f, true, FlowStateNew)
+	}
+
+	// Count flows per shard by examining the internal shard maps
+	shardCounts := make(map[int]int)
+	for i, shard := range ft.shards {
+		shard.mu.Lock()
+		shardCounts[i] = len(shard.flows)
+		shard.mu.Unlock()
+	}
+
+	// Count non-empty shards
+	nonEmptyShards := 0
+	for _, count := range shardCounts {
+		if count > 0 {
+			nonEmptyShards++
+		}
+	}
+
+	// With 64 shards and good hash distribution, flows should spread
+	// across at least half the shards (32). The old broken hash would
+	// put all flows in exactly 1 shard.
+	if nonEmptyShards < 32 {
+		t.Errorf("expected flows to spread across at least 32 shards, got %d non-empty shards", nonEmptyShards)
+		t.Logf("shard distribution: %v", shardCounts)
+	}
+
+	// Also verify no shard has an excessive concentration (> 50% of flows)
+	maxPerShard := 0
+	for _, count := range shardCounts {
+		if count > maxPerShard {
+			maxPerShard = count
+		}
+	}
+	if maxPerShard > numFlows/2 {
+		t.Errorf("one shard has too many flows (%d out of %d), hash not distributing well", maxPerShard, numFlows)
+	}
+}
