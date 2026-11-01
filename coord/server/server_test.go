@@ -1701,12 +1701,12 @@ func TestServer_Register_RequiresProofOfKeyPossession(t *testing.T) {
 		{"tampered timestamp", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
 			req.TimestampUnix++
 		}, codes.Unauthenticated},
-		{"stale timestamp (121 s old)", func(t *testing.T, req *coordv1.RegisterRequest, id *crypto.Identity) {
-			req.TimestampUnix = now - 121
+		{"stale timestamp (130 s old)", func(t *testing.T, req *coordv1.RegisterRequest, id *crypto.Identity) {
+			req.TimestampUnix = now - (crypto.RegisterTimestampWindow + 10)
 			req.Signature = crypto.SignRegister(id.Ed25519Private, registerClaimsFor(req))
 		}, codes.Unauthenticated},
-		{"future timestamp (121 s ahead)", func(t *testing.T, req *coordv1.RegisterRequest, id *crypto.Identity) {
-			req.TimestampUnix = now + 121
+		{"future timestamp (130 s ahead)", func(t *testing.T, req *coordv1.RegisterRequest, id *crypto.Identity) {
+			req.TimestampUnix = now + (crypto.RegisterTimestampWindow + 10)
 			req.Signature = crypto.SignRegister(id.Ed25519Private, registerClaimsFor(req))
 		}, codes.Unauthenticated},
 		{"malformed ed25519_public (not 32 bytes)", func(t *testing.T, req *coordv1.RegisterRequest, _ *crypto.Identity) {
@@ -1773,10 +1773,10 @@ func TestServer_Register_TimestampWindowEdge(t *testing.T) {
 func TestServer_Register_UniformAuthError(t *testing.T) {
 	srv, _ := newSignatureFixture(t)
 
-	// Case 1: stale timestamp (121 s old) with a valid signature for that timestamp.
+	// Case 1: stale timestamp (130 s old) with a valid signature for that timestamp.
 	id := newRegisterIdentity(t)
 	staleReq := newRegisterRequest(id, "net-a", "token-a", "stale", "1.2.3.4:51820", nil)
-	staleReq.TimestampUnix = time.Now().Unix() - 121
+	staleReq.TimestampUnix = time.Now().Unix() - (crypto.RegisterTimestampWindow + 10)
 	staleReq.Signature = crypto.SignRegister(id.Ed25519Private, registerClaimsFor(staleReq))
 
 	_, err := srv.Register(context.Background(), staleReq)
