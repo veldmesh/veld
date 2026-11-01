@@ -24,13 +24,8 @@ type Decision struct {
 // CompiledPolicy is an immutable, compiled policy optimized for fast Decide calls.
 // It is safe for concurrent use.
 type CompiledPolicy struct {
-	// For each destination peer, a list of rules that apply to it.
-	// Key: destination peer ID (32-byte Ed25519 public key)
-	// Value: list of rules sorted by priority (first match wins)
-	dstRules map[[32]byte][]compiledRule
-
-	// Rules with wildcard destination (to="*") - consulted for every destination
-	dstAnyRules []compiledRule
+	// All rules sorted by ruleIndex (file order) for first-match-wins semantics
+	rules []compiledRule
 
 	// Default action for packets that don't match any rule
 	defaultAction Action
@@ -45,7 +40,9 @@ type CompiledPolicy struct {
 // compiledRule is a rule compiled for fast matching.
 type compiledRule struct {
 	srcPeers  map[[32]byte]struct{} // source peers this rule applies to (empty means srcAny=true)
+	dstPeers  map[[32]byte]struct{} // destination peers this rule applies to (empty means dstAny=true)
 	srcAny    bool                  // true if rule applies to any source peer (from="*")
+	dstAny    bool                  // true if rule applies to any destination peer (to="*")
 	ports     []PortRange           // allowed protocols/ports
 	ruleIndex int                   // original rule index
 }
@@ -68,10 +65,8 @@ func (p *Policy) Compile() *CompiledPolicy {
 	}
 
 	// Resolve all rules to concrete (srcPeerID, dstPeerID) pairs
-	// For each destination peer, collect all rules that apply to it
-	dstRules := make(map[[32]byte][]compiledRule)
-	var dstAnyRules []compiledRule
-
+	// Rules are kept in file order (ruleIndex) for first-match-wins semantics
+	rules := make([]compiledRule, 0, len(p.Rules))
 	for ruleIdx, rule := range p.Rules {
 		srcSet := resolveSubjectToPeers(rule.From, p.Peers, p.Tags)
 		dstSet := resolveSubjectToPeers(rule.To, p.Peers, p.Tags)
@@ -81,25 +76,17 @@ func (p *Policy) Compile() *CompiledPolicy {
 
 		cr := compiledRule{
 			srcPeers:  srcSet,
+			dstPeers:  dstSet,
 			srcAny:    srcAny,
+			dstAny:    dstAny,
 			ports:     rule.Ports,
 			ruleIndex: ruleIdx,
 		}
-
-		if dstAny {
-			// Rule applies to any destination - add to wildcard list
-			dstAnyRules = append(dstAnyRules, cr)
-		} else {
-			// Rule applies to specific destinations
-			for dstID := range dstSet {
-				dstRules[dstID] = append(dstRules[dstID], cr)
-			}
-		}
+		rules = append(rules, cr)
 	}
 
 	return &CompiledPolicy{
-		dstRules:      dstRules,
-		dstAnyRules:   dstAnyRules,
+		rules:         rules,
 		defaultAction: Action(p.Default),
 		outboundOnly:  outboundOnly,
 		knownPeers:    knownPeers,
@@ -134,33 +121,15 @@ func resolveSubjectToPeers(subject string, peers map[string]PeerKey, tags map[st
 // proto is the IP protocol (TCP=6, UDP=17, ICMP=1, ICMPv6=58).
 // port is the destination port (ignored for ICMP).
 func (cp *CompiledPolicy) Decide(src, dst [32]byte, proto Proto, port uint16) Decision {
-	// Check destination-specific rules first
-	if rules, ok := cp.dstRules[dst]; ok {
-		for _, rule := range rules {
-			// Check if source peer matches (srcAny means any authenticated peer)
-			if !rule.srcAny {
-				if _, ok := rule.srcPeers[src]; !ok {
-					continue
-				}
-			}
-
-			// Check if protocol/port matches
-			for _, pr := range rule.ports {
-				if pr.MatchesProto(proto) {
-					if pr.ContainsPort(port) {
-						// Check outbound-only for known peers
-						if _, ok := cp.outboundOnly[dst]; ok {
-							return Decision{Action: ActionDeny, RuleIndex: -1, OutboundOnly: true}
-						}
-						return Decision{Action: ActionAllow, RuleIndex: rule.ruleIndex}
-					}
-				}
+	// Evaluate rules in file order (first match wins)
+	for _, rule := range cp.rules {
+		// Check if destination peer matches (dstAny means any peer)
+		if !rule.dstAny {
+			if _, ok := rule.dstPeers[dst]; !ok {
+				continue
 			}
 		}
-	}
 
-	// Then check wildcard destination rules (to="*")
-	for _, rule := range cp.dstAnyRules {
 		// Check if source peer matches (srcAny means any authenticated peer)
 		if !rule.srcAny {
 			if _, ok := rule.srcPeers[src]; !ok {

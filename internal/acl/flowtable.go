@@ -3,6 +3,7 @@
 package acl
 
 import (
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -58,6 +59,7 @@ type FlowTable struct {
 	evictList *evictList   // doubly-linked list for LRU eviction
 	evictMu   sync.Mutex   // protects evictList
 	flowCount atomic.Int64 // atomic counter for total flows
+	hashSeed  uint64       // random seed for hashFlowKey to prevent adversarial shard targeting
 }
 
 // flowShard is a single shard of the flow table.
@@ -103,6 +105,7 @@ func NewFlowTable(config FlowTableConfig) *FlowTable {
 		shardMask: numShards - 1,
 		config:    config,
 		evictList: &evictList{},
+		hashSeed:  rand.Uint64(),
 	}
 	for i := range ft.shards {
 		ft.shards[i] = &flowShard{
@@ -165,14 +168,15 @@ func compareIPs(a, b [16]byte, ipv6 bool) int {
 }
 
 // hashFlowKey computes a hash for a flow key.
-func hashFlowKey(key FlowKey) uint64 {
-	h := uint64(key.Proto) << 48
-	h |= uint64(key.SrcPort) << 32
-	h |= uint64(key.DstPort) << 16
+func (ft *FlowTable) hashFlowKey(key FlowKey) uint64 {
+	h := ft.hashSeed
+	h ^= uint64(key.Proto) << 48
+	h ^= uint64(key.SrcPort) << 32
+	h ^= uint64(key.DstPort) << 16
 	if key.IPv6 {
-		h |= 1
+		h ^= 1
 	}
-	// Mix in IP addresses (simplified hash)
+	// Mix in IP addresses
 	for i := 0; i < 16; i += 4 {
 		h ^= uint64(binaryBigEndian(key.SrcIP[i:i+4])) * 0x9e3779b97f4a7c15
 		h ^= uint64(binaryBigEndian(key.DstIP[i:i+4])) * 0x9e3779b97f4a7c15
@@ -222,6 +226,20 @@ func (ft *FlowTable) linkEntryFront(entry *FlowEntry) {
 	}
 }
 
+// linkEntryBack adds an entry to the back of the eviction list.
+// Caller must hold ft.evictMu.
+func (ft *FlowTable) linkEntryBack(entry *FlowEntry) {
+	entry.prev = ft.evictList.tail
+	entry.next = nil
+	if ft.evictList.tail != nil {
+		ft.evictList.tail.next = entry
+	}
+	ft.evictList.tail = entry
+	if ft.evictList.head == nil {
+		ft.evictList.head = entry
+	}
+}
+
 // moveToFrontLocked moves an entry to the front of the eviction list.
 // Caller must hold ft.evictMu.
 func (ft *FlowTable) moveToFrontLocked(entry *FlowEntry) {
@@ -246,7 +264,7 @@ func (ft *FlowTable) popOldestEntry() *FlowEntry {
 // Expired entries are treated as missing (deleted and nil returned).
 func (ft *FlowTable) Lookup(f Flow, createIfMissing bool, initialState FlowState) (*FlowEntry, bool, bool) {
 	key, isReply := NormalizeFlowKey(f)
-	shardIdx := hashFlowKey(key) & uint64(ft.shardMask)
+	shardIdx := ft.hashFlowKey(key) & uint64(ft.shardMask)
 	shard := ft.shards[shardIdx]
 
 	shard.mu.Lock()
@@ -283,7 +301,7 @@ func (ft *FlowTable) Lookup(f Flow, createIfMissing bool, initialState FlowState
 
 	// Check if we need to evict (global limit)
 	for ft.flowCount.Load() >= int64(ft.config.MaxFlows) {
-		ft.evictOneLocked()
+		ft.evictOneLocked(int(shardIdx))
 	}
 
 	entry = &FlowEntry{
@@ -303,9 +321,10 @@ func (ft *FlowTable) Lookup(f Flow, createIfMissing bool, initialState FlowState
 }
 
 // evictOneLocked evicts a single oldest flow.
-// Called with shard lock held.
-func (ft *FlowTable) evictOneLocked() {
-	for {
+// Called with shard lock held for callerShardIdx.
+func (ft *FlowTable) evictOneLocked(callerShardIdx int) {
+	const maxAttempts = 8
+	for attempts := 0; attempts < maxAttempts; attempts++ {
 		// Pop the oldest entry from the eviction list
 		ft.evictMu.Lock()
 		e := ft.popOldestEntry()
@@ -317,12 +336,20 @@ func (ft *FlowTable) evictOneLocked() {
 
 		// Try to remove the entry from its shard
 		key, _ := NormalizeFlowKey(e.Flow)
-		shardIdx := hashFlowKey(key) & uint64(ft.shardMask)
+		shardIdx := ft.hashFlowKey(key) & uint64(ft.shardMask)
 		targetShard := ft.shards[shardIdx]
 
-		// Use TryLock to avoid deadlock if target shard is the same as current
+		// If victim is in the same shard as caller, we already hold the lock
+		if int(shardIdx) == callerShardIdx {
+			if _, ok := targetShard.flows[key]; ok {
+				delete(targetShard.flows, key)
+				ft.flowCount.Add(-1)
+			}
+			return // Successfully evicted one entry
+		}
+
+		// TryLock for other shards
 		if targetShard.mu.TryLock() {
-			// Double-check the entry still exists
 			if _, ok := targetShard.flows[key]; ok {
 				delete(targetShard.flows, key)
 				ft.flowCount.Add(-1)
@@ -330,17 +357,19 @@ func (ft *FlowTable) evictOneLocked() {
 			targetShard.mu.Unlock()
 			return // Successfully evicted one entry
 		}
-		// If we couldn't lock (same shard as caller), re-link the entry and try the next oldest
+
+		// Could not lock target shard (contended), put victim back at TAIL to preserve LRU order
 		ft.evictMu.Lock()
-		ft.linkEntryFront(e)
+		ft.linkEntryBack(e)
 		ft.evictMu.Unlock()
 	}
+	// After maxAttempts, give up and allow temporary overshoot of at most one entry per concurrent inserter
 }
 
 // UpdateState updates the state of a flow entry.
 func (ft *FlowTable) UpdateState(f Flow, state FlowState) bool {
 	key, _ := NormalizeFlowKey(f)
-	shardIdx := hashFlowKey(key) & uint64(ft.shardMask)
+	shardIdx := ft.hashFlowKey(key) & uint64(ft.shardMask)
 	shard := ft.shards[shardIdx]
 
 	shard.mu.Lock()
@@ -372,7 +401,7 @@ func (ft *FlowTable) UpdateState(f Flow, state FlowState) bool {
 // RemoveFlow removes a flow entry by its normalized key.
 // Returns true if the flow was found and removed.
 func (ft *FlowTable) RemoveFlow(key FlowKey) bool {
-	shardIdx := hashFlowKey(key) & uint64(ft.shardMask)
+	shardIdx := ft.hashFlowKey(key) & uint64(ft.shardMask)
 	shard := ft.shards[shardIdx]
 
 	shard.mu.Lock()
