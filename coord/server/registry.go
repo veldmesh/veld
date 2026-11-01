@@ -4,6 +4,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -239,6 +240,10 @@ func (r *Registry) NetworkMachineCount(networkID string) (int, error) {
 // ErrMachineLimit is returned by RegisterPeer when the network is at capacity.
 var ErrMachineLimit = fmt.Errorf("machine limit reached")
 
+// ErrAddressSpaceExhausted is returned by RegisterPeer when every assignable
+// address in the network's CIDR is held by a peer.
+var ErrAddressSpaceExhausted = errors.New("address space exhausted")
+
 // ErrPeerIDTaken is returned by RegisterPeer when the peer ID (the Ed25519
 // public key) is already registered in a different network: peer IDs live
 // in one global namespace, so an existing registration is never moved to
@@ -341,7 +346,7 @@ func (r *Registry) RegisterPeer(p peerRecord, networkID string, maxMachines int)
 		} else {
 			free, ok := freeAddr(pb, networkID, cidr)
 			if !ok {
-				return fmt.Errorf("network %q address space exhausted", networkID)
+				return fmt.Errorf("network %q: %w", networkID, ErrAddressSpaceExhausted)
 			}
 			assigned = free
 		}

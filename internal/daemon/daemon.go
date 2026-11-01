@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,10 +48,10 @@ type Daemon struct {
 	routeMgr  route.Manager
 	// restoreIPForward puts IP forwarding back as it was before startup.
 	restoreIPForward func() error
-	ipcSrv    *IPCServer
-	peerTbl   *peer.Table
-	localID   *crypto.Identity
-	networkID [16]byte
+	ipcSrv           *IPCServer
+	peerTbl          *peer.Table
+	localID          *crypto.Identity
+	networkID        [16]byte
 
 	mu           sync.Mutex
 	vpnAddr      netip.Addr
@@ -239,12 +240,13 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 		d.coordAddr = cfg.Coord.Addr
 		d.mu.Unlock()
 
+		hostname, _ := os.Hostname()
 		coordCfg := coord.Config{
 			ServerAddr:   cfg.Coord.Addr,
 			NetworkID:    cfg.Coord.NetworkID,
 			Token:        cfg.Coord.Token,
 			Identity:     localID,
-			LocalName:    "host",
+			LocalName:    advertisedPeerName(cfg.MDNS.Name, hostname),
 			Endpoint:     advertisedEndpoint(cfg.Node.ListenAddr),
 			SubnetRoutes: cfg.Node.SubnetRoutes,
 			PeerTable:    peerTbl,
@@ -564,6 +566,41 @@ func advertisedEndpoint(listenAddr string) string {
 		return ""
 	}
 	return listenAddr
+}
+
+// peerNameMaxLen is the longest peer name the coord server accepts (a DNS label).
+const peerNameMaxLen = 63
+
+// advertisedPeerName returns the name this node registers with the coord.
+// The configured name wins, then the hostname. The result is lowercased, every
+// character other than a letter or digit becomes '-', leading and trailing
+// hyphens are trimmed and the result is cut to a DNS label. "node" is used
+// when nothing usable is left.
+func advertisedPeerName(configured, hostname string) string {
+	name := configured
+	if name == "" {
+		name = hostname
+	}
+	var b strings.Builder
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'A' && c <= 'Z':
+			b.WriteByte(c + ('a' - 'A'))
+		case (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'):
+			b.WriteByte(c)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	s := strings.Trim(b.String(), "-")
+	if len(s) > peerNameMaxLen {
+		s = strings.TrimRight(s[:peerNameMaxLen], "-")
+	}
+	if s == "" {
+		return "node"
+	}
+	return s
 }
 
 // addPeerRoutes installs OS routes for the subnets e advertises, skipping
