@@ -29,6 +29,9 @@ type CompiledPolicy struct {
 	// Value: list of rules sorted by priority (first match wins)
 	dstRules map[[32]byte][]compiledRule
 
+	// Rules with wildcard destination (to="*") - consulted for every destination
+	dstAnyRules []compiledRule
+
 	// Default action for packets that don't match any rule
 	defaultAction Action
 
@@ -41,7 +44,8 @@ type CompiledPolicy struct {
 
 // compiledRule is a rule compiled for fast matching.
 type compiledRule struct {
-	srcPeers  map[[32]byte]struct{} // source peers this rule applies to
+	srcPeers  map[[32]byte]struct{} // source peers this rule applies to (empty means srcAny=true)
+	srcAny    bool                  // true if rule applies to any source peer (from="*")
 	ports     []PortRange           // allowed protocols/ports
 	ruleIndex int                   // original rule index
 }
@@ -66,28 +70,63 @@ func (p *Policy) Compile() *CompiledPolicy {
 	// Resolve all rules to concrete (srcPeerID, dstPeerID) pairs
 	// For each destination peer, collect all rules that apply to it
 	dstRules := make(map[[32]byte][]compiledRule)
+	var dstAnyRules []compiledRule
 
 	for ruleIdx, rule := range p.Rules {
-		srcSet := resolveSubject(rule.From, p.Peers, p.Tags)
-		dstSet := resolveSubject(rule.To, p.Peers, p.Tags)
+		srcSet := resolveSubjectToPeers(rule.From, p.Peers, p.Tags)
+		dstSet := resolveSubjectToPeers(rule.To, p.Peers, p.Tags)
 
-		for dstID := range dstSet {
-			// Create a compiled rule for this destination
-			cr := compiledRule{
-				srcPeers:  srcSet,
-				ports:     rule.Ports,
-				ruleIndex: ruleIdx,
+		srcAny := rule.From == "*"
+		dstAny := rule.To == "*"
+
+		cr := compiledRule{
+			srcPeers:  srcSet,
+			srcAny:    srcAny,
+			ports:     rule.Ports,
+			ruleIndex: ruleIdx,
+		}
+
+		if dstAny {
+			// Rule applies to any destination - add to wildcard list
+			dstAnyRules = append(dstAnyRules, cr)
+		} else {
+			// Rule applies to specific destinations
+			for dstID := range dstSet {
+				dstRules[dstID] = append(dstRules[dstID], cr)
 			}
-			dstRules[dstID] = append(dstRules[dstID], cr)
 		}
 	}
 
 	return &CompiledPolicy{
 		dstRules:      dstRules,
+		dstAnyRules:   dstAnyRules,
 		defaultAction: Action(p.Default),
 		outboundOnly:  outboundOnly,
 		knownPeers:    knownPeers,
 	}
+}
+
+// resolveSubjectToPeers resolves a subject (peer name, tag, or "*") to a set of peer IDs.
+// Returns empty set for "*" (wildcard), which is handled separately via srcAny/dstAny flags.
+func resolveSubjectToPeers(subject string, peers map[string]PeerKey, tags map[string][]string) map[[32]byte]struct{} {
+	result := make(map[[32]byte]struct{})
+	if subject == "*" {
+		// Wildcard - caller should use srcAny/dstAny flag instead
+		return result
+	}
+	if len(subject) >= 4 && subject[:4] == "tag:" {
+		tagName := subject[4:]
+		for _, pn := range tags[tagName] {
+			if key, ok := peers[pn]; ok {
+				result[key] = struct{}{}
+			}
+		}
+		return result
+	}
+	if key, ok := peers[subject]; ok {
+		result[key] = struct{}{}
+	}
+	return result
 }
 
 // Decide evaluates a packet against the compiled policy.
@@ -95,37 +134,62 @@ func (p *Policy) Compile() *CompiledPolicy {
 // proto is the IP protocol (TCP=6, UDP=17, ICMP=1, ICMPv6=58).
 // port is the destination port (ignored for ICMP).
 func (cp *CompiledPolicy) Decide(src, dst [32]byte, proto Proto, port uint16) Decision {
-	// Check if destination is a known peer
-	if _, ok := cp.knownPeers[dst]; !ok {
-		return Decision{Action: cp.defaultAction, RuleIndex: -1}
+	// Check destination-specific rules first
+	if rules, ok := cp.dstRules[dst]; ok {
+		for _, rule := range rules {
+			// Check if source peer matches (srcAny means any authenticated peer)
+			if !rule.srcAny {
+				if _, ok := rule.srcPeers[src]; !ok {
+					continue
+				}
+			}
+
+			// Check if protocol/port matches
+			for _, pr := range rule.ports {
+				if pr.MatchesProto(proto) {
+					if pr.ContainsPort(port) {
+						// Check outbound-only for known peers
+						if _, ok := cp.outboundOnly[dst]; ok {
+							return Decision{Action: ActionDeny, RuleIndex: -1, OutboundOnly: true}
+						}
+						return Decision{Action: ActionAllow, RuleIndex: rule.ruleIndex}
+					}
+				}
+			}
+		}
 	}
 
-	// Check if destination is outbound-only (inbound connections denied)
-	if _, ok := cp.outboundOnly[dst]; ok {
-		return Decision{Action: ActionDeny, RuleIndex: -1, OutboundOnly: true}
-	}
-
-	// Look up rules for this destination
-	rules, ok := cp.dstRules[dst]
-	if !ok {
-		return Decision{Action: cp.defaultAction, RuleIndex: -1}
-	}
-
-	// Check each rule in order (first match wins)
-	for _, rule := range rules {
-		// Check if source peer matches
-		if _, ok := rule.srcPeers[src]; !ok {
-			continue
+	// Then check wildcard destination rules (to="*")
+	for _, rule := range cp.dstAnyRules {
+		// Check if source peer matches (srcAny means any authenticated peer)
+		if !rule.srcAny {
+			if _, ok := rule.srcPeers[src]; !ok {
+				continue
+			}
 		}
 
 		// Check if protocol/port matches
 		for _, pr := range rule.ports {
 			if pr.MatchesProto(proto) {
 				if pr.ContainsPort(port) {
+					// Check outbound-only for known peers
+					if _, ok := cp.outboundOnly[dst]; ok {
+						return Decision{Action: ActionDeny, RuleIndex: -1, OutboundOnly: true}
+					}
 					return Decision{Action: ActionAllow, RuleIndex: rule.ruleIndex}
 				}
 			}
 		}
+	}
+
+	// No rule matched - check if destination is a known peer
+	if _, ok := cp.knownPeers[dst]; !ok {
+		return Decision{Action: cp.defaultAction, RuleIndex: -1}
+	}
+
+	// Known peer but no rule matched - check outbound-only
+	if _, ok := cp.outboundOnly[dst]; ok {
+		return Decision{Action: ActionDeny, RuleIndex: -1, OutboundOnly: true}
 	}
 
 	return Decision{Action: cp.defaultAction, RuleIndex: -1}

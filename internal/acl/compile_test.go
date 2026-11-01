@@ -454,3 +454,117 @@ ports = ["tcp/22"]
 	}
 	_ = p
 }
+
+func TestDecide_StarSubject_AnySource(t *testing.T) {
+	// Policy with only alice and bob in peers
+	src := `
+version = 1
+default = "deny"
+[peers]
+alice = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bob   = "ed25519:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+[[rule]]
+from = "*"
+to   = "bob"
+ports = ["tcp/22"]
+`
+	p, _, err := ParsePolicy(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := p.Compile()
+
+	// Test with alice (known peer) -> bob
+	aliceKey := p.Peers["alice"]
+	bobKey := p.Peers["bob"]
+	dec := cp.Decide(aliceKey, bobKey, ProtoTCP, 22)
+	if dec.Action != ActionAllow {
+		t.Errorf("alice->bob: got %v, want allow", dec.Action)
+	}
+
+	// Test with unknown peer -> bob (should be allowed per spec: * means ANY authenticated peer)
+	var unknownKey PeerKey
+	unknownKey[0] = 99
+	dec = cp.Decide(unknownKey, bobKey, ProtoTCP, 22)
+	if dec.Action != ActionAllow {
+		t.Errorf("unknown->bob: got %v, want allow (per spec * means ANY authenticated peer)", dec.Action)
+	}
+}
+
+func TestDecide_StarSubject_AnyDestination(t *testing.T) {
+	src := `
+version = 1
+default = "deny"
+[peers]
+alice = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bob   = "ed25519:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+[[rule]]
+from = "alice"
+to   = "*"
+ports = ["tcp/22"]
+`
+	p, _, err := ParsePolicy(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := p.Compile()
+
+	// alice -> bob (known peer)
+	dec := cp.Decide(p.Peers["alice"], p.Peers["bob"], ProtoTCP, 22)
+	if dec.Action != ActionAllow {
+		t.Errorf("alice->bob (to=*): got %v, want allow", dec.Action)
+	}
+
+	// alice -> unknown peer (should be allowed per spec)
+	var unknownKey PeerKey
+	unknownKey[0] = 99
+	dec = cp.Decide(p.Peers["alice"], unknownKey, ProtoTCP, 22)
+	if dec.Action != ActionAllow {
+		t.Errorf("alice->unknown (to=*): got %v, want allow (per spec * means ANY authenticated peer)", dec.Action)
+	}
+}
+
+func TestDecide_StarSubject_BothWildcard(t *testing.T) {
+	src := `
+version = 1
+default = "deny"
+[peers]
+alice = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bob   = "ed25519:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+[[rule]]
+from = "*"
+to   = "*"
+ports = ["tcp/22"]
+`
+	p, _, err := ParsePolicy(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := p.Compile()
+
+	// known -> known
+	dec := cp.Decide(p.Peers["alice"], p.Peers["bob"], ProtoTCP, 22)
+	if dec.Action != ActionAllow {
+		t.Errorf("alice->bob: got %v, want allow", dec.Action)
+	}
+
+	// unknown -> known
+	var unknownKey PeerKey
+	unknownKey[0] = 99
+	dec = cp.Decide(unknownKey, p.Peers["bob"], ProtoTCP, 22)
+	if dec.Action != ActionAllow {
+		t.Errorf("unknown->bob: got %v, want allow", dec.Action)
+	}
+
+	// known -> unknown
+	dec = cp.Decide(p.Peers["alice"], unknownKey, ProtoTCP, 22)
+	if dec.Action != ActionAllow {
+		t.Errorf("alice->unknown: got %v, want allow", dec.Action)
+	}
+
+	// unknown -> unknown
+	dec = cp.Decide(unknownKey, unknownKey, ProtoTCP, 22)
+	if dec.Action != ActionAllow {
+		t.Errorf("unknown->unknown: got %v, want allow", dec.Action)
+	}
+}

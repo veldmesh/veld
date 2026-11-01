@@ -3,6 +3,7 @@
 package acl
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -519,5 +520,213 @@ func TestFlowTable_GetTimeout(t *testing.T) {
 	}
 	if ft.GetTimeout(ProtoICMPv6) != 30*time.Second {
 		t.Errorf("ICMPv6 timeout: got %v, want 30s", ft.GetTimeout(ProtoICMPv6))
+	}
+}
+
+// Gate tests for flow table bounds and expiration
+
+func TestFlowTable_BoundEnforcement_SingleGoroutine(t *testing.T) {
+	config := DefaultFlowTableConfig()
+	config.MaxFlows = 10000
+	ft := NewFlowTable(config)
+
+	// Add 100000 connection starts (10x the limit)
+	for i := 0; i < 100000; i++ {
+		f := Flow{
+			SrcIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: byte(i)},
+			DstIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 100},
+			SrcPort: uint16(10000 + i),
+			DstPort: 22,
+			Proto:   ProtoTCP,
+			IPv6:    false,
+		}
+		ft.Lookup(f, true, FlowStateNew)
+	}
+
+	// Should have evicted to stay within bound
+	if ft.Len() > config.MaxFlows {
+		t.Errorf("flow table exceeded max flows: got %d, max %d", ft.Len(), config.MaxFlows)
+	}
+	// Should be close to max (allowing for some races in eviction)
+	if ft.Len() < config.MaxFlows/2 {
+		t.Errorf("flow table too empty: got %d, max %d", ft.Len(), config.MaxFlows)
+	}
+}
+
+func TestFlowTable_BoundEnforcement_Concurrent(t *testing.T) {
+	config := DefaultFlowTableConfig()
+	config.MaxFlows = 50000
+	ft := NewFlowTable(config)
+
+	var wg sync.WaitGroup
+	numGoroutines := 4
+	perGoroutine := 25000 // 4 * 25000 = 100,000 > 50,000
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				f := Flow{
+					SrcIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: byte(gid)},
+					DstIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: byte(i)},
+					SrcPort: uint16(10000 + gid*1000 + i),
+					DstPort: 22,
+					Proto:   ProtoTCP,
+					IPv6:    false,
+				}
+				ft.Lookup(f, true, FlowStateNew)
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	// Should have evicted to stay within bound
+	if ft.Len() > config.MaxFlows {
+		t.Errorf("flow table exceeded max flows under concurrency: got %d, max %d", ft.Len(), config.MaxFlows)
+	}
+	// Should be close to max
+	if ft.Len() < config.MaxFlows/2 {
+		t.Errorf("flow table too empty under concurrency: got %d, max %d", ft.Len(), config.MaxFlows)
+	}
+}
+
+func TestFlowTable_ExpiredFlowsTreatedAsMissing(t *testing.T) {
+	config := DefaultFlowTableConfig()
+	config.TCPIdleTimeout = 10 * time.Millisecond
+	ft := NewFlowTable(config)
+
+	f := Flow{
+		SrcIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 1},
+		DstIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 2},
+		SrcPort: 12345,
+		DstPort: 22,
+		Proto:   ProtoTCP,
+		IPv6:    false,
+	}
+
+	// Create flow
+	entry, _, _ := ft.Lookup(f, true, FlowStateNew)
+	if entry == nil {
+		t.Fatal("entry should be created")
+	}
+
+	// Wait for expiration
+	time.Sleep(20 * time.Millisecond)
+
+	// Lookup without createIfMissing - should return nil because flow is expired
+	entry, _, created := ft.Lookup(f, false, FlowStateNew)
+	if entry != nil {
+		t.Errorf("expired flow should be treated as missing, got entry with state %v", entry.State)
+	}
+	if created {
+		t.Error("should not create new entry on lookup without createIfMissing")
+	}
+
+	// Lookup with createIfMissing should create a new entry
+	entry, _, created = ft.Lookup(f, true, FlowStateNew)
+	if entry == nil {
+		t.Fatal("new entry should be created")
+	}
+	if !created {
+		t.Error("should create new entry on lookup with createIfMissing")
+	}
+}
+
+func TestFlowTable_UpdateState_ExpiredEntry(t *testing.T) {
+	config := DefaultFlowTableConfig()
+	config.TCPIdleTimeout = 10 * time.Millisecond
+	ft := NewFlowTable(config)
+
+	f := Flow{
+		SrcIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 1},
+		DstIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 2},
+		SrcPort: 12345,
+		DstPort: 22,
+		Proto:   ProtoTCP,
+		IPv6:    false,
+	}
+
+	// Create flow
+	ft.Lookup(f, true, FlowStateNew)
+	if ft.Len() != 1 {
+		t.Fatalf("expected 1 flow, got %d", ft.Len())
+	}
+
+	// Wait for expiration
+	time.Sleep(20 * time.Millisecond)
+
+	// UpdateState on expired flow should return false
+	ok := ft.UpdateState(f, FlowStateEstablished)
+	if ok {
+		t.Error("UpdateState on expired flow should return false")
+	}
+	if ft.Len() != 0 {
+		t.Errorf("expired flow should be removed, got %d flows", ft.Len())
+	}
+}
+
+func TestFlowTable_EvictionPicksOldestIdle(t *testing.T) {
+	config := DefaultFlowTableConfig()
+	config.MaxFlows = 5
+	ft := NewFlowTable(config)
+
+	// Add 5 flows
+	for i := 0; i < 5; i++ {
+		f := Flow{
+			SrcIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: byte(i)},
+			DstIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 100},
+			SrcPort: uint16(10000 + i),
+			DstPort: 22,
+			Proto:   ProtoTCP,
+			IPv6:    false,
+		}
+		ft.Lookup(f, true, FlowStateNew)
+	}
+
+	// Access the first flow to make it recently used
+	f0 := Flow{
+		SrcIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 0},
+		DstIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 100},
+		SrcPort: 10000,
+		DstPort: 22,
+		Proto:   ProtoTCP,
+		IPv6:    false,
+	}
+	e0, _, _ := ft.Lookup(f0, false, FlowStateNew)
+	if e0 == nil {
+		t.Fatal("flow 0 should exist")
+	}
+
+	// Add one more flow - should evict the oldest (flow 1, not flow 0)
+	f5 := Flow{
+		SrcIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 5},
+		DstIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 100},
+		SrcPort: 10005,
+		DstPort: 22,
+		Proto:   ProtoTCP,
+		IPv6:    false,
+	}
+	ft.Lookup(f5, true, FlowStateNew)
+
+	// Flow 0 should still exist (was recently accessed)
+	e0, _, _ = ft.Lookup(f0, false, FlowStateNew)
+	if e0 == nil {
+		t.Error("flow 0 should not have been evicted (recently accessed)")
+	}
+
+	// Flow 1 should have been evicted
+	f1 := Flow{
+		SrcIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 1},
+		DstIP:   [16]byte{12: 10, 13: 0, 14: 0, 15: 100},
+		SrcPort: 10001,
+		DstPort: 22,
+		Proto:   ProtoTCP,
+		IPv6:    false,
+	}
+	e1, _, _ := ft.Lookup(f1, false, FlowStateNew)
+	if e1 != nil {
+		t.Error("flow 1 should have been evicted (oldest idle)")
 	}
 }

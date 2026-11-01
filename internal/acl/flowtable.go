@@ -4,6 +4,7 @@ package acl
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -54,8 +55,9 @@ type FlowTable struct {
 	shards    []*flowShard
 	shardMask int
 	config    FlowTableConfig
-	evictList *evictList // doubly-linked list for LRU eviction
-	evictMu   sync.Mutex // protects evictList
+	evictList *evictList   // doubly-linked list for LRU eviction
+	evictMu   sync.Mutex   // protects evictList
+	flowCount atomic.Int64 // atomic counter for total flows
 }
 
 // flowShard is a single shard of the flow table.
@@ -182,124 +184,16 @@ func binaryBigEndian(b []byte) uint32 {
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }
 
-// Lookup looks up a flow by its key. Returns the entry and whether it was the reply direction.
-// If createIfMissing is true, creates a new entry with the given state.
-func (ft *FlowTable) Lookup(f Flow, createIfMissing bool, initialState FlowState) (*FlowEntry, bool, bool) {
-	key, isReply := NormalizeFlowKey(f)
-	shardIdx := hashFlowKey(key) & uint64(ft.shardMask)
-	shard := ft.shards[shardIdx]
-
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	entry, ok := shard.flows[key]
-	if ok {
-		entry.LastSeen = time.Now()
-		if entry.State == FlowStateNew && initialState == FlowStateEstablished {
-			entry.State = FlowStateEstablished
-		}
-		ft.moveToFront(entry)
-		return entry, isReply, false
-	}
-
-	if !createIfMissing {
-		return nil, isReply, false
-	}
-
-	// Check if we need to evict (global limit)
-	if ft.totalFlowsLocked() >= ft.config.MaxFlows {
-		ft.evictGlobalOldestLocked()
-	}
-
-	now := time.Now()
-	entry = &FlowEntry{
-		Flow:       f,
-		Created:    now,
-		LastSeen:   now,
-		State:      initialState,
-		IsReplyDir: isReply,
-	}
-	shard.flows[key] = entry
-	ft.addToFront(entry)
-	return entry, isReply, true
+// isEntryExpired checks if a flow entry has exceeded its idle timeout.
+// Caller must hold the shard lock.
+func (ft *FlowTable) isEntryExpired(entry *FlowEntry, now time.Time) bool {
+	timeout := ft.GetTimeout(entry.Proto)
+	return now.Sub(entry.LastSeen) > timeout
 }
 
-// totalFlowsLocked returns the total number of flows across all shards.
-// Caller must hold at least one shard lock (to avoid deadlock, we use a simple approach).
-func (ft *FlowTable) totalFlowsLocked() int {
-	count := 0
-	for _, shard := range ft.shards {
-		// Try to lock, skip if busy (approximate count is fine for eviction decision)
-		if shard.mu.TryLock() {
-			count += len(shard.flows)
-			shard.mu.Unlock()
-		}
-	}
-	return count
-}
-
-// evictGlobalOldestLocked evicts the globally oldest flow from the eviction list.
-// Caller must hold a shard lock.
-func (ft *FlowTable) evictGlobalOldestLocked() {
-	// Walk the eviction list from tail (oldest) to find an entry we can evict
-	ft.evictMu.Lock()
-	defer ft.evictMu.Unlock()
-
-	for e := ft.evictList.tail; e != nil; e = e.prev {
-		key, _ := NormalizeFlowKey(e.Flow)
-		shardIdx := hashFlowKey(key) & uint64(ft.shardMask)
-		targetShard := ft.shards[shardIdx]
-
-		// Try to lock the target shard
-		if targetShard.mu.TryLock() {
-			// Double-check the entry still exists
-			if _, ok := targetShard.flows[key]; ok {
-				delete(targetShard.flows, key)
-				ft.removeFromListLocked(e)
-			}
-			targetShard.mu.Unlock()
-			return
-		}
-	}
-}
-
-// moveToFront moves an entry to the front of the eviction list (most recently used).
-func (ft *FlowTable) moveToFront(entry *FlowEntry) {
-	ft.removeFromList(entry)
-	ft.addToFront(entry)
-}
-
-// addToFront adds an entry to the front of the eviction list.
-func (ft *FlowTable) addToFront(entry *FlowEntry) {
-	ft.evictMu.Lock()
-	defer ft.evictMu.Unlock()
-	ft.addToFrontLocked(entry)
-}
-
-// addToFrontLocked adds an entry to the front of the eviction list.
+// unlinkEntry removes an entry from the eviction list.
 // Caller must hold ft.evictMu.
-func (ft *FlowTable) addToFrontLocked(entry *FlowEntry) {
-	entry.next = ft.evictList.head
-	entry.prev = nil
-	if ft.evictList.head != nil {
-		ft.evictList.head.prev = entry
-	}
-	ft.evictList.head = entry
-	if ft.evictList.tail == nil {
-		ft.evictList.tail = entry
-	}
-}
-
-// removeFromList removes an entry from the eviction list.
-func (ft *FlowTable) removeFromList(entry *FlowEntry) {
-	ft.evictMu.Lock()
-	defer ft.evictMu.Unlock()
-	ft.removeFromListLocked(entry)
-}
-
-// removeFromListLocked removes an entry from the eviction list.
-// Caller must hold ft.evictMu.
-func (ft *FlowTable) removeFromListLocked(entry *FlowEntry) {
+func (ft *FlowTable) unlinkEntry(entry *FlowEntry) {
 	if entry.prev != nil {
 		entry.prev.next = entry.next
 	} else {
@@ -312,6 +206,130 @@ func (ft *FlowTable) removeFromListLocked(entry *FlowEntry) {
 	}
 	entry.prev = nil
 	entry.next = nil
+}
+
+// linkEntryFront adds an entry to the front of the eviction list.
+// Caller must hold ft.evictMu.
+func (ft *FlowTable) linkEntryFront(entry *FlowEntry) {
+	entry.next = ft.evictList.head
+	entry.prev = nil
+	if ft.evictList.head != nil {
+		ft.evictList.head.prev = entry
+	}
+	ft.evictList.head = entry
+	if ft.evictList.tail == nil {
+		ft.evictList.tail = entry
+	}
+}
+
+// moveToFrontLocked moves an entry to the front of the eviction list.
+// Caller must hold ft.evictMu.
+func (ft *FlowTable) moveToFrontLocked(entry *FlowEntry) {
+	ft.unlinkEntry(entry)
+	ft.linkEntryFront(entry)
+}
+
+// popOldestEntry removes and returns the oldest entry from the eviction list.
+// Caller must hold ft.evictMu.
+// Returns nil if list is empty.
+func (ft *FlowTable) popOldestEntry() *FlowEntry {
+	e := ft.evictList.tail
+	if e == nil {
+		return nil
+	}
+	ft.unlinkEntry(e)
+	return e
+}
+
+// Lookup looks up a flow by its key. Returns the entry and whether it was the reply direction.
+// If createIfMissing is true, creates a new entry with the given state.
+// Expired entries are treated as missing (deleted and nil returned).
+func (ft *FlowTable) Lookup(f Flow, createIfMissing bool, initialState FlowState) (*FlowEntry, bool, bool) {
+	key, isReply := NormalizeFlowKey(f)
+	shardIdx := hashFlowKey(key) & uint64(ft.shardMask)
+	shard := ft.shards[shardIdx]
+
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	entry, ok := shard.flows[key]
+	now := time.Now()
+	if ok {
+		// Check if entry is expired
+		if ft.isEntryExpired(entry, now) {
+			// Treat expired entry as missing - delete it
+			delete(shard.flows, key)
+			// Remove from eviction list
+			ft.evictMu.Lock()
+			ft.unlinkEntry(entry)
+			ft.evictMu.Unlock()
+			ft.flowCount.Add(-1)
+			ok = false
+		} else {
+			entry.LastSeen = now
+			if entry.State == FlowStateNew && initialState == FlowStateEstablished {
+				entry.State = FlowStateEstablished
+			}
+			// Move to front of LRU list
+			ft.evictMu.Lock()
+			ft.moveToFrontLocked(entry)
+			ft.evictMu.Unlock()
+			return entry, isReply, false
+		}
+	}
+
+	if !createIfMissing {
+		return nil, isReply, false
+	}
+
+	// Check if we need to evict (global limit)
+	for ft.flowCount.Load() >= int64(ft.config.MaxFlows) {
+		ft.evictOneLocked()
+	}
+
+	entry = &FlowEntry{
+		Flow:       f,
+		Created:    now,
+		LastSeen:   now,
+		State:      initialState,
+		IsReplyDir: isReply,
+	}
+	shard.flows[key] = entry
+	// Add to front of LRU list
+	ft.evictMu.Lock()
+	ft.linkEntryFront(entry)
+	ft.evictMu.Unlock()
+	ft.flowCount.Add(1)
+	return entry, isReply, true
+}
+
+// evictOneLocked evicts a single oldest flow.
+// Called with shard lock held.
+func (ft *FlowTable) evictOneLocked() {
+	// Pop the oldest entry from the eviction list
+	ft.evictMu.Lock()
+	e := ft.popOldestEntry()
+	ft.evictMu.Unlock()
+
+	if e == nil {
+		return
+	}
+
+	// Try to remove the entry from its shard
+	key, _ := NormalizeFlowKey(e.Flow)
+	shardIdx := hashFlowKey(key) & uint64(ft.shardMask)
+	targetShard := ft.shards[shardIdx]
+
+	// Use TryLock to avoid deadlock if target shard is the same as current
+	if targetShard.mu.TryLock() {
+		// Double-check the entry still exists
+		if _, ok := targetShard.flows[key]; ok {
+			delete(targetShard.flows, key)
+			ft.flowCount.Add(-1)
+		}
+		targetShard.mu.Unlock()
+	}
+	// If we couldn't lock, the entry will be evicted on next attempt
 }
 
 // UpdateState updates the state of a flow entry.
@@ -327,9 +345,22 @@ func (ft *FlowTable) UpdateState(f Flow, state FlowState) bool {
 	if !ok {
 		return false
 	}
+	// Check if entry is expired
+	now := time.Now()
+	if ft.isEntryExpired(entry, now) {
+		delete(shard.flows, key)
+		ft.evictMu.Lock()
+		ft.unlinkEntry(entry)
+		ft.evictMu.Unlock()
+		ft.flowCount.Add(-1)
+		return false
+	}
 	entry.State = state
-	entry.LastSeen = time.Now()
-	ft.moveToFront(entry)
+	entry.LastSeen = now
+	// Move to front of LRU list
+	ft.evictMu.Lock()
+	ft.moveToFrontLocked(entry)
+	ft.evictMu.Unlock()
 	return true
 }
 
@@ -347,7 +378,10 @@ func (ft *FlowTable) RemoveFlow(key FlowKey) bool {
 		return false
 	}
 	delete(shard.flows, key)
-	ft.removeFromList(entry)
+	ft.evictMu.Lock()
+	ft.unlinkEntry(entry)
+	ft.evictMu.Unlock()
+	ft.flowCount.Add(-1)
 	return true
 }
 
@@ -379,7 +413,10 @@ func (ft *FlowTable) ExpireOldFlows() int {
 			closed := entry.State == FlowStateClosed
 			if expired || closed {
 				delete(shard.flows, key)
-				ft.removeFromList(entry)
+				ft.evictMu.Lock()
+				ft.unlinkEntry(entry)
+				ft.evictMu.Unlock()
+				ft.flowCount.Add(-1)
 				count++
 			}
 		}
@@ -390,13 +427,7 @@ func (ft *FlowTable) ExpireOldFlows() int {
 
 // Len returns the total number of flows in the table.
 func (ft *FlowTable) Len() int {
-	count := 0
-	for _, shard := range ft.shards {
-		shard.mu.Lock()
-		count += len(shard.flows)
-		shard.mu.Unlock()
-	}
-	return count
+	return int(ft.flowCount.Load())
 }
 
 // Stats returns statistics about the flow table.
