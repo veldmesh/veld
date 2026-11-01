@@ -513,7 +513,8 @@ func TestManager_PendingHoldDropsGarbage(t *testing.T) {
 		{
 			name: "future timestamp",
 			envelope: func(t *testing.T, idB *crypto.Identity) []byte {
-				return buildEnvelope(t, []byte("future"), idA, idB, idB.X25519Public, idA.Ed25519Private, now+signalMaxSkewSec+1)
+				// Well past the limit: the clock may tick over before the check.
+				return buildEnvelope(t, []byte("future"), idA, idB, idB.X25519Public, idA.Ed25519Private, now+signalMaxSkewSec+10)
 			},
 		},
 		{
