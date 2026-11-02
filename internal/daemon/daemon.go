@@ -53,12 +53,13 @@ type Daemon struct {
 	localID          *crypto.Identity
 	networkID        [16]byte
 
-	mu           sync.Mutex
-	vpnAddr      netip.Addr
-	peerID       string
-	coordAddr    string
-	relayProxies map[[32]byte]*relay.Proxy // one relay proxy per peer ID
-	tunDev       tun.TUN                   // veld's own TUN; nil in coord mode until the coordinator assigns the VPN address
+	mu              sync.Mutex
+	vpnAddr         netip.Addr
+	peerID          string
+	coordAddr       string
+	relayProxies    map[[32]byte]*relay.Proxy // one relay proxy per peer ID
+	tunDev          tun.TUN                   // veld's own TUN; nil in coord mode until the coordinator assigns the VPN address
+	tofuMismatchLog map[string]time.Time      // last log time per VPN address for TOFU mismatch rate limiting
 }
 
 // New creates a Daemon from pre-constructed components.
@@ -222,6 +223,11 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 		return nil, fmt.Errorf("load TOFU store: %w", err)
 	}
 	d.hsMgr.TOFUCheck = tofuStore.Check
+
+	// Wire up TOFU mismatch logging with rate limiting (one log per address per 10 minutes).
+	d.hsMgr.OnTOFUMismatch = func(vpnAddr string, fingerprint [32]byte) {
+		d.logTOFUMismatch(vpnAddr)
+	}
 
 	// Handshake replay state lives there too, so a restart keeps rejecting
 	// Inits it has already seen.
@@ -664,6 +670,24 @@ func (d *Daemon) logRouteCollisions(pfx netip.Prefix) {
 	for _, c := range coexist.CheckRoute(pfx, d.selfInterface()) {
 		fmt.Printf("%s\n", c)
 	}
+}
+
+// logTOFUMismatch logs a TOFU fingerprint mismatch for the given VPN address,
+// rate-limited to once per 10 minutes per address.
+func (d *Daemon) logTOFUMismatch(vpnAddr string) {
+	d.mu.Lock()
+	if d.tofuMismatchLog == nil {
+		d.tofuMismatchLog = make(map[string]time.Time)
+	}
+	now := time.Now()
+	if last, ok := d.tofuMismatchLog[vpnAddr]; ok && now.Sub(last) < 10*time.Minute {
+		d.mu.Unlock()
+		return
+	}
+	d.tofuMismatchLog[vpnAddr] = now
+	d.mu.Unlock()
+
+	log.Printf("tofu: dropped handshake for %s: it is pinned to a different key. If that node was replaced or reinstalled, run \"veld tofu forget %s\" on this node.", vpnAddr, vpnAddr)
 }
 
 func buildPeerTable(peerCfgs []intconfig.PeerConfig) (*peer.Table, error) {

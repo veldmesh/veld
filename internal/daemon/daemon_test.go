@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"strings"
@@ -872,5 +873,126 @@ func TestAdvertisedPeerName(t *testing.T) {
 				t.Errorf("advertisedPeerName(%q, %q) = %q, longer than %d", tt.configured, tt.hostname, got, peerNameMaxLen)
 			}
 		})
+	}
+}
+
+// TestLogTOFUMismatch_RateLimited tests that logTOFUMismatch is rate-limited
+// to once per 10 minutes per VPN address.
+func TestLogTOFUMismatch_RateLimited(t *testing.T) {
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	var networkID [16]byte
+	d := New(id, networkID, nil, newFakeConn(), peer.New())
+
+	var buf strings.Builder
+	originalOutput := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(originalOutput)
+
+	addr1 := "10.100.0.5"
+	addr2 := "10.100.0.6"
+
+	// First mismatch for addr1 -> should log
+	d.logTOFUMismatch(addr1)
+	output := buf.String()
+	if !strings.Contains(output, addr1) {
+		t.Errorf("log should contain address %s, got: %s", addr1, output)
+	}
+	if !strings.Contains(output, "veld tofu forget") {
+		t.Errorf("log should contain remediation hint, got: %s", output)
+	}
+
+	// Second mismatch for addr1 within 10 minutes -> should NOT log
+	buf.Reset()
+	d.logTOFUMismatch(addr1)
+	output = buf.String()
+	if strings.Contains(output, "tofu: dropped handshake") {
+		t.Errorf("expected no log (rate-limited), got: %s", output)
+	}
+
+	// Mismatch for a different address -> should log
+	buf.Reset()
+	d.logTOFUMismatch(addr2)
+	output = buf.String()
+	if !strings.Contains(output, addr2) {
+		t.Errorf("second log should contain address %s, got: %s", addr2, output)
+	}
+	secondLogCount := strings.Count(output, "tofu: dropped handshake")
+	if secondLogCount != 1 {
+		t.Errorf("expected 1 log line for new address, got %d: %s", secondLogCount, output)
+	}
+}
+
+// TestLogTOFUMismatch_DifferentAddresses tests that different addresses
+// each get their own rate-limited log line.
+func TestLogTOFUMismatch_DifferentAddresses(t *testing.T) {
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	var networkID [16]byte
+	d := New(id, networkID, nil, newFakeConn(), peer.New())
+
+	var buf strings.Builder
+	originalOutput := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(originalOutput)
+
+	addresses := []string{"10.100.0.1", "10.100.0.2", "10.100.0.3"}
+
+	for _, addr := range addresses {
+		buf.Reset()
+		d.logTOFUMismatch(addr)
+		output := buf.String()
+		if !strings.Contains(output, addr) {
+			t.Errorf("log for %s should contain the address, got: %s", addr, output)
+		}
+		if strings.Count(output, "tofu: dropped handshake") != 1 {
+			t.Errorf("expected 1 log line for %s, got: %s", addr, output)
+		}
+	}
+}
+
+// TestLogTOFUMismatch_ExpiredRateLimit tests that after the 10-minute window
+// expires, a new log line is emitted for the same address.
+func TestLogTOFUMismatch_ExpiredRateLimit(t *testing.T) {
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	var networkID [16]byte
+	d := New(id, networkID, nil, newFakeConn(), peer.New())
+
+	var buf strings.Builder
+	originalOutput := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(originalOutput)
+
+	addr := "10.100.0.99"
+
+	// First mismatch -> logs
+	buf.Reset()
+	d.logTOFUMismatch(addr)
+	output := buf.String()
+	if !strings.Contains(output, addr) {
+		t.Errorf("first log should contain address %s, got: %s", addr, output)
+	}
+
+	// Manually expire the rate limit by setting the last log time to 11 minutes ago
+	d.mu.Lock()
+	d.tofuMismatchLog[addr] = time.Now().Add(-11 * time.Minute)
+	d.mu.Unlock()
+
+	// Second mismatch -> should log again (rate limit expired)
+	buf.Reset()
+	d.logTOFUMismatch(addr)
+	output = buf.String()
+	if !strings.Contains(output, addr) {
+		t.Errorf("second log should contain address %s, got: %s", addr, output)
+	}
+	if strings.Count(output, "tofu: dropped handshake") != 1 {
+		t.Errorf("expected 1 log line after rate limit expired, got: %s", output)
 	}
 }

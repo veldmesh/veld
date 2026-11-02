@@ -304,7 +304,7 @@ func TestManager_DeliverSignal_RejectsWrongSigner(t *testing.T) {
 func TestManager_DeliverSignal_RejectsStaleTimestamp(t *testing.T) {
 	f := newDeliveryFixture(t)
 
-	f.deliver(f.idA, f.idA, time.Now().Unix() - (signalMaxAgeSec + 10))
+	f.deliver(f.idA, f.idA, time.Now().Unix()-(signalMaxAgeSec+10))
 
 	if f.expectProbe(800 * time.Millisecond) {
 		t.Fatal("stale signal was accepted")
@@ -314,7 +314,7 @@ func TestManager_DeliverSignal_RejectsStaleTimestamp(t *testing.T) {
 func TestManager_DeliverSignal_RejectsFutureTimestamp(t *testing.T) {
 	f := newDeliveryFixture(t)
 
-	f.deliver(f.idA, f.idA, time.Now().Unix() + (signalMaxSkewSec + 10))
+	f.deliver(f.idA, f.idA, time.Now().Unix()+(signalMaxSkewSec+10))
 
 	if f.expectProbe(800 * time.Millisecond) {
 		t.Fatal("future-timestamped signal was accepted")
