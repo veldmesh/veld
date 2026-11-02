@@ -24,7 +24,7 @@ func TestCreateTUN_Windows(t *testing.T) {
 		t.Fatalf("parse prefix: %v", err)
 	}
 
-	dev, err := tun.CreateTUN("veld-test0", prefix, 1420)
+	dev, err := tun.CreateTUN("veld-test0", prefix, 1420, false)
 	if err != nil {
 		// wintun requires admin + wintun.dll; skip gracefully in unprivileged CI
 		t.Skipf("CreateTUN: %v (requires administrator + wintun.dll)", err)
@@ -48,7 +48,7 @@ func TestCreateTUN_Windows_WriteRead(t *testing.T) {
 		t.Fatalf("parse prefix: %v", err)
 	}
 
-	dev, err := tun.CreateTUN("veld-test1", prefix, 1420)
+	dev, err := tun.CreateTUN("veld-test1", prefix, 1420, false)
 	if err != nil {
 		t.Skipf("CreateTUN: %v (requires administrator + wintun.dll)", err)
 	}

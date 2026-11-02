@@ -43,9 +43,9 @@ func tunCreateError(name string, err error) error {
 	return fmt.Errorf("tun create %s: %w (hint: %s)", name, err, wintunMissingHint)
 }
 
-// CreateTUN creates a Wintun adapter, assigns ip to it, and brings it up.
+// createTUN creates a Wintun adapter, assigns ip to it, and brings it up.
 // Requires administrator privileges; wintun.dll must be on PATH or next to the binary.
-func CreateTUN(name string, ip netip.Prefix, mtu int) (TUN, error) {
+func createTUN(name string, ip netip.Prefix, mtu int) (TUN, error) {
 	dev, err := wgtun.CreateTUN(name, mtu)
 	if err != nil {
 		return nil, tunCreateError(name, err)
