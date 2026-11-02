@@ -21,6 +21,7 @@ require (
 )
 
 require (
+	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/miekg/dns v1.1.55 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect

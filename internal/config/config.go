@@ -59,9 +59,15 @@ type CoordConfig struct {
 	RelayX25519 string `toml:"relay_x25519"` // base64 32-byte pinned relay static key; required if relay_addr set
 }
 
+// PolicyConfig holds local ACL policy settings.
+type PolicyConfig struct {
+	LocalFile string `toml:"local_file"` // path to local policy TOML file; empty = no local policy
+}
+
 // DaemonConfig holds daemon process settings.
 type DaemonConfig struct {
-	SocketPath string `toml:"socket_path"` // IPC Unix socket path; empty = platform default
+	SocketPath string       `toml:"socket_path"` // IPC Unix socket path; empty = platform default
+	Policy     PolicyConfig `toml:"policy"`
 }
 
 // PeerConfig holds the static configuration for one remote peer.

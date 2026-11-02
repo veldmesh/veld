@@ -3,12 +3,16 @@
 package dataplane
 
 import (
+	"encoding/binary"
 	"errors"
+	"log"
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/veldmesh/veld/internal/acl"
 	"github.com/veldmesh/veld/internal/peer"
 	"github.com/veldmesh/veld/internal/session"
 	"github.com/veldmesh/veld/internal/tun"
@@ -54,6 +58,20 @@ type Dispatcher struct {
 	// peer's hold queue via FlushHoldQueue.
 	OnSessionEstablished func(entry *peer.Entry)
 
+	// ACL policy decider (local + network)
+	policyDecider atomic.Pointer[acl.PolicyDecider]
+
+	// This node's Ed25519 public key (for ACL decisions)
+	selfPeerID [32]byte
+
+	// Flow table for connection tracking
+	flowTable *acl.FlowTable
+
+	// Drop counters and logging
+	dropCounters *acl.DropCounters
+	lastDropLog  atomic.Int64 // unix nano of last drop log
+	flowLogged   sync.Map     // flow key -> bool (whether first drop logged)
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -62,10 +80,12 @@ type Dispatcher struct {
 // New creates a Dispatcher. Call Start to launch the I/O goroutines.
 func New(t tun.TUN, conn net.PacketConn, peers *peer.Table) *Dispatcher {
 	return &Dispatcher{
-		tun:    t,
-		conn:   conn,
-		peers:  peers,
-		stopCh: make(chan struct{}),
+		tun:           t,
+		conn:          conn,
+		peers:         peers,
+		stopCh:        make(chan struct{}),
+		flowTable:     acl.NewFlowTable(acl.DefaultFlowTableConfig()),
+		dropCounters:  acl.NewDropCounters(),
 	}
 }
 
@@ -75,6 +95,9 @@ func (d *Dispatcher) Start() {
 	go d.tunLoop()
 	go d.udpLoop()
 	go d.rekeyLoop()
+	// Flow expiration loop
+	d.wg.Add(1)
+	go d.expireFlowsLoop()
 }
 
 // SetTUN sets the TUN device. If the dispatcher was started with a nil TUN
@@ -87,6 +110,25 @@ func (d *Dispatcher) SetTUN(t tun.TUN) {
 		d.wg.Add(1)
 		go d.tunLoop()
 	}
+}
+
+// SetPolicyDecider sets the ACL policy decider for this dispatcher.
+func (d *Dispatcher) SetPolicyDecider(pd acl.PolicyDecider) {
+	d.policyDecider.Store(&pd)
+}
+
+// SetSelfPeerID sets this node's Ed25519 public key for ACL decisions.
+func (d *Dispatcher) SetSelfPeerID(id [32]byte) {
+	d.selfPeerID = id
+}
+
+// getPolicyDecider returns the current policy decider, or nil if not set.
+func (d *Dispatcher) getPolicyDecider() acl.PolicyDecider {
+	ptr := d.policyDecider.Load()
+	if ptr == nil {
+		return nil
+	}
+	return *ptr
 }
 
 // Stop closes the TUN and UDP conn, causing both loops to exit.
@@ -157,6 +199,42 @@ func (d *Dispatcher) checkRekey() {
 	}
 }
 
+// expireFlowsLoop periodically expires old flows and logs drop counters.
+func (d *Dispatcher) expireFlowsLoop() {
+	defer d.wg.Done()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.stopCh:
+			return
+		case <-ticker.C:
+			d.flowTable.ExpireOldFlows()
+			d.logDropCounters()
+		}
+	}
+}
+
+// logDropCounters logs a periodic summary of drop counters.
+func (d *Dispatcher) logDropCounters() {
+	byPeer, byRule, byOO := d.dropCounters.Snapshot()
+	total := uint64(0)
+	for _, v := range byPeer {
+		total += v
+	}
+	for _, v := range byRule {
+		total += v
+	}
+	for _, v := range byOO {
+		total += v
+	}
+	if total > 0 {
+		log.Printf("acl: drops - total=%d by_peer=%d by_rule=%d by_outbound_only=%d",
+			total, len(byPeer), len(byRule), len(byOO))
+	}
+}
+
 // tunLoop reads raw IP packets from TUN and sends them encrypted over UDP.
 // If TUN is nil (coord mode before VPN address assignment), the loop exits immediately.
 func (d *Dispatcher) tunLoop() {
@@ -184,12 +262,39 @@ func (d *Dispatcher) tunLoop() {
 func (d *Dispatcher) handleTunPacket(pkt []byte) {
 	destIP, ok := extractDestIP(pkt)
 	if !ok {
+		log.Printf("handleTunPacket: failed to extract dest IP")
 		return
 	}
 
 	entry, ok := d.peers.LookupByVPN(destIP)
 	if !ok {
+		log.Printf("handleTunPacket: no peer for dest IP %v", destIP)
 		return
+	}
+
+	// Parse packet to get protocol and port for ACL check
+	flow, kind, err := acl.ParsePacket(pkt)
+	if err != nil {
+		log.Printf("handleTunPacket: parse packet error: %v", err)
+		// Unparseable packet - skip ACL check for outbound (local app may send various packet types)
+		// but continue with encryption
+		flow = acl.Flow{}
+		kind = acl.KindOther
+	}
+
+	// Outbound ACL check: this peer (self) -> destination peer
+	pd := d.getPolicyDecider()
+	log.Printf("handleTunPacket: policyDecider=%v, selfPeerID=%x, dstPeerID=%x, flow=%+v", pd != nil, d.selfPeerID[:8], entry.ID[:8], flow)
+	if pd != nil && flow.Proto != 0 {
+		dstPeerID := entry.ID
+		srcPeerID := d.selfPeerID
+		dec := pd.Decide(srcPeerID, dstPeerID, flow.Proto, flow.DstPort)
+		log.Printf("handleTunPacket: ACL decision: %+v", dec)
+		if dec.Action == acl.ActionDeny {
+			d.recordDrop(dstPeerID, dec, kind)
+			d.sendReject(entry, flow, pkt)
+			return
+		}
 	}
 
 	sess := entry.GetSession()
@@ -225,6 +330,11 @@ func (d *Dispatcher) handleTunPacket(pkt []byte) {
 	ep := entry.GetEndpoint()
 	if !ep.IsValid() {
 		return
+	}
+
+	// Record flow for reply tracking (outbound direction)
+	if kind == acl.KindStart {
+		d.flowTable.Lookup(flow, true, acl.FlowStateNew)
 	}
 
 	udpPkt := buildDataPacket(nonce, ct)
@@ -275,6 +385,49 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 			return
 		}
 
+		// Inbound ACL check and flow tracking
+		var flow acl.Flow
+		var kind acl.Kind
+		pd := d.getPolicyDecider()
+		if pd != nil {
+			// Parse packet for ACL check only when policy is enforced
+			var err error
+			flow, kind, err = acl.ParsePacket(plain)
+			if err != nil {
+				// Unparseable packet - drop under default deny for inbound
+				log.Printf("handleUDPPacket: parse packet error: %v", err)
+				return
+			}
+
+			srcPeerID := entry.ID
+			dstPeerID := d.selfPeerID
+			dec := pd.Decide(srcPeerID, dstPeerID, flow.Proto, flow.DstPort)
+			if dec.Action == acl.ActionDeny {
+				d.recordDrop(srcPeerID, dec, kind)
+				return
+			}
+		}
+
+		// Flow tracking (only if we parsed the packet)
+		if pd != nil {
+			flowEntry, isReply, created := d.flowTable.Lookup(flow, true, acl.FlowStateNew)
+			if kind == acl.KindStart && !isReply && created {
+				// New outbound flow started - already recorded in handleTunPacket
+				// For inbound, we need to check if there's a matching outbound flow
+				if isReply {
+					// This is a reply to an existing flow
+					if flowEntry != nil {
+						flowEntry.State = acl.FlowStateEstablished
+					}
+				}
+			} else if kind == acl.KindEnd {
+				// Connection end (TCP FIN/RST) - mark flow as closing
+				if flowEntry != nil {
+					d.flowTable.UpdateState(flow, acl.FlowStateClosing)
+				}
+			}
+		}
+
 		entry.Touch()
 		d.tunMu.RLock()
 		t := d.tun
@@ -308,6 +461,122 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 			d.OnNATProbePacket(pktCopy, addr)
 		}
 	}
+}
+
+// recordDrop records a dropped packet and logs the first drop per flow.
+func (d *Dispatcher) recordDrop(peerID [32]byte, dec acl.Decision, kind acl.Kind) {
+	d.dropCounters.IncrementPeer(peerID)
+	if dec.RuleIndex >= 0 {
+		d.dropCounters.IncrementRule(dec.RuleIndex)
+	}
+	if dec.OutboundOnly {
+		d.dropCounters.IncrementOutboundOnly(peerID)
+	}
+
+	// Log first drop per flow (rate-limited by flow)
+	// We use a simple approach: log if it's been more than 60 seconds since last log
+	now := time.Now().UnixNano()
+	lastLog := d.lastDropLog.Load()
+	if now-lastLog > 60*time.Second.Nanoseconds() {
+		if d.lastDropLog.CompareAndSwap(lastLog, now) {
+			log.Printf("acl: drop peer=%x action=deny rule=%d outbound_only=%v kind=%v",
+				peerID[:8], dec.RuleIndex, dec.OutboundOnly, kind)
+		}
+	}
+}
+
+// sendReject sends a rejection packet (TCP RST or ICMP admin prohibited) back to the local app.
+func (d *Dispatcher) sendReject(entry *peer.Entry, flow acl.Flow, originalPkt []byte) {
+	// Build a reject packet and inject it into the TUN
+	// For TCP, send RST; for others, send ICMP admin prohibited
+	d.tunMu.RLock()
+	t := d.tun
+	d.tunMu.RUnlock()
+	if t == nil {
+		return
+	}
+
+	// Extract source and dest from original packet
+	srcIP, _ := extractSrcIP(originalPkt)
+	dstIP, _ := extractDestIP(originalPkt)
+
+	var rejectPkt []byte
+	if flow.Proto == acl.ProtoTCP {
+		// Build TCP RST packet
+		rejectPkt = buildTCPRST(flow, srcIP, dstIP)
+	} else {
+		// Build ICMP/ICMPv6 admin prohibited
+		rejectPkt = buildICMPAdminProhibited(flow, srcIP, dstIP, originalPkt)
+	}
+
+	if rejectPkt != nil {
+		_, _ = t.Write(rejectPkt)
+	}
+}
+
+// buildTCPRST builds a TCP RST packet in response to a SYN.
+func buildTCPRST(flow acl.Flow, srcIP, dstIP netip.Addr) []byte {
+	// Swap src/dst for the response
+	rstFlow := flow
+	rstFlow.SrcIP, rstFlow.DstIP = flow.DstIP, flow.SrcIP
+	rstFlow.SrcPort, rstFlow.DstPort = flow.DstPort, flow.SrcPort
+
+	if flow.IPv6 {
+		// IPv6 TCP RST
+		pkt := make([]byte, 40+20) // IPv6 header + TCP header
+		// IPv6 header
+		pkt[0] = 0x60 // Version=6
+		pkt[1] = 0x00
+		pkt[2] = 0x00
+		pkt[3] = 0x00
+		binary.BigEndian.PutUint16(pkt[4:6], 20) // Payload length
+		pkt[6] = 6                               // Next header = TCP
+		pkt[7] = 64                              // Hop limit
+		// Src/Dst IP
+		copy(pkt[8:24], rstFlow.SrcIP[:])
+		copy(pkt[24:40], rstFlow.DstIP[:])
+		// TCP header
+		binary.BigEndian.PutUint16(pkt[40:42], rstFlow.SrcPort)
+		binary.BigEndian.PutUint16(pkt[42:44], rstFlow.DstPort)
+		binary.BigEndian.PutUint32(pkt[44:48], 0) // Seq
+		binary.BigEndian.PutUint32(pkt[48:52], 0) // Ack
+		pkt[52] = 0x50                            // Data offset=5
+		pkt[53] = 0x04                            // Flags = RST
+		// Window, Checksum, Urgent = 0
+		return pkt
+	} else {
+		// IPv4 TCP RST
+		pkt := make([]byte, 20+20) // IPv4 header + TCP header
+		// IPv4 header
+		pkt[0] = 0x45 // Version=4, IHL=5
+		pkt[1] = 0x00
+		binary.BigEndian.PutUint16(pkt[2:4], 40) // Total length
+		binary.BigEndian.PutUint16(pkt[4:6], 0)  // ID
+		binary.BigEndian.PutUint16(pkt[6:8], 0)  // Flags + FragOffset
+		pkt[8] = 64                              // TTL
+		pkt[9] = 6                               // Protocol = TCP
+		// Checksum = 0 (kernel will fill)
+		copy(pkt[12:16], rstFlow.SrcIP[12:16])
+		copy(pkt[16:20], rstFlow.DstIP[12:16])
+		// TCP header
+		binary.BigEndian.PutUint16(pkt[20:22], rstFlow.SrcPort)
+		binary.BigEndian.PutUint16(pkt[22:24], rstFlow.DstPort)
+		binary.BigEndian.PutUint32(pkt[24:28], 0) // Seq
+		binary.BigEndian.PutUint32(pkt[28:32], 0) // Ack
+		pkt[32] = 0x50                            // Data offset=5
+		pkt[33] = 0x04                            // Flags = RST
+		// Window, Checksum, Urgent = 0
+		return pkt
+	}
+}
+
+// buildICMPAdminProhibited builds an ICMP/ICMPv6 admin prohibited packet.
+func buildICMPAdminProhibited(flow acl.Flow, srcIP, dstIP netip.Addr, originalPkt []byte) []byte {
+	// For simplicity, we don't implement full ICMP error generation here.
+	// The kernel will generate ICMP errors if we drop the packet at the socket level.
+	// Since we're in userspace TUN, we'd need to craft the ICMP packet.
+	// This is a placeholder - in practice, we'd need to implement this properly.
+	return nil
 }
 
 // decryptDataPacket decrypts a data packet using the peer's active session,
@@ -393,7 +662,7 @@ func extractSrcIP(pkt []byte) (netip.Addr, bool) {
 // sourceAllowed reports whether a decrypted packet from entry carries a source
 // address that peer owns: its VPN address or an address inside one of the
 // subnet routes it advertises. Anything else (another peer's address, an
-// unparsable packet) is dropped. A subnet route never vouches for an address
+// unparseable packet) is dropped. A subnet route never vouches for an address
 // in the mesh or for another peer's address, so advertising a broad route
 // does not let a peer speak for others.
 func (d *Dispatcher) sourceAllowed(entry *peer.Entry, pkt []byte) bool {

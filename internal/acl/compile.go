@@ -116,6 +116,11 @@ func resolveSubjectToPeers(subject string, peers map[string]PeerKey, tags map[st
 	return result
 }
 
+// OutboundOnly returns the set of outbound-only peer IDs.
+func (cp *CompiledPolicy) OutboundOnly() map[[32]byte]struct{} {
+	return cp.outboundOnly
+}
+
 // Decide evaluates a packet against the compiled policy.
 // src, dst are Ed25519 public keys (32 bytes).
 // proto is the IP protocol (TCP=6, UDP=17, ICMP=1, ICMPv6=58).

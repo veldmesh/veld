@@ -11,11 +11,14 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/veldmesh/veld/internal/acl"
 	"github.com/veldmesh/veld/internal/coexist"
 	intconfig "github.com/veldmesh/veld/internal/config"
 	"github.com/veldmesh/veld/internal/coord"
@@ -52,6 +55,13 @@ type Daemon struct {
 	peerTbl          *peer.Table
 	localID          *crypto.Identity
 	networkID        [16]byte
+
+	// ACL policy
+	policySwap      *acl.PolicySwap
+	policyLoader    *acl.LocalPolicyLoader
+	networkPolicy   acl.PolicyDecider // network policy from coord (future)
+	policyDecider   acl.PolicyDecider // combined local + network
+	selfPeerID      [32]byte
 
 	mu              sync.Mutex
 	vpnAddr         netip.Addr
@@ -144,6 +154,10 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	var networkID [16]byte
 	copy(networkID[:], netIDBytes)
 
+	// This node's Ed25519 public key (self peer ID)
+	var selfPeerID [32]byte
+	copy(selfPeerID[:], localID.Ed25519Public)
+
 	// In static mode, use the configured VPN address
 	var tunDev tun.TUN
 	var vpnPrefix netip.Prefix
@@ -153,17 +167,6 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 		vpnPrefix, err = netip.ParsePrefix(cfg.Node.VPNAddr)
 		if err != nil {
 			return nil, fmt.Errorf("invalid vpn_addr: %w", err)
-		}
-	}
-
-	// If running in static mode (no coord), create TUN now
-	if cfg.Coord.Addr == "" {
-		if vpnPrefix.IsValid() {
-			ifaceName := resolveIfaceName(fmt.Printf, cfg.Node.IfaceName)
-			tunDev, err = createTUN(ifaceName, vpnPrefix, resolveTunMTU(cfg))
-			if err != nil {
-				return nil, fmt.Errorf("create tun: %w", err)
-			}
 		}
 	}
 
@@ -186,7 +189,50 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	}
 
 	d := New(localID, networkID, tunDev, conn, peerTbl)
+	d.selfPeerID = selfPeerID
 	d.routeMgr = route.New()
+
+	// Initialize ACL policy swap and loader
+	d.policySwap = &acl.PolicySwap{}
+
+	// Determine local policy file path
+	localPolicyPath := ""
+	if cfg.Daemon.Policy.LocalFile != "" {
+		localPolicyPath = cfg.Daemon.Policy.LocalFile
+	} else {
+		// Default: policy.toml next to the config file
+		localPolicyPath = filepath.Join(filepath.Dir(cfg.Node.IdentityPath), "policy.toml")
+	}
+
+	// Peer lookup function for resolving names in local policy
+	peerLookup := func(name string) ([32]byte, bool) {
+		if name == "self" {
+			return selfPeerID, true
+		}
+		if e, ok := peerTbl.LookupByName(name); ok {
+			return e.ID, true
+		}
+		return [32]byte{}, false
+	}
+
+	d.policyLoader = acl.NewLocalPolicyLoader(localPolicyPath, selfPeerID, peerLookup, d.policySwap, nil)
+
+	// Load local policy BEFORE creating TUN (no unfiltered window on restart)
+	if err := d.policyLoader.Load(); err != nil {
+		if tunDev != nil {
+			_ = tunDev.Close()
+		}
+		_ = conn.Close()
+		return nil, fmt.Errorf("load local policy: %w", err)
+	}
+
+	// Combined policy decider (local + network, network is nil for now)
+	d.policyDecider = d.policyLoader.CombinedPolicy()
+
+	// Set the policy decider on the dispatcher
+	d.disp.SetPolicyDecider(d.policyDecider)
+	// Set the self peer ID for ACL decisions
+	d.disp.SetSelfPeerID(selfPeerID)
 
 	// Commercial VPN coexistence: detect VPN tunnels and routing conflicts
 	// at startup and log actionable guidance (kill switches, split tunneling,
@@ -209,6 +255,21 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	if cfg.Coord.Addr == "" {
 		for _, e := range peerTbl.List() {
 			d.addPeerRoutes(e)
+		}
+	}
+
+	// Create TUN now (after policy is loaded)
+	if cfg.Coord.Addr == "" {
+		if vpnPrefix.IsValid() {
+			ifaceName := resolveIfaceName(fmt.Printf, cfg.Node.IfaceName)
+			tunDev, err = createTUN(ifaceName, vpnPrefix, resolveTunMTU(cfg))
+			if err != nil {
+				return nil, fmt.Errorf("create tun: %w", err)
+			}
+			d.disp.SetTUN(tunDev)
+			d.mu.Lock()
+			d.tunDev = tunDev
+			d.mu.Unlock()
 		}
 	}
 
@@ -419,7 +480,32 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 		}
 	}
 
+	// Start policy file watcher
+	if err := d.policyLoader.StartWatcher(); err != nil {
+		log.Printf("warning: policy file watcher: %v", err)
+	}
+
+	// Start SIGHUP handler for policy reload
+	d.startSIGHUPHandler()
+
 	return d, nil
+}
+
+// startSIGHUPHandler starts a goroutine that reloads the local policy on SIGHUP.
+func (d *Daemon) startSIGHUPHandler() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGHUP)
+	go func() {
+		for range sigCh {
+			log.Printf("policy: received SIGHUP, reloading local policy")
+			if err := d.policyLoader.Reload(); err != nil {
+				log.Printf("policy: reload failed: %v", err)
+			}
+			// Update the combined policy decider
+			d.policyDecider = d.policyLoader.CombinedPolicy()
+			d.disp.SetPolicyDecider(d.policyDecider)
+		}
+	}()
 }
 
 // newMDNSDiscovery builds the mDNS discovery service advertising vpnAddr and
@@ -776,6 +862,10 @@ func (d *Daemon) Stop() {
 	}
 	if d.ipcSrv != nil {
 		d.ipcSrv.Stop()
+	}
+	// Stop policy watcher
+	if d.policyLoader != nil {
+		d.policyLoader.Wait()
 	}
 }
 
