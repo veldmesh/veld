@@ -5,7 +5,7 @@
 # golang:1.26.10-alpine — includes a ca-certificates bundle that distrusts the
 # eMudhra intermediates (emSign Root TLS CA - G3, emSign ECC Root CA - G3).
 # Pinned by digest for reproducible builds; bump via Dependabot docker updates.
-FROM golang@sha256:d1f3216ef30257c850cc136ba42a359ccd9d3e75f19b2c276e520c0b4ef327ce AS builder
+FROM golang@sha256:2920bb124f1a2e12a1d39f0cab756ae0068441ee1da7655dec7f5e374944095b AS builder
 
 WORKDIR /src
 
