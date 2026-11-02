@@ -333,23 +333,6 @@ func (r *Registry) RegisterPeer(p peerRecord, networkID string, maxMachines int)
 			return ErrMachineLimit
 		}
 
-		// Backward compatibility: if AssignedAddrs is nil (old DB), initialize it
-		// and populate with currently assigned peers' addresses as "currently assigned" (timestamp 0).
-		if netRec.AssignedAddrs == nil {
-			netRec.AssignedAddrs = make(map[string]int64)
-			_ = pb.ForEach(func(_, v []byte) error {
-				var rec peerRecord
-				if json.Unmarshal(v, &rec) == nil && rec.NetworkID == networkID {
-					if a, err := netip.ParseAddr(rec.VPNAddr); err == nil {
-						netRec.AssignedAddrs[a.String()] = 0
-					}
-				}
-				return nil
-			})
-		}
-
-		cidr, _ := netip.ParsePrefix(netRec.CIDR)
-
 		// Build set of currently used addresses.
 		used := make(map[netip.Addr]bool)
 		_ = pb.ForEach(func(_, v []byte) error {
@@ -361,6 +344,38 @@ func (r *Registry) RegisterPeer(p peerRecord, networkID string, maxMachines int)
 			}
 			return nil
 		})
+
+		// Backward compatibility: if AssignedAddrs is nil (old DB), initialize it
+		// and populate with currently assigned peers' addresses as "currently assigned" (timestamp 0).
+		// Also mark every address from the first host address up to (not including) NextIP
+		// that no peer currently holds as freed (timestamp 1), so those addresses are
+		// reused last and in address order. This prevents reusing a departed peer's address
+		// on upgraded coords, which would cause TOFU pin mismatches.
+		if netRec.AssignedAddrs == nil {
+			netRec.AssignedAddrs = make(map[string]int64)
+
+			// Mark currently assigned addresses as timestamp 0.
+			for addr := range used {
+				netRec.AssignedAddrs[addr.String()] = 0
+			}
+
+			// Parse NextIP to find the range of potentially freed addresses.
+			nextIP, err := netip.ParseAddr(netRec.NextIP)
+			if err == nil && nextIP.IsValid() {
+				cidr, _ := netip.ParsePrefix(netRec.CIDR)
+				firstHost := nextIPAfterNetwork(cidr.Masked())
+
+				// Mark addresses from firstHost up to (not including) NextIP
+				// that are not currently used as freed (timestamp 1).
+				for a := firstHost; cidr.Contains(a) && a.Compare(nextIP) < 0; a = a.Next() {
+					if !used[a] {
+						netRec.AssignedAddrs[a.String()] = 1
+					}
+				}
+			}
+		}
+
+		cidr, _ := netip.ParsePrefix(netRec.CIDR)
 
 		// Allocation order:
 		// 1. Lowest address never assigned in this network (not in AssignedAddrs)
