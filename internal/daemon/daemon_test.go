@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -125,18 +126,30 @@ func newTestSessionPair(t *testing.T) (initiator, responder *session.Session) {
 }
 
 // buildIPv4Packet builds a minimal IPv4 packet with the given source and dest IP.
+// Includes a UDP header for ACL parsing.
 func buildIPv4Packet(src, dst [4]byte, payload []byte) []byte {
-	totalLen := 20 + len(payload)
+	udpLen := 8 + len(payload)
+	totalLen := 20 + udpLen
 	pkt := make([]byte, totalLen)
-	pkt[0] = 0x45                // version=4, IHL=5
-	pkt[1] = 0x00                // DSCP/ECN
-	pkt[2] = byte(totalLen >> 8) // total length high
-	pkt[3] = byte(totalLen)      // total length low
-	pkt[8] = 64                  // TTL
-	pkt[9] = 17                  // protocol: UDP
-	copy(pkt[12:16], src[:])     // source IP
-	copy(pkt[16:20], dst[:])     // dest IP
-	copy(pkt[20:], payload)
+	// IPv4 header
+	pkt[0] = 0x45 // version=4, IHL=5
+	pkt[1] = 0x00 // DSCP/ECN
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
+	pkt[4] = 0x00
+	pkt[5] = 0x00
+	pkt[6] = 0x00
+	pkt[7] = 0x00
+	pkt[8] = 64 // TTL
+	pkt[9] = 17 // protocol: UDP
+	// Checksum at 10:12 = 0
+	copy(pkt[12:16], src[:]) // source IP
+	copy(pkt[16:20], dst[:]) // dest IP
+	// UDP header
+	binary.BigEndian.PutUint16(pkt[20:22], 12345) // src port
+	binary.BigEndian.PutUint16(pkt[22:24], 53)    // dst port
+	binary.BigEndian.PutUint16(pkt[24:26], uint16(udpLen))
+	// Checksum at 26:28 = 0
+	copy(pkt[28:], payload)
 	return pkt
 }
 

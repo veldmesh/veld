@@ -87,11 +87,11 @@ func TestTOFU_E2E_FirstConnect_Pinned(t *testing.T) {
 	store, _ := tofu.New(t.TempDir() + "/tofu.json")
 
 	tblA := peer.New()
-	entryBinA := makeEntry(idB, "10.0.0.2", netip.MustParseAddrPort("2.2.2.2:2000"))
+	entryBinA := makeEntry(idB, "peerB", "10.0.0.2", netip.MustParseAddrPort("2.2.2.2:2000"))
 	tblA.Upsert(entryBinA)
 
 	tblB := peer.New()
-	tblB.Upsert(makeEntry(idA, "10.0.0.1", netip.MustParseAddrPort("1.1.1.1:1000")))
+	tblB.Upsert(makeEntry(idA, "peerA", "10.0.0.1", netip.MustParseAddrPort("1.1.1.1:1000")))
 
 	connA, connB := newTOFUConn(), newTOFUConn()
 
@@ -128,11 +128,11 @@ func TestTOFU_E2E_SameKey_Accepted(t *testing.T) {
 	store, _ := tofu.New(t.TempDir() + "/tofu.json")
 
 	tblA := peer.New()
-	entryBinA := makeEntry(idB, "10.0.0.2", netip.MustParseAddrPort("2.2.2.2:2000"))
+	entryBinA := makeEntry(idB, "peerB", "10.0.0.2", netip.MustParseAddrPort("2.2.2.2:2000"))
 	tblA.Upsert(entryBinA)
 
 	tblB := peer.New()
-	tblB.Upsert(makeEntry(idA, "10.0.0.1", netip.MustParseAddrPort("1.1.1.1:1000")))
+	tblB.Upsert(makeEntry(idA, "peerA", "10.0.0.1", netip.MustParseAddrPort("1.1.1.1:1000")))
 
 	connA, connB := newTOFUConn(), newTOFUConn()
 
@@ -184,12 +184,12 @@ func TestTOFU_E2E_KeyChange_Rejected(t *testing.T) {
 
 	// Coord server is now compromised: A's peer table has evil's keys for 10.0.0.2.
 	tblA := peer.New()
-	entryEvil := makeEntry(idB_evil, "10.0.0.2", netip.MustParseAddrPort("2.2.2.2:2000"))
+	entryEvil := makeEntry(idB_evil, "peerEvil", "10.0.0.2", netip.MustParseAddrPort("2.2.2.2:2000"))
 	tblA.Upsert(entryEvil)
 
 	// Evil's responder table knows A.
 	tblEvil := peer.New()
-	tblEvil.Upsert(makeEntry(idA, "10.0.0.1", netip.MustParseAddrPort("1.1.1.1:1000")))
+	tblEvil.Upsert(makeEntry(idA, "peerA", "10.0.0.1", netip.MustParseAddrPort("1.1.1.1:1000")))
 
 	connA, connEvil := newTOFUConn(), newTOFUConn()
 

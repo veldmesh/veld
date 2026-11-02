@@ -12,11 +12,14 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/veldmesh/veld/internal/acl"
 	"github.com/veldmesh/veld/internal/coexist"
 	intconfig "github.com/veldmesh/veld/internal/config"
 	"github.com/veldmesh/veld/internal/coord"
@@ -53,6 +56,12 @@ type Daemon struct {
 	peerTbl          *peer.Table
 	localID          *crypto.Identity
 	networkID        [16]byte
+
+	// ACL policy
+	policySwap    *acl.PolicySwap
+	policyLoader  *acl.LocalPolicyLoader
+	policyDecider acl.PolicyDecider // combined local + network
+	selfPeerID    [32]byte
 
 	mu              sync.Mutex
 	vpnAddr         netip.Addr
@@ -145,10 +154,12 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	var networkID [16]byte
 	copy(networkID[:], netIDBytes)
 
-	// In static mode, use the configured VPN address
-	var tunDev tun.TUN
-	var vpnPrefix netip.Prefix
+	// This node's Ed25519 public key (self peer ID)
+	var selfPeerID [32]byte
+	copy(selfPeerID[:], localID.Ed25519Public)
 
+	// In static mode, use the configured VPN address
+	var vpnPrefix netip.Prefix
 	if cfg.Node.VPNAddr != "" {
 		var err error
 		vpnPrefix, err = netip.ParsePrefix(cfg.Node.VPNAddr)
@@ -157,44 +168,68 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 		}
 	}
 
-	// If running in static mode (no coord), create TUN now
-	if cfg.Coord.Addr == "" {
-		if vpnPrefix.IsValid() {
-			ifaceName := resolveIfaceName(fmt.Printf, cfg.Node.IfaceName)
-			tunDev, err = createTUN(ifaceName, vpnPrefix, resolveTunMTU(cfg), cfg.Node.Userspace)
-			if err != nil {
-				return nil, fmt.Errorf("create tun: %w", err)
-			}
-		}
-	}
-
 	// Listen on UDP
 	conn, err := net.ListenPacket("udp", cfg.Node.ListenAddr)
 	if err != nil {
-		if tunDev != nil {
-			_ = tunDev.Close()
-		}
 		return nil, fmt.Errorf("listen %s: %w", cfg.Node.ListenAddr, err)
 	}
 
 	peerTbl, err := buildPeerTable(cfg.Peers)
 	if err != nil {
-		if tunDev != nil {
-			_ = tunDev.Close()
-		}
 		_ = conn.Close()
 		return nil, fmt.Errorf("build peer table: %w", err)
 	}
 
-	d := New(localID, networkID, tunDev, conn, peerTbl)
+	d := New(localID, networkID, nil, conn, peerTbl)
+	d.selfPeerID = selfPeerID
 	userspace := cfg.Node.Userspace
+
+	// Initialize ACL policy swap and loader
+	d.policySwap = &acl.PolicySwap{}
+
+	// Determine local policy file path
+	localPolicyPath := ""
+	if cfg.Daemon.Policy.LocalFile != "" {
+		localPolicyPath = cfg.Daemon.Policy.LocalFile
+	} else {
+		// Default: policy.toml next to the config file
+		localPolicyPath = filepath.Join(filepath.Dir(cfg.Node.IdentityPath), "policy.toml")
+	}
+
+	// Peer lookup function for resolving names in local policy
+	peerLookup := func(name string) ([32]byte, bool) {
+		if name == "self" {
+			return selfPeerID, true
+		}
+		if e, ok := peerTbl.LookupByName(name); ok {
+			return e.ID, true
+		}
+		return [32]byte{}, false
+	}
+
+	d.policyLoader = acl.NewLocalPolicyLoader(localPolicyPath, selfPeerID, peerLookup, d.policySwap, nil)
+
+	// Load local policy BEFORE creating TUN (no unfiltered window on restart)
+	if err := d.policyLoader.Load(); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("load local policy: %w", err)
+	}
+
+	// Combined policy decider (local + network, network is nil for now)
+	d.policyDecider = d.policyLoader.CombinedPolicy()
+
+	// Set the policy decider on the dispatcher
+	d.disp.SetPolicyDecider(d.policyDecider)
+	// Set the self peer ID for ACL decisions
+	d.disp.SetSelfPeerID(selfPeerID)
+
+	// Commercial VPN coexistence: detect VPN tunnels and routing conflicts
+	// at startup and log actionable guidance (kill switches, split tunneling,
+	// CIDR overlaps). Detection never blocks startup.
+	coexist.Report(fmt.Printf, d.selfInterface(), vpnPrefix)
 
 	if !userspace {
 		d.routeMgr = route.New()
-		// Commercial VPN coexistence: detect VPN tunnels and routing conflicts
-		// at startup and log actionable guidance (kill switches, split tunneling,
-		// CIDR overlaps). Detection never blocks startup.
-		coexist.Report(fmt.Printf, d.selfInterface(), vpnPrefix)
 
 		// If this node advertises subnet routes, enable IP forwarding on Linux.
 		if len(cfg.Node.SubnetRoutes) > 0 {
@@ -216,12 +251,27 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 		}
 	}
 
+	// Create TUN now (after policy is loaded)
+	if cfg.Coord.Addr == "" {
+		if vpnPrefix.IsValid() {
+			ifaceName := resolveIfaceName(fmt.Printf, cfg.Node.IfaceName)
+			tunDev, err := createTUN(ifaceName, vpnPrefix, resolveTunMTU(cfg), userspace)
+			if err != nil {
+				return nil, fmt.Errorf("create tun: %w", err)
+			}
+			d.disp.SetTUN(tunDev)
+			d.mu.Lock()
+			d.tunDev = tunDev
+			d.mu.Unlock()
+		}
+	}
+
 	// Wire up TOFU key pinning. The store lives next to the identity file.
 	tofuPath := filepath.Join(filepath.Dir(cfg.Node.IdentityPath), "tofu.json")
 	tofuStore, err := tofu.New(tofuPath)
 	if err != nil {
-		if tunDev != nil {
-			_ = tunDev.Close()
+		if d.tunDev != nil {
+			_ = d.tunDev.Close()
 		}
 		_ = conn.Close()
 		return nil, fmt.Errorf("load TOFU store: %w", err)
@@ -243,8 +293,8 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	// Inits it has already seen.
 	replayPath := filepath.Join(filepath.Dir(cfg.Node.IdentityPath), "handshake-replay.json")
 	if err := d.hsMgr.UseReplayState(replayPath); err != nil {
-		if tunDev != nil {
-			_ = tunDev.Close()
+		if d.tunDev != nil {
+			_ = d.tunDev.Close()
 		}
 		_ = conn.Close()
 		return nil, fmt.Errorf("load handshake replay state: %w", err)
@@ -433,7 +483,32 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 		}
 	}
 
+	// Start policy file watcher
+	if err := d.policyLoader.StartWatcher(); err != nil {
+		log.Printf("warning: policy file watcher: %v", err)
+	}
+
+	// Start SIGHUP handler for policy reload
+	d.startSIGHUPHandler()
+
 	return d, nil
+}
+
+// startSIGHUPHandler starts a goroutine that reloads the local policy on SIGHUP.
+func (d *Daemon) startSIGHUPHandler() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGHUP)
+	go func() {
+		for range sigCh {
+			log.Printf("policy: received SIGHUP, reloading local policy")
+			if err := d.policyLoader.Reload(); err != nil {
+				log.Printf("policy: reload failed: %v", err)
+			}
+			// Update the combined policy decider
+			d.policyDecider = d.policyLoader.CombinedPolicy()
+			d.disp.SetPolicyDecider(d.policyDecider)
+		}
+	}()
 }
 
 // newMDNSDiscovery builds the mDNS discovery service advertising vpnAddr and
@@ -597,7 +672,7 @@ const peerNameMaxLen = 63
 // The configured name wins, then the hostname. The result is lowercased, every
 // character other than a letter or digit becomes '-', leading and trailing
 // hyphens are trimmed and the result is cut to a DNS label. "node" is used
-// when nothing usable is left.
+// when nothing unusable is left.
 func advertisedPeerName(configured, hostname string) string {
 	name := configured
 	if name == "" {
@@ -802,6 +877,10 @@ func (d *Daemon) Stop() {
 	if d.ipcSrv != nil {
 		d.ipcSrv.Stop()
 	}
+	// Stop policy watcher
+	if d.policyLoader != nil {
+		d.policyLoader.Wait()
+	}
 }
 
 func (d *Daemon) mdnsDiscovery() *mdns.Discovery {
@@ -815,6 +894,16 @@ func (d *Daemon) Wait() {
 	if d.coordCli != nil {
 		d.coordCli.Wait()
 	}
+}
+
+// SetPolicyDecider sets the ACL policy decider on the dispatcher.
+func (d *Daemon) SetPolicyDecider(pd acl.PolicyDecider) {
+	d.disp.SetPolicyDecider(pd)
+}
+
+// SetSelfPeerID sets this node's Ed25519 public key for ACL decisions.
+func (d *Daemon) SetSelfPeerID(id [32]byte) {
+	d.disp.SetSelfPeerID(id)
 }
 
 func (d *Daemon) updateIPCStatus() {

@@ -5,120 +5,72 @@ package dataplane
 import (
 	"net"
 	"net/netip"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/veldmesh/veld/internal/crypto"
 	"github.com/veldmesh/veld/internal/peer"
 	"github.com/veldmesh/veld/internal/session"
 	"github.com/veldmesh/veld/internal/tun"
 )
 
-// fakeConn is an in-memory net.PacketConn for testing.
-type fakeConn struct {
-	in     chan udpMsg
-	out    chan udpMsg
-	once   sync.Once
-	closed chan struct{}
-}
+// buildIPv6Packet builds a minimal IPv6 packet with the given source and dest IP.
+func buildIPv6Packet(src, dst netip.Addr, payload []byte) []byte {
+	pkt := make([]byte, 40+len(payload))
+	pkt[0] = 0x60 // version=6
+	pkt[4] = byte(len(payload) >> 8)
+	pkt[5] = byte(len(payload))
+	pkt[6] = 17 // next header: UDP
+	pkt[7] = 64 // hop limit
 
-type udpMsg struct {
-	data []byte
-	addr net.Addr
-}
-
-func newFakeConn() *fakeConn {
-	return &fakeConn{
-		in:     make(chan udpMsg, 32),
-		out:    make(chan udpMsg, 32),
-		closed: make(chan struct{}),
-	}
-}
-
-func (c *fakeConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	select {
-	case msg := <-c.in:
-		n := copy(p, msg.data)
-		return n, msg.addr, nil
-	case <-c.closed:
-		return 0, nil, net.ErrClosed
-	}
-}
-
-func (c *fakeConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	buf := make([]byte, len(p))
-	copy(buf, p)
-	select {
-	case c.out <- udpMsg{data: buf, addr: addr}:
-	default:
-	}
-	return len(p), nil
-}
-
-func (c *fakeConn) Close() error {
-	c.once.Do(func() { close(c.closed) })
-	return nil
-}
-
-func (c *fakeConn) LocalAddr() net.Addr                { return &net.UDPAddr{} }
-func (c *fakeConn) SetDeadline(t time.Time) error      { return nil }
-func (c *fakeConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *fakeConn) SetWriteDeadline(t time.Time) error { return nil }
-
-// newTestSessionPair creates a pair of linked Noise IK sessions for testing.
-// Returns (initiatorSession, responderSession).
-func newTestSessionPair(t *testing.T) (*session.Session, *session.Session) {
-	t.Helper()
-	idA, _ := crypto.Generate()
-	idB, _ := crypto.Generate()
-
-	initiatorHS, _ := crypto.NewInitiatorHS(idA, idB.X25519Public, [16]byte{})
-	responderHS, _ := crypto.NewResponderHS(idB, func(pub []byte) ([32]byte, bool) {
-		if string(pub) == string(idA.Ed25519Public) {
-			return idA.X25519Public, true
-		}
-		return [32]byte{}, false
-	})
-	now := time.Now().UnixNano()
-	msg1, _ := initiatorHS.BuildMessage1(now)
-	_, _ = responderHS.ProcessMessage1(msg1, now)
-	msg2, respResult, _ := responderHS.BuildMessage2(now)
-	initResult, _ := initiatorHS.ProcessMessage2(msg2, now)
-	return session.New(initResult), session.New(respResult)
-}
-
-// mustAddrPort parses an AddrPort or panics.
-func mustAddrPort(s string) netip.AddrPort {
-	a, err := netip.ParseAddrPort(s)
-	if err != nil {
-		panic(err)
-	}
-	return a
-}
-
-// mustAddr parses an Addr or panics.
-func mustAddr(s string) netip.Addr {
-	a, err := netip.ParseAddr(s)
-	if err != nil {
-		panic(err)
-	}
-	return a
-}
-
-// buildIPv4Packet builds a minimal IPv4 packet with the given source and dest IP.
-func buildIPv4Packet(src, dst [4]byte, payload []byte) []byte {
-	totalLen := 20 + len(payload)
-	pkt := make([]byte, totalLen)
-	pkt[0] = 0x45                // version=4, IHL=5
-	pkt[1] = 0x00                // DSCP/ECN
-	pkt[2] = byte(totalLen >> 8) // total length high
-	pkt[3] = byte(totalLen)      // total length low
-	pkt[8] = 64                  // TTL
-	pkt[9] = 17                  // protocol: UDP
-	copy(pkt[12:16], src[:])     // source IP
-	copy(pkt[16:20], dst[:])     // dest IP
+	s16, d16 := src.As16(), dst.As16()
+	copy(pkt[8:24], s16[:])
+	copy(pkt[24:40], d16[:])
+	copy(pkt[40:], payload)
 	return pkt
+}
+
+// deliverFromPeer sends plain as an encrypted data packet from a peer with the
+// given VPN address and subnet routes, and returns what reached the TUN (nil if
+// the dispatcher dropped it).
+func deliverFromPeer(t *testing.T, vpnAddr string, routes []netip.Prefix, plain []byte) []byte {
+	t.Helper()
+	sessA, sessB := newTestSessionPair(t)
+
+	peerTbl := peer.New()
+	var peerBID [32]byte
+	peerBID[0] = 0x02
+	entryB := &peer.Entry{ID: peerBID, VPNAddr: mustAddr(vpnAddr), SubnetRoutes: routes}
+	entryB.SetEndpoint(mustAddrPort("1.2.3.4:5000"))
+	entryB.SetSession(sessA)
+	peerTbl.Upsert(entryB)
+	// A third peer outside the mesh prefix (static configs allow that).
+	peerTbl.Upsert(&peer.Entry{ID: [32]byte{0x03}, VPNAddr: mustAddr("192.168.1.99")})
+
+	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
+	conn := newFakeConn()
+	d := New(tunDev, conn, peerTbl)
+	d.Start()
+	defer d.Stop()
+
+	nonce, ct, err := sessB.Encrypt(plain)
+	if err != nil {
+		t.Fatalf("encrypt failed: %v", err)
+	}
+	conn.in <- udpMsg{data: buildDataPacket(nonce, ct), addr: &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5000}}
+
+	got := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 1500)
+		if n, err := tunDev.ReadDelivered(buf); err == nil {
+			got <- buf[:n]
+		}
+	}()
+	select {
+	case pkt := <-got:
+		return pkt
+	case <-time.After(200 * time.Millisecond):
+		return nil
+	}
 }
 
 // TestDispatcher_StopDoesNotLeak verifies that Start/Stop does not leak goroutines.
@@ -211,7 +163,7 @@ func TestDispatcher_TunToUDP(t *testing.T) {
 	defer d.Stop()
 
 	// Send a packet from TUN destined for 10.0.0.2
-	ipPkt := buildIPv4Packet([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, []byte("hello"))
+	ipPkt := buildUDPv4Packet([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, 12345, 53, []byte("hello"))
 	tunDev.Inject(ipPkt)
 
 	// Expect an encrypted UDP packet to be sent to peerB's endpoint
@@ -256,7 +208,7 @@ func TestDispatcher_UDPToTun(t *testing.T) {
 	defer d.Stop()
 
 	// Encrypt a packet with B's session (sessB) and send it via UDP
-	want := buildIPv4Packet([4]byte{10, 0, 0, 2}, [4]byte{10, 0, 0, 1}, []byte("hello from B"))
+	want := buildUDPv4Packet([4]byte{10, 0, 0, 2}, [4]byte{10, 0, 0, 1}, 53, 12345, []byte("hello from B"))
 	nonce, ct, err := sessB.Encrypt(want)
 	if err != nil {
 		t.Fatalf("encrypt failed: %v", err)
@@ -277,65 +229,6 @@ func TestDispatcher_UDPToTun(t *testing.T) {
 	}
 }
 
-// buildIPv6Packet builds a minimal IPv6 packet with the given source and dest IP.
-func buildIPv6Packet(src, dst netip.Addr, payload []byte) []byte {
-	pkt := make([]byte, 40+len(payload))
-	pkt[0] = 0x60 // version=6
-	pkt[4] = byte(len(payload) >> 8)
-	pkt[5] = byte(len(payload))
-	pkt[6] = 17 // next header: UDP
-	pkt[7] = 64 // hop limit
-	s16, d16 := src.As16(), dst.As16()
-	copy(pkt[8:24], s16[:])
-	copy(pkt[24:40], d16[:])
-	copy(pkt[40:], payload)
-	return pkt
-}
-
-// deliverFromPeer sends plain as an encrypted data packet from a peer with the
-// given VPN address and subnet routes, and returns what reached the TUN (nil if
-// the dispatcher dropped it).
-func deliverFromPeer(t *testing.T, vpnAddr string, routes []netip.Prefix, plain []byte) []byte {
-	t.Helper()
-	sessA, sessB := newTestSessionPair(t)
-
-	peerTbl := peer.New()
-	var peerBID [32]byte
-	peerBID[0] = 0x02
-	entryB := &peer.Entry{ID: peerBID, VPNAddr: mustAddr(vpnAddr), SubnetRoutes: routes}
-	entryB.SetEndpoint(mustAddrPort("1.2.3.4:5000"))
-	entryB.SetSession(sessA)
-	peerTbl.Upsert(entryB)
-	// A third peer outside the mesh prefix (static configs allow that).
-	peerTbl.Upsert(&peer.Entry{ID: [32]byte{0x03}, VPNAddr: mustAddr("192.168.1.99")})
-
-	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
-	conn := newFakeConn()
-	d := New(tunDev, conn, peerTbl)
-	d.Start()
-	defer d.Stop()
-
-	nonce, ct, err := sessB.Encrypt(plain)
-	if err != nil {
-		t.Fatalf("encrypt failed: %v", err)
-	}
-	conn.in <- udpMsg{data: buildDataPacket(nonce, ct), addr: &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5000}}
-
-	got := make(chan []byte, 1)
-	go func() {
-		buf := make([]byte, 1500)
-		if n, err := tunDev.ReadDelivered(buf); err == nil {
-			got <- buf[:n]
-		}
-	}()
-	select {
-	case pkt := <-got:
-		return pkt
-	case <-time.After(200 * time.Millisecond):
-		return nil
-	}
-}
-
 // TestDispatcher_InboundSourceCheck verifies that a peer can only deliver
 // packets whose source is its own VPN address or inside its subnet routes.
 func TestDispatcher_InboundSourceCheck(t *testing.T) {
@@ -348,17 +241,17 @@ func TestDispatcher_InboundSourceCheck(t *testing.T) {
 		pkt     []byte
 		deliver bool
 	}{
-		{"own VPN address", "10.0.0.2", nil, buildIPv4Packet([4]byte{10, 0, 0, 2}, me, []byte("x")), true},
-		{"another peer's address", "10.0.0.2", nil, buildIPv4Packet([4]byte{10, 0, 0, 3}, me, []byte("x")), false},
-		{"my own address", "10.0.0.2", nil, buildIPv4Packet(me, me, []byte("x")), false},
-		{"inside advertised route", "10.0.0.2", lan, buildIPv4Packet([4]byte{192, 168, 1, 20}, me, []byte("x")), true},
-		{"outside advertised route", "10.0.0.2", lan, buildIPv4Packet([4]byte{192, 168, 2, 20}, me, []byte("x")), false},
+		{"own VPN address", "10.0.0.2", nil, buildUDPv4Packet([4]byte{10, 0, 0, 2}, me, 53, 12345, []byte("x")), true},
+		{"another peer's address", "10.0.0.2", nil, buildUDPv4Packet([4]byte{10, 0, 0, 3}, me, 53, 12345, []byte("x")), false},
+		{"my own address", "10.0.0.2", nil, buildUDPv4Packet(me, me, 53, 12345, []byte("x")), false},
+		{"inside advertised route", "10.0.0.2", lan, buildUDPv4Packet([4]byte{192, 168, 1, 20}, me, 53, 12345, []byte("x")), true},
+		{"outside advertised route", "10.0.0.2", lan, buildUDPv4Packet([4]byte{192, 168, 2, 20}, me, 53, 12345, []byte("x")), false},
 		{"IPv6 own address", "fd00::2", nil, buildIPv6Packet(mustAddr("fd00::2"), mustAddr("fd00::1"), []byte("x")), true},
 		{"IPv6 forged address", "fd00::2", nil, buildIPv6Packet(mustAddr("fd00::3"), mustAddr("fd00::1"), []byte("x")), false},
-		{"mesh address via a broad route", "10.0.0.2", []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, buildIPv4Packet([4]byte{10, 0, 0, 3}, me, []byte("x")), false},
-		{"my own address via a broad route", "10.0.0.2", []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, buildIPv4Packet(me, me, []byte("x")), false},
-		{"outside the mesh via a broad route", "10.0.0.2", []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, buildIPv4Packet([4]byte{10, 1, 0, 3}, me, []byte("x")), true},
-		{"other peer's address inside the route", "10.0.0.2", lan, buildIPv4Packet([4]byte{192, 168, 1, 99}, me, []byte("x")), false},
+		{"mesh address via a broad route", "10.0.0.2", []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, buildUDPv4Packet([4]byte{10, 0, 0, 3}, me, 53, 12345, []byte("x")), false},
+		{"my own address via a broad route", "10.0.0.2", []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, buildUDPv4Packet(me, me, 53, 12345, []byte("x")), false},
+		{"outside the mesh via a broad route", "10.0.0.2", []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, buildUDPv4Packet([4]byte{10, 1, 0, 3}, me, 53, 12345, []byte("x")), true},
+		{"other peer's address inside the route", "10.0.0.2", lan, buildUDPv4Packet([4]byte{192, 168, 1, 99}, me, 53, 12345, []byte("x")), false},
 		{"not an IP packet", "10.0.0.2", nil, []byte("hello"), false},
 		{"truncated IPv4 header", "10.0.0.2", nil, []byte{0x45, 0, 0, 20}, false},
 	}
@@ -417,7 +310,7 @@ func TestDispatcher_NoSession_HoldsPacket(t *testing.T) {
 	defer d.Stop()
 
 	// Send a packet from TUN destined for 10.0.0.2 (no session yet)
-	ipPkt := buildIPv4Packet([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, []byte("hello"))
+	ipPkt := buildUDPv4Packet([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, 12345, 53, []byte("hello"))
 	tunDev.Inject(ipPkt)
 
 	// Expect OnHandshakeRequired to be called
@@ -449,7 +342,7 @@ func TestDispatcher_UnknownDestIP_Drop(t *testing.T) {
 	defer d.Stop()
 
 	// Send a packet from TUN destined for unknown IP 10.0.0.99
-	ipPkt := buildIPv4Packet([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 99}, []byte("hello"))
+	ipPkt := buildUDPv4Packet([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 99}, 12345, 53, []byte("hello"))
 	tunDev.Inject(ipPkt)
 
 	// No UDP packet should be sent, no handshake triggered
@@ -495,7 +388,7 @@ func TestDispatcher_RekeyThreshold(t *testing.T) {
 	defer d.Stop()
 
 	// Send a packet from TUN - should trigger rekey because session needs rekey
-	ipPkt := buildIPv4Packet([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, []byte("hello"))
+	ipPkt := buildUDPv4Packet([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, 12345, 53, []byte("hello"))
 	tunDev.Inject(ipPkt)
 
 	select {

@@ -428,8 +428,32 @@ func TestDecide_FirstMatchWins(t *testing.T) {
 	}
 }
 
+func TestDecide_ReflexiveRuleWarning(t *testing.T) {
+	// Test that reflexive rules (from X to X) produce a warning
+	src := `
+version = 1
+default = "deny"
+[peers]
+alice = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bob   = "ed25519:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+[[rule]]
+from = "alice"
+to   = "alice"
+ports = ["tcp/22"]
+`
+	p, warnings, err := ParsePolicy(src)
+	if err != nil {
+		t.Fatalf("ParsePolicy: %v", err)
+	}
+	if len(warnings) == 0 {
+		t.Fatal("expected warning for reflexive rule")
+	}
+	_ = p
+}
+
 func TestDecide_DisjointTagsWarning(t *testing.T) {
 	// Test that disjoint tags produce a warning
+	// this is a valid use case (e.g., admins accessing servers)
 	src := `
 version = 1
 default = "deny"

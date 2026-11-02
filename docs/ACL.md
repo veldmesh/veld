@@ -1,0 +1,215 @@
+# Veld ACL (Access Control List)
+
+Veld implements a two-layer ACL system for fine-grained control over which peers can communicate with each other and on which ports.
+
+## Policy Model
+
+A policy is a TOML file with the following structure:
+
+```toml
+version = 1                    # Integer, only increases
+default = "deny"               # "allow" or "deny" (required)
+
+[peers]
+alice = "ed25519:<base64 or hex pubkey>"
+bob   = "ed25519:<base64 or hex pubkey>"
+
+[tags]
+admins = ["alice", "bob"]
+servers = ["carol"]
+
+[[rule]]
+from = "alice"                 # Peer name, "tag:<name>", or "*"
+to   = "bob"                   # Peer name, "tag:<name>", or "*"
+ports = ["tcp/22", "tcp/8000-8099"]
+
+[outbound_only]
+peers = ["bob"]                # Peer names that can only initiate connections
+```
+
+### Subjects
+
+Subjects in `from` and `to` fields resolve to Ed25519 peer identities (32-byte public keys), never to VPN addresses or coordinator-assigned names.
+
+- **Peer name**: `alice` — matches the specific peer
+- **Tag**: `tag:admins` — matches all peers in the tag
+- **Wildcard**: `*` — matches any authenticated peer
+
+### Ports
+
+Port specifications support:
+- Single port: `tcp/22`, `udp/53`
+- Port range: `tcp/8000-8099`
+- ICMP: `icmp` (matches both ICMPv4 and ICMPv6)
+- All protocols/ports: `*`
+
+### Rule Semantics
+
+A rule allows `from` to **start** a connection to `to` on the specified `ports`. Rules are one-way — a rule from `alice` to `bob` does not allow `bob` to start connections to `alice`.
+
+Replies to an allowed connection always pass (bidirectional flow once established).
+
+### Outbound-Only Peers
+
+Peers listed in `[outbound_only].peers` may start connections but **cannot receive inbound connection attempts**, even if a rule would otherwise allow them. The keyword `self` refers to the local node.
+
+Example:
+```toml
+[outbound_only]
+peers = ["self"]    # This node is outbound-only
+```
+
+## Two-Layer Policy Enforcement
+
+Veld enforces two policy layers:
+
+1. **Local Policy** — File next to the daemon config (root-owned, unsigned). Covers inbound traffic **to this peer**.
+2. **Network Policy** — Signed policy distributed by the coordinator (future). Covers all peers in the network.
+
+A packet passes only if **BOTH** policies allow it. Missing local policy = defer to network policy.
+
+## Daemon Configuration
+
+Add a `[daemon.policy]` section to your config:
+
+```toml
+[daemon]
+socket_path = "/run/veld/daemon.sock"
+
+[daemon.policy]
+local_file = "/etc/veld/policy.toml"    # Optional; defaults to policy.toml next to identity file
+```
+
+### File Requirements
+
+- **Linux/macOS**: Must be owned by root (UID 0) or the daemon's effective user. Must not be group/world-writable (mode 0600 or 0640).
+- **Windows**: File permission checks are skipped (Windows ACLs are used instead).
+- Missing file = no local policy (defer to network)
+- Invalid/unparseable file = daemon refuses to start (fail closed)
+
+## Policy Loading & Reloading
+
+- Local policy is loaded **before** the tunnel comes up (no unfiltered window on restart)
+- Hot-reload on SIGHUP: `kill -HUP <daemon-pid>`
+- Automatic reload on file change (atomic swap; existing flows re-checked against new policy)
+- A revoked peer loses open connections immediately
+
+## Drop Counters & Logging
+
+- Per-peer and per-rule drop counters
+- Rate-limited logging: first drop per flow, then periodic summary (every 10s)
+- Never logs per packet, never logs payload
+
+## Examples
+
+### Basic Server Access
+
+```toml
+version = 1
+default = "deny"
+
+[peers]
+web = "ed25519:AAAA..."
+db  = "ed25519:BBBB..."
+app = "ed25519:CCCC..."
+
+[[rule]]
+from = "app"
+to   = "web"
+ports = ["tcp/80", "tcp/443"]
+
+[[rule]]
+from = "app"
+to   = "db"
+ports = ["tcp/5432"]
+```
+
+### Tag-Based Access
+
+```toml
+version = 1
+default = "deny"
+
+[peers]
+alice = "ed25519:AAAA..."
+bob   = "ed25519:BBBB..."
+carol = "ed25519:CCCC..."
+dave  = "ed25519:DDDD..."
+
+[tags]
+admins = ["alice", "bob"]
+servers = ["carol", "dave"]
+
+[[rule]]
+from = "tag:admins"
+to   = "tag:servers"
+ports = ["tcp/22", "tcp/443"]
+```
+
+### Outbound-Only Node
+
+```toml
+version = 1
+default = "deny"
+
+[peers]
+self = "ed25519:AAAA..."   # This node
+api  = "ed25519:BBBB..."
+
+[[rule]]
+from = "self"
+to   = "api"
+ports = ["tcp/443"]
+
+[outbound_only]
+peers = ["self"]    # This node cannot receive inbound connections
+```
+
+### Allow All (with Explicit Deny)
+
+```toml
+version = 1
+default = "allow"
+
+[peers]
+alice = "ed25519:AAAA..."
+bob   = "ed25519:BBBB..."
+
+[[rule]]
+from = "bob"
+to   = "alice"
+ports = ["tcp/22"]
+# bob can reach alice on 22, but alice cannot reach bob (no rule)
+# All other traffic allowed by default
+```
+
+## Failure Modes
+
+| Scenario | Behavior |
+|----------|----------|
+| No local policy file | Defer to network policy (allow if network allows) |
+| Local policy file missing | Same as above |
+| Local policy file unparseable | Daemon refuses to start (fail closed) |
+| Local policy file group/world-writable | Daemon refuses to start |
+| Local policy invalid (unknown peer, bad port) | Daemon refuses to start |
+| Network policy unavailable | Local policy only (if present) |
+| Both policies deny | Packet dropped, drop counter incremented |
+| Policy reload removes a rule | Existing flows re-checked; revoked connections dropped |
+
+## Testing ACL Policies
+
+Use `veld acl test` (future CLI) or unit tests to verify policy logic before deploying.
+
+## Performance
+
+- Policy decision (`Decide`) is O(rules) — fast enough for per-flow decisions
+- Flow table tracks established connections for zero-cost reply forwarding
+- Benchmarks: ~50ns per decision with 50-rule policy
+- Packet-path overhead: negligible vs. no-policy baseline
+
+## Migration from v1
+
+Policy version is an integer that only increases. When upgrading:
+1. Increment `version`
+2. Update rules as needed
+3. Reload via SIGHUP or file change — no daemon restart required
