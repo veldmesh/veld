@@ -268,7 +268,7 @@ migrates the record in a single transaction:
 - Currently assigned peers' addresses are marked with timestamp 0 (assigned).
 - Every address from the first host address up to (but not including) `NextIP` that is
   not currently held is marked with timestamp 1 (freed, oldest possible), so those
-  addresses are reused last and in address order.
+  addresses are reused first among freed addresses and in address order.
 - Addresses at or above `NextIP` are left unrecorded (treated as never-used).
 The migrated record is written back atomically. Subsequent registrations use the
 populated `assigned_addrs` normally; migration happens exactly once.
