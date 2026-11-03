@@ -479,7 +479,7 @@ func TestReportSkipsSelfAndSuggestsNothingWithoutVPNPrefix(t *testing.T) {
 	}
 }
 
-func TestReportEqualCollisionExplainsReplace(t *testing.T) {
+func TestReportEqualCollisionExplainsMetricPrecedence(t *testing.T) {
 	s := coexist.Snapshot{
 		Routes: []coexist.RouteEntry{{Dst: pfx("10.100.0.0/24"), Iface: "nordlynx"}},
 	}
@@ -491,7 +491,13 @@ func TestReportEqualCollisionExplainsReplace(t *testing.T) {
 	if !strings.Contains(out, "10.100.0.0/24") {
 		t.Errorf("missing colliding prefix in output:\n%s", out)
 	}
-	if !strings.Contains(out, "replacing") {
-		t.Errorf("equal-collision guidance should explain the replace-on-conflict install:\n%s", out)
+	if !strings.Contains(out, "metric 0") {
+		t.Errorf("equal-collision guidance should explain metric-0 precedence:\n%s", out)
+	}
+	if !strings.Contains(out, "higher metric is left in place") {
+		t.Errorf("equal-collision guidance should mention VPN route at higher metric is left in place:\n%s", out)
+	}
+	if !strings.Contains(out, "metric 0 is displaced") {
+		t.Errorf("equal-collision guidance should mention VPN route at metric 0 is displaced:\n%s", out)
 	}
 }

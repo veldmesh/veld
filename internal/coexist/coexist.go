@@ -74,9 +74,10 @@ type CollisionKind int
 
 const (
 	// CollisionEqual: another interface holds a route for the identical prefix.
-	// Veldmesh installs its route via replace-on-conflict, so each side's
-	// (re)install claims the prefix in turn. A VPN that reinstalls its
-	// route later can still take the prefix back.
+	// Veldmesh installs its route at metric 0; the kernel prefers the lowest
+	// metric for a prefix. A VPN route at a higher metric is left in place
+	// and outranked by veld's route while veld is up. Only a VPN route at
+	// the same metric (0) is displaced, and it is not restored on Close.
 	CollisionEqual CollisionKind = iota
 	// CollisionInside: a more-specific route is carved out of the mesh prefix.
 	// Those destinations follow the other route and never reach the mesh.
@@ -304,7 +305,7 @@ func FindCollisions(s Snapshot, selfIface string, prefixes ...netip.Prefix) []Co
 					Route:  r.Dst,
 					Iface:  r.Iface,
 					Kind:   CollisionEqual,
-					Advice: fmt.Sprintf("route %s via %s is an exact conflict; Veldmesh installs its route by replacing any same-prefix route — but if the VPN reinstalls its route later, traffic to %s breaks; prefer moving one side to a different CIDR", r.Dst, r.Iface, p),
+					Advice: fmt.Sprintf("route %s via %s is an exact conflict; Veldmesh installs its route at metric 0, so it takes precedence while up — a VPN route at a higher metric is left in place, but a VPN route at metric 0 is displaced and not restored on close; prefer moving one side to a different CIDR", r.Dst, r.Iface),
 				})
 			case r.Dst.Bits() < p.Bits():
 				cs = append(cs, Collision{
