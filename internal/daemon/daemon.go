@@ -61,6 +61,8 @@ type Daemon struct {
 	relayProxies    map[[32]byte]*relay.Proxy // one relay proxy per peer ID
 	tunDev          tun.TUN                   // veld's own TUN; nil in coord mode until the coordinator assigns the VPN address
 	tofuMismatchLog map[string]time.Time      // last log time per VPN address for TOFU mismatch rate limiting
+	tofuLastPrune   time.Time                 // last time the tofuMismatchLog was pruned
+	now             func() time.Time          // injectable clock for tests; defaults to time.Now
 }
 
 // New creates a Daemon from pre-constructed components.
@@ -88,6 +90,7 @@ func New(
 		localID:   localID,
 		networkID: networkID,
 		tunDev:    t,
+		now:       time.Now,
 	}
 }
 
@@ -690,19 +693,22 @@ func (d *Daemon) logRouteCollisions(pfx netip.Prefix) {
 
 // logTOFUMismatch logs a TOFU fingerprint mismatch for the given VPN address,
 // rate-limited to once per 10 minutes per address. Prunes entries older than
-// 10 minutes to prevent unbounded growth.
+// 10 minutes at most once per minute to prevent unbounded growth.
 func (d *Daemon) logTOFUMismatch(vpnAddr string) {
 	d.mu.Lock()
 	if d.tofuMismatchLog == nil {
 		d.tofuMismatchLog = make(map[string]time.Time)
 	}
-	now := time.Now()
+	now := d.now()
 
-	// Prune entries older than 10 minutes.
-	for addr, last := range d.tofuMismatchLog {
-		if now.Sub(last) >= 10*time.Minute {
-			delete(d.tofuMismatchLog, addr)
+	// Prune at most once per minute.
+	if now.Sub(d.tofuLastPrune) >= time.Minute {
+		for addr, last := range d.tofuMismatchLog {
+			if now.Sub(last) >= 10*time.Minute {
+				delete(d.tofuMismatchLog, addr)
+			}
 		}
+		d.tofuLastPrune = now
 	}
 
 	if last, ok := d.tofuMismatchLog[vpnAddr]; ok && now.Sub(last) < 10*time.Minute {
