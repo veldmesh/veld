@@ -198,10 +198,7 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           SHA_X86_64=$(head -c 64 /dev/zero | tr '\0' 'a')
           SHA_AARCH64=$(head -c 64 /dev/zero | tr '\0' 'b')
-          cat > checksums.txt <<EOF
-$SHA_X86_64  veld-v9.9.9-linux_amd64.tar.gz
-$SHA_AARCH64  veld-v9.9.9-linux_arm64.tar.gz
-EOF
+          printf '%s  %s\n' "$SHA_X86_64" veld-v9.9.9-linux_amd64.tar.gz "$SHA_AARCH64" veld-v9.9.9-linux_arm64.tar.gz > checksums.txt
           cp packaging/aur/PKGBUILD PKGBUILD.test
           sh packaging/aur/update-pkgbuild.sh 9.9.9 checksums.txt PKGBUILD.test
           # Verify pkgver, pkgrel, and both sha256sums arrays
@@ -216,9 +213,7 @@ EOF
         run: |
           cd "$GITHUB_WORKSPACE"
           SHA_X86_64=$(head -c 64 /dev/zero | tr '\0' 'a')
-          cat > checksums.txt <<EOF
-$SHA_X86_64  veld-v9.9.9-linux_amd64.tar.gz
-EOF
+          printf '%s  %s\n' "$SHA_X86_64" veld-v9.9.9-linux_amd64.tar.gz > checksums.txt
           cp packaging/aur/PKGBUILD PKGBUILD.test
           # Should fail with non-zero exit code
           ! sh packaging/aur/update-pkgbuild.sh 9.9.9 checksums.txt PKGBUILD.test
