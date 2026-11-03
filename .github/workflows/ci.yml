@@ -181,3 +181,44 @@ jobs:
           go build ./cmd/veld-daemon
           go build ./cmd/veld-coord
           go build ./cmd/veld
+
+  aur-pkgbuild:
+    name: AUR PKGBUILD generator
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: archlinux:base-devel
+      options: --user 1000:1000
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Test successful PKGBUILD generation
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          SHA_X86_64=$(head -c 64 /dev/zero | tr '\0' 'a')
+          SHA_AARCH64=$(head -c 64 /dev/zero | tr '\0' 'b')
+          cat > checksums.txt <<EOF
+$SHA_X86_64  veld-v9.9.9-linux_amd64.tar.gz
+$SHA_AARCH64  veld-v9.9.9-linux_arm64.tar.gz
+EOF
+          cp packaging/aur/PKGBUILD PKGBUILD.test
+          sh packaging/aur/update-pkgbuild.sh 9.9.9 checksums.txt PKGBUILD.test
+          # Verify pkgver, pkgrel, and both sha256sums arrays
+          grep -q '^pkgver=9.9.9$' PKGBUILD.test
+          grep -q '^pkgrel=1$' PKGBUILD.test
+          grep -q "^sha256sums_x86_64=('$SHA_X86_64')" PKGBUILD.test
+          grep -q "^sha256sums_aarch64=('$SHA_AARCH64')" PKGBUILD.test
+          # Validate PKGBUILD syntax with makepkg --printsrcinfo
+          makepkg --printsrcinfo -f PKGBUILD.test > /dev/null
+
+      - name: Test failure when arm64 checksum is missing
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          SHA_X86_64=$(head -c 64 /dev/zero | tr '\0' 'a')
+          cat > checksums.txt <<EOF
+$SHA_X86_64  veld-v9.9.9-linux_amd64.tar.gz
+EOF
+          cp packaging/aur/PKGBUILD PKGBUILD.test
+          # Should fail with non-zero exit code
+          ! sh packaging/aur/update-pkgbuild.sh 9.9.9 checksums.txt PKGBUILD.test
