@@ -216,4 +216,7 @@ jobs:
           printf '%s  %s\n' "$SHA_X86_64" veld-v9.9.9-linux_amd64.tar.gz > checksums.txt
           cp packaging/aur/PKGBUILD PKGBUILD.test
           # Should fail with non-zero exit code
-          ! sh packaging/aur/update-pkgbuild.sh 9.9.9 checksums.txt PKGBUILD.test
+          if sh packaging/aur/update-pkgbuild.sh 9.9.9 checksums.txt PKGBUILD.test; then
+            echo "expected failure without the arm64 checksum"
+            exit 1
+          fi
