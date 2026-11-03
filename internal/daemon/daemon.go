@@ -689,13 +689,22 @@ func (d *Daemon) logRouteCollisions(pfx netip.Prefix) {
 }
 
 // logTOFUMismatch logs a TOFU fingerprint mismatch for the given VPN address,
-// rate-limited to once per 10 minutes per address.
+// rate-limited to once per 10 minutes per address. Prunes entries older than
+// 10 minutes to prevent unbounded growth.
 func (d *Daemon) logTOFUMismatch(vpnAddr string) {
 	d.mu.Lock()
 	if d.tofuMismatchLog == nil {
 		d.tofuMismatchLog = make(map[string]time.Time)
 	}
 	now := time.Now()
+
+	// Prune entries older than 10 minutes.
+	for addr, last := range d.tofuMismatchLog {
+		if now.Sub(last) >= 10*time.Minute {
+			delete(d.tofuMismatchLog, addr)
+		}
+	}
+
 	if last, ok := d.tofuMismatchLog[vpnAddr]; ok && now.Sub(last) < 10*time.Minute {
 		d.mu.Unlock()
 		return

@@ -829,3 +829,562 @@ func TestRegistry_ReRegistration_KeepsAddress(t *testing.T) {
 		t.Errorf("re-registration changed address: got %s, want %s", again, vpnAddr)
 	}
 }
+
+// TestRegistry_AddressAllocation_PreUpgradeMigration reproduces the bug where
+// a pre-upgrade database (with nil AssignedAddrs) that had peers removed
+// before the upgrade incorrectly reuses freed addresses.
+func TestRegistry_AddressAllocation_PreUpgradeMigration(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+
+	// Phase 1: Create network, register p1, p2, p3, then remove p2.
+	// This simulates a pre-upgrade database where addresses were assigned and freed.
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry: %v", err)
+		}
+
+		cidr := netip.MustParsePrefix("10.0.0.0/24")
+		net := coordcore.Network{ID: "net1", CIDR: cidr, Name: "Test Network"}
+		if err := reg.CreateNetwork(net, "acc1"); err != nil {
+			t.Fatalf("CreateNetwork: %v", err)
+		}
+
+		// Register p1, p2, p3 -> get 10.0.0.1, .2, .3
+		for i := 1; i <= 3; i++ {
+			rec := peerRecord{
+				ID:            fmt.Sprintf("p%d", i),
+				Name:          fmt.Sprintf("Peer %d", i),
+				Ed25519Public: base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("pub%dxxxxxxxxxxxxxxxxxxxxxxxxx", i))),
+				X25519Public:  base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("x25519%dxxxxxxxxxxxxxxxxxxxxxxxx", i))),
+				RegisteredAt:  0,
+				LastSeen:      0,
+			}
+			vpnAddr, err := reg.RegisterPeer(rec, "net1", 0)
+			if err != nil {
+				t.Fatalf("RegisterPeer p%d: %v", i, err)
+			}
+			if vpnAddr.String() != fmt.Sprintf("10.0.0.%d", i) {
+				t.Errorf("p%d got %s, want 10.0.0.%d", i, vpnAddr, i)
+			}
+		}
+
+		// Remove p2 (10.0.0.2)
+		if _, err := reg.RemovePeer("p2"); err != nil {
+			t.Fatalf("RemovePeer p2: %v", err)
+		}
+
+		// Now simulate pre-upgrade on-disk form: set AssignedAddrs to nil
+		err = reg.db.Update(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			netRec.AssignedAddrs = nil
+			updated, err := json.Marshal(netRec)
+			if err != nil {
+				return err
+			}
+			return nb.Put([]byte("net1"), updated)
+		})
+		if err != nil {
+			t.Fatalf("manual DB update: %v", err)
+		}
+
+		reg.Close()
+	}
+
+	// Phase 2: Reopen registry (simulating upgrade), register p4.
+	// p4 must get 10.0.0.4 (never-used), not 10.0.0.2 (freed before upgrade).
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry (reopen): %v", err)
+		}
+		defer reg.Close()
+
+		rec := peerRecord{
+			ID:            "p4",
+			Name:          "Peer 4",
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("pub4xxxxxxxxxxxxxxxxxxxxxxxxxx")),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x255194xxxxxxxxxxxxxxxxxxxxxxxxx")),
+			RegisteredAt:  0,
+			LastSeen:      0,
+		}
+		vpnAddr, err := reg.RegisterPeer(rec, "net1", 0)
+		if err != nil {
+			t.Fatalf("RegisterPeer p4: %v", err)
+		}
+
+		if vpnAddr.String() != "10.0.0.4" {
+			t.Errorf("p4 got %s, want 10.0.0.4 (never-used), not 10.0.0.2 (freed before upgrade)", vpnAddr)
+		}
+	}
+}
+
+// TestRegistry_AddressAllocation_PreUpgradeMigration_WithGap tests the case
+// where NextIP points past a gap (e.g. NextIP .6, peers hold .1 and .4).
+// Uses a /29 (usable .1-.6) so the never-used space from NextIP can be exhausted.
+// New registrations get .6 first (never-used from NextIP); then .2, .3, .5 (freed, lowest first).
+func TestRegistry_AddressAllocation_PreUpgradeMigration_WithGap(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+
+	// Phase 1: Create network, register peers to create a gap, then simulate pre-upgrade.
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry: %v", err)
+		}
+
+		// /29: network 10.0.0.0, broadcast 10.0.0.7, usable 10.0.0.1-10.0.0.6 (6 addresses)
+		cidr := netip.MustParsePrefix("10.0.0.0/29")
+		net := coordcore.Network{ID: "net1", CIDR: cidr, Name: "Test Network"}
+		if err := reg.CreateNetwork(net, "acc1"); err != nil {
+			t.Fatalf("CreateNetwork: %v", err)
+		}
+
+		// Register p1 (10.0.0.1), p2 (10.0.0.2), p3 (10.0.0.3), p4 (10.0.0.4), p5 (10.0.0.5)
+		for i := 1; i <= 5; i++ {
+			rec := peerRecord{
+				ID:            fmt.Sprintf("p%d", i),
+				Name:          fmt.Sprintf("Peer %d", i),
+				Ed25519Public: base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("pub%dxxxxxxxxxxxxxxxxxxxxxxxxx", i))),
+				X25519Public:  base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("x25519%dxxxxxxxxxxxxxxxxxxxxxxxx", i))),
+				RegisteredAt:  0,
+				LastSeen:      0,
+			}
+			if _, err := reg.RegisterPeer(rec, "net1", 0); err != nil {
+				t.Fatalf("RegisterPeer p%d: %v", i, err)
+			}
+		}
+
+		// Remove p2 (10.0.0.2), p3 (10.0.0.3), p5 (10.0.0.5)
+		// Remaining: p1 (10.0.0.1), p4 (10.0.0.4)
+		// NextIP should be 10.0.0.6
+		for _, id := range []string{"p2", "p3", "p5"} {
+			if _, err := reg.RemovePeer(id); err != nil {
+				t.Fatalf("RemovePeer %s: %v", id, err)
+			}
+		}
+
+		// Verify NextIP is 10.0.0.6
+		err = reg.db.View(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			if netRec.NextIP != "10.0.0.6" {
+				t.Errorf("NextIP is %s, want 10.0.0.6", netRec.NextIP)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("verify NextIP: %v", err)
+		}
+
+		// Now simulate pre-upgrade on-disk form: set AssignedAddrs to nil
+		err = reg.db.Update(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			netRec.AssignedAddrs = nil
+			updated, err := json.Marshal(netRec)
+			if err != nil {
+				return err
+			}
+			return nb.Put([]byte("net1"), updated)
+		})
+		if err != nil {
+			t.Fatalf("manual DB update: %v", err)
+		}
+
+		reg.Close()
+	}
+
+	// Phase 2: Reopen registry, register new peers.
+	// Never-used from NextIP (.6): only 10.0.0.6 (1 address)
+	// Freed: 10.0.0.2, 10.0.0.3, 10.0.0.5
+	// Order: .6 (never-used), then .2, .3, .5 (freed, lowest first)
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry (reopen): %v", err)
+		}
+		defer reg.Close()
+
+		// First gets never-used 10.0.0.6
+		rec := peerRecord{
+			ID:            "new1",
+			Name:          "New 1",
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("new1xxxxxxxxxxxxxxxxxxxxxxxxxx")),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("xnew1xxxxxxxxxxxxxxxxxxxxxxxxx")),
+			RegisteredAt:  0,
+			LastSeen:      0,
+		}
+		vpnAddr, err := reg.RegisterPeer(rec, "net1", 0)
+		if err != nil {
+			t.Fatalf("RegisterPeer new1: %v", err)
+		}
+		if vpnAddr.String() != "10.0.0.6" {
+			t.Errorf("new1 got %s, want 10.0.0.6 (never-used from NextIP)", vpnAddr)
+		}
+
+		// Next get freed addresses in order: 10.0.0.2, 10.0.0.3, 10.0.0.5
+		expectedFreed := []string{"10.0.0.2", "10.0.0.3", "10.0.0.5"}
+		for i, exp := range expectedFreed {
+			rec := peerRecord{
+				ID:            fmt.Sprintf("new%d", i+2),
+				Name:          fmt.Sprintf("New %d", i+2),
+				Ed25519Public: base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("new%dxxxxxxxxxxxxxxxxxxxxxxxxx", i+2))),
+				X25519Public:  base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("xnew%dxxxxxxxxxxxxxxxxxxxxxxxx", i+2))),
+				RegisteredAt:  0,
+				LastSeen:      0,
+			}
+			vpnAddr, err := reg.RegisterPeer(rec, "net1", 0)
+			if err != nil {
+				t.Fatalf("RegisterPeer new%d: %v", i+2, err)
+			}
+			if vpnAddr.String() != exp {
+				t.Errorf("new%d got %s, want %s (freed, lowest first)", i+2, vpnAddr, exp)
+			}
+		}
+
+		// Next should exhaust address space
+		rec = peerRecord{
+			ID:            "new6",
+			Name:          "New 6",
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("new6xxxxxxxxxxxxxxxxxxxxxxxxxx")),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("xnew6xxxxxxxxxxxxxxxxxxxxxxxxx")),
+			RegisteredAt:  0,
+			LastSeen:      0,
+		}
+		_, err = reg.RegisterPeer(rec, "net1", 0)
+		if !errors.Is(err, ErrAddressSpaceExhausted) {
+			t.Errorf("expected ErrAddressSpaceExhausted, got %v", err)
+		}
+	}
+}
+
+// TestRegistry_AddressAllocation_PreUpgradeMigration_Once tests that
+// migration happens once: after the first registration the record has
+// assigned_addrs and a reopen of the registry gives the same answers.
+func TestRegistry_AddressAllocation_PreUpgradeMigration_Once(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+
+	// Phase 1: Create network, register p1, p2, p3, remove p2, set AssignedAddrs to nil.
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry: %v", err)
+		}
+
+		cidr := netip.MustParsePrefix("10.0.0.0/24")
+		net := coordcore.Network{ID: "net1", CIDR: cidr, Name: "Test Network"}
+		if err := reg.CreateNetwork(net, "acc1"); err != nil {
+			t.Fatalf("CreateNetwork: %v", err)
+		}
+
+		for i := 1; i <= 3; i++ {
+			rec := peerRecord{
+				ID:            fmt.Sprintf("p%d", i),
+				Name:          fmt.Sprintf("Peer %d", i),
+				Ed25519Public: base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("pub%dxxxxxxxxxxxxxxxxxxxxxxxxx", i))),
+				X25519Public:  base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("x25519%dxxxxxxxxxxxxxxxxxxxxxxxx", i))),
+				RegisteredAt:  0,
+				LastSeen:      0,
+			}
+			if _, err := reg.RegisterPeer(rec, "net1", 0); err != nil {
+				t.Fatalf("RegisterPeer p%d: %v", i, err)
+			}
+		}
+
+		if _, err := reg.RemovePeer("p2"); err != nil {
+			t.Fatalf("RemovePeer p2: %v", err)
+		}
+
+		err = reg.db.Update(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			netRec.AssignedAddrs = nil
+			updated, err := json.Marshal(netRec)
+			if err != nil {
+				return err
+			}
+			return nb.Put([]byte("net1"), updated)
+		})
+		if err != nil {
+			t.Fatalf("manual DB update: %v", err)
+		}
+
+		reg.Close()
+	}
+
+	// Phase 2: First registration after upgrade (migration happens).
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry (reopen): %v", err)
+		}
+
+		rec := peerRecord{
+			ID:            "p4",
+			Name:          "Peer 4",
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("pub4xxxxxxxxxxxxxxxxxxxxxxxxxx")),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x255194xxxxxxxxxxxxxxxxxxxxxxxxx")),
+			RegisteredAt:  0,
+			LastSeen:      0,
+		}
+		vpnAddr, err := reg.RegisterPeer(rec, "net1", 0)
+		if err != nil {
+			t.Fatalf("RegisterPeer p4: %v", err)
+		}
+		if vpnAddr.String() != "10.0.0.4" {
+			t.Errorf("p4 got %s, want 10.0.0.4", vpnAddr)
+		}
+
+		// Verify AssignedAddrs is now populated
+		err = reg.db.View(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			if netRec.AssignedAddrs == nil {
+				t.Errorf("AssignedAddrs is nil after migration")
+			} else {
+				// Should have entries for 10.0.0.1, 10.0.0.3 (assigned), 10.0.0.2 (freed), 10.0.0.4 (assigned)
+				if netRec.AssignedAddrs["10.0.0.1"] != 0 {
+					t.Errorf("10.0.0.1 should be assigned (0), got %d", netRec.AssignedAddrs["10.0.0.1"])
+				}
+				if netRec.AssignedAddrs["10.0.0.3"] != 0 {
+					t.Errorf("10.0.0.3 should be assigned (0), got %d", netRec.AssignedAddrs["10.0.0.3"])
+				}
+				if netRec.AssignedAddrs["10.0.0.2"] <= 0 {
+					t.Errorf("10.0.0.2 should be freed (>0), got %d", netRec.AssignedAddrs["10.0.0.2"])
+				}
+				if netRec.AssignedAddrs["10.0.0.4"] != 0 {
+					t.Errorf("10.0.0.4 should be assigned (0), got %d", netRec.AssignedAddrs["10.0.0.4"])
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("verify AssignedAddrs: %v", err)
+		}
+
+		reg.Close()
+	}
+
+	// Phase 3: Reopen again, register p5 - should get 10.0.0.5 (never-used)
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry (reopen 2): %v", err)
+		}
+		defer reg.Close()
+
+		rec := peerRecord{
+			ID:            "p5",
+			Name:          "Peer 5",
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("pub5xxxxxxxxxxxxxxxxxxxxxxxxxx")),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x255195xxxxxxxxxxxxxxxxxxxxxxxxx")),
+			RegisteredAt:  0,
+			LastSeen:      0,
+		}
+		vpnAddr, err := reg.RegisterPeer(rec, "net1", 0)
+		if err != nil {
+			t.Fatalf("RegisterPeer p5: %v", err)
+		}
+		if vpnAddr.String() != "10.0.0.5" {
+			t.Errorf("p5 got %s, want 10.0.0.5 (never-used)", vpnAddr)
+		}
+
+		// Verify AssignedAddrs still has the migrated data
+		err = reg.db.View(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			if netRec.AssignedAddrs == nil {
+				t.Errorf("AssignedAddrs is nil after second reopen")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("verify AssignedAddrs second reopen: %v", err)
+		}
+	}
+}
+
+// TestRegistry_AddressAllocation_PreUpgradeMigration_RemovePeerFirst tests the case
+// where the first operation after upgrade is RemovePeer of a still-present peer,
+// then RegisterPeer of a new peer. The new peer must get the next never-used address
+// (at or above NextIP), not an address freed before the upgrade.
+func TestRegistry_AddressAllocation_PreUpgradeMigration_RemovePeerFirst(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+
+	// Phase 1: Create network, register p1, p2, p3, then remove p2.
+	// This simulates a pre-upgrade database where addresses were assigned and freed.
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry: %v", err)
+		}
+
+		cidr := netip.MustParsePrefix("10.0.0.0/24")
+		net := coordcore.Network{ID: "net1", CIDR: cidr, Name: "Test Network"}
+		if err := reg.CreateNetwork(net, "acc1"); err != nil {
+			t.Fatalf("CreateNetwork: %v", err)
+		}
+
+		// Register p1, p2, p3 -> get 10.0.0.1, .2, .3
+		for i := 1; i <= 3; i++ {
+			rec := peerRecord{
+				ID:            fmt.Sprintf("p%d", i),
+				Name:          fmt.Sprintf("Peer %d", i),
+				Ed25519Public: base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("pub%dxxxxxxxxxxxxxxxxxxxxxxxxx", i))),
+				X25519Public:  base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("x25519%dxxxxxxxxxxxxxxxxxxxxxxxx", i))),
+				RegisteredAt:  0,
+				LastSeen:      0,
+			}
+			vpnAddr, err := reg.RegisterPeer(rec, "net1", 0)
+			if err != nil {
+				t.Fatalf("RegisterPeer p%d: %v", i, err)
+			}
+			if vpnAddr.String() != fmt.Sprintf("10.0.0.%d", i) {
+				t.Errorf("p%d got %s, want 10.0.0.%d", i, vpnAddr, i)
+			}
+		}
+
+		// Remove p2 (10.0.0.2)
+		if _, err := reg.RemovePeer("p2"); err != nil {
+			t.Fatalf("RemovePeer p2: %v", err)
+		}
+
+		// Now simulate pre-upgrade on-disk form: set AssignedAddrs to nil
+		err = reg.db.Update(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			netRec.AssignedAddrs = nil
+			updated, err := json.Marshal(netRec)
+			if err != nil {
+				return err
+			}
+			return nb.Put([]byte("net1"), updated)
+		})
+		if err != nil {
+			t.Fatalf("manual DB update: %v", err)
+		}
+
+		reg.Close()
+	}
+
+	// Phase 2: Reopen registry (simulating upgrade), FIRST remove p1, THEN register p4.
+	// p4 must get 10.0.0.4 (never-used from NextIP), not 10.0.0.2 (freed before upgrade).
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry (reopen): %v", err)
+		}
+		defer reg.Close()
+
+		// First operation after upgrade: remove p1 (10.0.0.1)
+		if _, err := reg.RemovePeer("p1"); err != nil {
+			t.Fatalf("RemovePeer p1: %v", err)
+		}
+
+		// Now register p4 - must get 10.0.0.4 (never-used), not 10.0.0.2
+		rec := peerRecord{
+			ID:            "p4",
+			Name:          "Peer 4",
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("pub4xxxxxxxxxxxxxxxxxxxxxxxxxx")),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x255194xxxxxxxxxxxxxxxxxxxxxxxxx")),
+			RegisteredAt:  0,
+			LastSeen:      0,
+		}
+		vpnAddr, err := reg.RegisterPeer(rec, "net1", 0)
+		if err != nil {
+			t.Fatalf("RegisterPeer p4: %v", err)
+		}
+
+		if vpnAddr.String() != "10.0.0.4" {
+			t.Errorf("p4 got %s, want 10.0.0.4 (never-used from NextIP), not 10.0.0.2 (freed before upgrade)", vpnAddr)
+		}
+
+		// Verify AssignedAddrs has the migrated data
+		err = reg.db.View(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			if netRec.AssignedAddrs == nil {
+				t.Errorf("AssignedAddrs is nil after migration")
+			} else {
+				// 10.0.0.2 (freed before upgrade) should have timestamp 1
+				if netRec.AssignedAddrs["10.0.0.2"] <= 0 {
+					t.Errorf("10.0.0.2 should be freed with timestamp 1, got %d", netRec.AssignedAddrs["10.0.0.2"])
+				}
+				// 10.0.0.3 (still assigned) should have timestamp 0
+				if netRec.AssignedAddrs["10.0.0.3"] != 0 {
+					t.Errorf("10.0.0.3 should be assigned (0), got %d", netRec.AssignedAddrs["10.0.0.3"])
+				}
+				// 10.0.0.4 (newly assigned) should have timestamp 0
+				if netRec.AssignedAddrs["10.0.0.4"] != 0 {
+					t.Errorf("10.0.0.4 should be assigned (0), got %d", netRec.AssignedAddrs["10.0.0.4"])
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("verify AssignedAddrs: %v", err)
+		}
+	}
+}

@@ -257,9 +257,21 @@ mismatches when a peer leaves and a new one joins, the allocation order is:
 
 Re-registration of an existing peer (same Ed25519 identity) always keeps its current
 VPN address. The coordinator records every address ever assigned and when it was last
-freed; this record survives a coordinator restart. Existing databases without this
-record are backward compatible — currently assigned peers' addresses are treated as
-"assigned" and all others as "never used."
+freed; this record survives a coordinator restart.
+
+The `assigned_addrs` map is bounded by the network CIDR size (at most one entry per
+usable host address). For a /24 this is 254 entries; for a /16 it is 65,534 entries.
+
+**Pre-upgrade database migration.** Databases created before the `assigned_addrs` field
+existed have `nil` for that field. On the first registration after upgrade, the coordinator
+migrates the record in a single transaction:
+- Currently assigned peers' addresses are marked with timestamp 0 (assigned).
+- Every address from the first host address up to (but not including) `NextIP` that is
+  not currently held is marked with timestamp 1 (freed, oldest possible), so those
+  addresses are reused first among freed addresses and in address order.
+- Addresses at or above `NextIP` are left unrecorded (treated as never-used).
+The migrated record is written back atomically. Subsequent registrations use the
+populated `assigned_addrs` normally; migration happens exactly once.
 
 ### 3.8 TOFU mismatch logging
 
@@ -274,3 +286,6 @@ tofu: dropped handshake for 10.100.0.5: it is pinned to a different key. If that
 The log message includes the VPN address and a remediation hint. No key material is
 logged beyond what is already visible in the TOFU store. The handshake itself is
 silently dropped on the wire (no error response) — this is a logging-only addition.
+
+The rate-limit map is pruned on each insertion: entries older than 10 minutes are
+removed to prevent unbounded growth.
