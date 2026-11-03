@@ -30,7 +30,7 @@ func TestCreateTUN_Darwin(t *testing.T) {
 		t.Fatalf("parse prefix: %v", err)
 	}
 
-	dev, err := tun.CreateTUN(tun.DefaultIfaceName(), prefix, 1420)
+	dev, err := tun.CreateTUN(tun.DefaultIfaceName(), prefix, 1420, false)
 	if err != nil {
 		t.Fatalf("CreateTUN: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestCreateTUN_Darwin_WriteRead(t *testing.T) {
 		t.Fatalf("parse prefix: %v", err)
 	}
 
-	dev, err := tun.CreateTUN(tun.DefaultIfaceName(), prefix, 1420)
+	dev, err := tun.CreateTUN(tun.DefaultIfaceName(), prefix, 1420, false)
 	if err != nil {
 		t.Fatalf("CreateTUN: %v", err)
 	}

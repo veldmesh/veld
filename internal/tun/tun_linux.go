@@ -31,9 +31,9 @@ type linuxTUN struct {
 // stable interface to reference in split-tunnel and firewall rules.
 func DefaultIfaceName() string { return "veld0" }
 
-// CreateTUN creates a Linux TUN device with the given name, assigns ip to it, and brings it up.
+// createTUN creates a Linux TUN device with the given name, assigns ip to it, and brings it up.
 // Requires CAP_NET_ADMIN or root.
-func CreateTUN(name string, ip netip.Prefix, mtu int) (TUN, error) {
+func createTUN(name string, ip netip.Prefix, mtu int) (TUN, error) {
 	dev, err := createDevice(name, mtu)
 	if err != nil {
 		return nil, fmt.Errorf("tun create %s: %w", name, err)
