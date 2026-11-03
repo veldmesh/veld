@@ -189,7 +189,6 @@ jobs:
       contents: read
     container:
       image: archlinux:base-devel
-      options: --user 1000:1000
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -206,8 +205,9 @@ jobs:
           grep -q '^pkgrel=1$' PKGBUILD.test
           grep -q "^sha256sums_x86_64=('$SHA_X86_64')" PKGBUILD.test
           grep -q "^sha256sums_aarch64=('$SHA_AARCH64')" PKGBUILD.test
-          # Validate PKGBUILD syntax with makepkg --printsrcinfo
-          makepkg --printsrcinfo -f PKGBUILD.test > /dev/null
+          # Validate PKGBUILD syntax with makepkg --printsrcinfo as non-root user
+          useradd -m builder && chown -R builder "$GITHUB_WORKSPACE"
+          su builder -c "cd '$GITHUB_WORKSPACE' && makepkg --printsrcinfo -p PKGBUILD.test > /dev/null"
 
       - name: Test failure when arm64 checksum is missing
         run: |
