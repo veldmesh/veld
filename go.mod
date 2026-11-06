@@ -7,6 +7,7 @@ toolchain go1.26.10
 require (
 	github.com/BurntSushi/toml v1.3.2
 	github.com/flynn/noise v1.1.0
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/golang/protobuf v1.5.4
 	github.com/hashicorp/mdns v1.0.6
 	github.com/pires/go-proxyproto v0.15.0

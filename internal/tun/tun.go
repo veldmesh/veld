@@ -132,3 +132,18 @@ func (m *MemTUN) Close() error {
 func (m *MemTUN) Name() string       { return m.name }
 func (m *MemTUN) Addr() netip.Prefix { return m.addr }
 func (m *MemTUN) MTU() int           { return m.mtu }
+
+// Drain removes and discards all packets from the delivery channel.
+// Useful for tests to clear leftover packets between test cases.
+func (m *MemTUN) Drain() {
+	for {
+		select {
+		case _, ok := <-m.delivCh:
+			if !ok {
+				return
+			}
+		default:
+			return
+		}
+	}
+}

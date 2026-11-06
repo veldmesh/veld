@@ -14,34 +14,6 @@ import (
 	"github.com/veldmesh/veld/internal/tun"
 )
 
-func makeEntry(id *crypto.Identity, vpn string, ep netip.AddrPort) *peer.Entry {
-	var peerID [32]byte
-	copy(peerID[:], id.Ed25519Public)
-	e := &peer.Entry{
-		ID:        peerID,
-		X25519Pub: id.X25519Public,
-		VPNAddr:   netip.MustParseAddr(vpn),
-	}
-	if ep.IsValid() {
-		e.SetEndpoint(ep)
-	}
-	return e
-}
-
-func makeIPv4Packet(src, dst [4]byte, payload []byte) []byte {
-	total := 20 + len(payload)
-	pkt := make([]byte, total)
-	pkt[0] = 0x45
-	pkt[2] = byte(total >> 8)
-	pkt[3] = byte(total)
-	pkt[8] = 64
-	pkt[9] = 17
-	copy(pkt[12:16], src[:])
-	copy(pkt[16:20], dst[:])
-	copy(pkt[20:], payload)
-	return pkt
-}
-
 // TestStaticConfig_TwoPeers_Exchange verifies that two daemons connect via static
 // config and exchange packets end-to-end, including the initial Noise IK handshake.
 func TestStaticConfig_TwoPeers_Exchange(t *testing.T) {
@@ -74,10 +46,10 @@ func TestStaticConfig_TwoPeers_Exchange(t *testing.T) {
 
 	// Build peer tables.
 	tblA := peer.New()
-	tblA.Upsert(makeEntry(idB, "10.100.0.2", epB))
+	tblA.Upsert(makeEntry(idB, "peerB", "10.100.0.2", epB))
 
 	tblB := peer.New()
-	tblB.Upsert(makeEntry(idA, "10.100.0.1", epA))
+	tblB.Upsert(makeEntry(idA, "peerA", "10.100.0.1", epA))
 
 	tunA := tun.NewMemTUN("tunA", netip.MustParsePrefix("10.100.0.1/24"), 1420)
 	tunB := tun.NewMemTUN("tunB", netip.MustParsePrefix("10.100.0.2/24"), 1420)
@@ -97,7 +69,7 @@ func TestStaticConfig_TwoPeers_Exchange(t *testing.T) {
 	// The dispatcher will enqueue it and trigger a handshake.
 	// After handshake completes, FlushHoldQueue sends it encrypted.
 	// B decrypts and writes to tunB.
-	want := makeIPv4Packet([4]byte{10, 100, 0, 1}, [4]byte{10, 100, 0, 2}, []byte("hello from A"))
+	want := makeUDPv4Packet([4]byte{10, 100, 0, 1}, [4]byte{10, 100, 0, 2}, 12345, 53, []byte("hello from A"))
 	if _, err := tunA.Inject(want); err != nil {
 		t.Fatalf("tunA.Inject: %v", err)
 	}
@@ -144,9 +116,9 @@ func TestStaticConfig_BidirectionalExchange(t *testing.T) {
 	epB, _ := netip.ParseAddrPort(connB.LocalAddr().String())
 
 	tblA := peer.New()
-	tblA.Upsert(makeEntry(idB, "10.100.0.2", epB))
+	tblA.Upsert(makeEntry(idB, "peerB", "10.100.0.2", epB))
 	tblB := peer.New()
-	tblB.Upsert(makeEntry(idA, "10.100.0.1", epA))
+	tblB.Upsert(makeEntry(idA, "peerA", "10.100.0.1", epA))
 
 	tunA := tun.NewMemTUN("tunA", netip.MustParsePrefix("10.100.0.1/24"), 1420)
 	tunB := tun.NewMemTUN("tunB", netip.MustParsePrefix("10.100.0.2/24"), 1420)
@@ -158,7 +130,7 @@ func TestStaticConfig_BidirectionalExchange(t *testing.T) {
 	defer func() { dA.Stop(); dB.Stop(); dA.Wait(); dB.Wait() }()
 
 	// A→B: send "ping"
-	ping := makeIPv4Packet([4]byte{10, 100, 0, 1}, [4]byte{10, 100, 0, 2}, []byte("ping"))
+	ping := makeUDPv4Packet([4]byte{10, 100, 0, 1}, [4]byte{10, 100, 0, 2}, 12345, 53, []byte("ping"))
 	tunA.Inject(ping)
 
 	bufB := make([]byte, 1500)
@@ -182,7 +154,7 @@ func TestStaticConfig_BidirectionalExchange(t *testing.T) {
 	}
 
 	// B→A: send "pong"
-	pong := makeIPv4Packet([4]byte{10, 100, 0, 2}, [4]byte{10, 100, 0, 1}, []byte("pong"))
+	pong := makeUDPv4Packet([4]byte{10, 100, 0, 2}, [4]byte{10, 100, 0, 1}, 53, 12345, []byte("pong"))
 	tunB.Inject(pong)
 
 	bufA := make([]byte, 1500)
