@@ -1009,3 +1009,125 @@ func TestLogTOFUMismatch_ExpiredRateLimit(t *testing.T) {
 		t.Errorf("expected 1 log line after rate limit expired, got: %s", output)
 	}
 }
+
+// TestLogTOFUMismatch_PruneOncePerMinute tests that pruning runs at most
+// once per minute. With an injectable clock we can verify that two calls
+// within a minute do not prune twice.
+func TestLogTOFUMismatch_PruneOncePerMinute(t *testing.T) {
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	var networkID [16]byte
+	d := New(id, networkID, nil, newFakeConn(), peer.New())
+
+	var buf strings.Builder
+	originalOutput := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(originalOutput)
+
+	// Use an injectable clock.
+	baseTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	d.now = func() time.Time { return baseTime }
+
+	addr1 := "10.100.0.1"
+	addr2 := "10.100.0.2"
+	addr3 := "10.100.0.3" // this one will be stale
+
+	// First call at baseTime: logs for addr1, initializes tofuLastPrune
+	d.logTOFUMismatch(addr1)
+	if !strings.Contains(buf.String(), addr1) {
+		t.Errorf("first call should log for %s", addr1)
+	}
+	buf.Reset()
+
+	// Second call 30 seconds later (same minute): should NOT prune again.
+	// Add a stale entry for addr3 that would be pruned if pruning ran.
+	d.mu.Lock()
+	d.tofuMismatchLog[addr3] = baseTime.Add(-11 * time.Minute)
+	d.mu.Unlock()
+
+	d.now = func() time.Time { return baseTime.Add(30 * time.Second) }
+	d.logTOFUMismatch(addr2)
+	output := buf.String()
+
+	// addr2 should be logged
+	if !strings.Contains(output, addr2) {
+		t.Errorf("second call should log for %s, got: %s", addr2, output)
+	}
+	// addr3 should NOT be pruned (still in map) because pruning didn't run again
+	d.mu.Lock()
+	if _, ok := d.tofuMismatchLog[addr3]; !ok {
+		t.Errorf("stale entry for %s should not be pruned on second call within same minute", addr3)
+	}
+	d.mu.Unlock()
+	buf.Reset()
+
+	// Third call 70 seconds after baseTime (next minute): pruning SHOULD run now.
+	d.now = func() time.Time { return baseTime.Add(70 * time.Second) }
+	d.logTOFUMismatch(addr1)
+	// addr1 should not log (rate limited to 10 min)
+	if strings.Contains(buf.String(), "tofu: dropped handshake") {
+		t.Errorf("third call for addr1 should be rate-limited, got: %s", buf.String())
+	}
+	// But addr3 should now be pruned
+	d.mu.Lock()
+	if _, ok := d.tofuMismatchLog[addr3]; ok {
+		t.Errorf("stale entry for %s should be pruned on call after minute boundary", addr3)
+	}
+	d.mu.Unlock()
+}
+
+// TestLogTOFUMismatch_StaleEntriesPruned tests that stale entries (older
+// than 10 minutes) are removed by the next prune after a minute.
+func TestLogTOFUMismatch_StaleEntriesPruned(t *testing.T) {
+	id, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	var networkID [16]byte
+	d := New(id, networkID, nil, newFakeConn(), peer.New())
+
+	var buf strings.Builder
+	originalOutput := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(originalOutput)
+
+	baseTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	d.now = func() time.Time { return baseTime }
+
+	addrFresh := "10.100.0.1"
+	addrStale := "10.100.0.2"
+
+	// First call: log for addrFresh
+	d.logTOFUMismatch(addrFresh)
+	buf.Reset()
+
+	// Manually add a stale entry (11 minutes old)
+	d.mu.Lock()
+	d.tofuMismatchLog[addrStale] = baseTime.Add(-11 * time.Minute)
+	d.mu.Unlock()
+
+	// Advance clock by 70 seconds (past the 1-minute prune interval)
+	d.now = func() time.Time { return baseTime.Add(70 * time.Second) }
+
+	// Call logTOFUMismatch for a new address - this should trigger pruning
+	d.logTOFUMismatch("10.100.0.3")
+	output := buf.String()
+
+	// The new address should be logged
+	if !strings.Contains(output, "10.100.0.3") {
+		t.Errorf("new address should be logged, got: %s", output)
+	}
+
+	// The stale entry should be pruned
+	d.mu.Lock()
+	if _, ok := d.tofuMismatchLog[addrStale]; ok {
+		t.Errorf("stale entry for %s should be pruned", addrStale)
+	}
+	// The fresh entry should remain
+	if _, ok := d.tofuMismatchLog[addrFresh]; !ok {
+		t.Errorf("fresh entry for %s should not be pruned", addrFresh)
+	}
+	d.mu.Unlock()
+}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/netip"
 	"strings"
 	"sync"
@@ -65,6 +66,11 @@ type peerRecord struct {
 // registry does not retain more detail about a machine's online
 // activity than the TTL sweep needs.
 const lastSeenGranularity = int64(time.Hour / time.Second)
+
+// maxFallbackHosts is the maximum number of host addresses to mark as freed
+// during the migration fallback for invalid NextIP. This prevents allocating
+// millions of entries for large CIDRs (e.g., /8).
+const maxFallbackHosts = 65536
 
 // roundToHour rounds a unix timestamp in seconds down to the hour. Zero
 // (never seen) is preserved: the sweep treats it as "no heartbeat" and
@@ -265,6 +271,12 @@ var ErrPeerKeyMismatch = fmt.Errorf("peer x25519 public key mismatch")
 // addresses are reused first among freed addresses and in address order.
 // This prevents reusing a departed peer's address on upgraded coords, which
 // would cause TOFU pin mismatches.
+// If NextIP is empty, unparseable, or not within the network CIDR, logs a
+// warning and falls back to marking every non-held host address in the CIDR
+// as freed with timestamp 1, capped at 65536 host addresses. If the CIDR
+// exceeds this limit, only the held addresses are marked (timestamp 0) and
+// no freed marks are added; allocation will then reuse never-used addresses
+// first.
 func migrateAssignedAddrs(netRec *networkRecord, used map[netip.Addr]bool) {
 	if netRec.AssignedAddrs != nil {
 		return
@@ -278,11 +290,33 @@ func migrateAssignedAddrs(netRec *networkRecord, used map[netip.Addr]bool) {
 
 	// Parse NextIP to find the range of potentially freed addresses.
 	nextIP, err := netip.ParseAddr(netRec.NextIP)
-	if err != nil || !nextIP.IsValid() {
-		return
-	}
 	cidr, _ := netip.ParsePrefix(netRec.CIDR)
 	firstHost := nextIPAfterNetwork(cidr.Masked())
+
+	// If NextIP is empty, unparseable, or not within the CIDR, fall back to
+	// marking all non-held host addresses as freed.
+	if err != nil || !nextIP.IsValid() || !cidr.Contains(nextIP) {
+		log.Printf("warning: network %q has invalid or empty NextIP %q; marking all non-held host addresses as freed", netRec.ID, netRec.NextIP)
+		// Count host addresses (exclude network and broadcast).
+		hostCount := 0
+		for a := firstHost; cidr.Contains(a.Next()); a = a.Next() {
+			hostCount++
+		}
+		if hostCount > maxFallbackHosts {
+			log.Printf("warning: network %q CIDR has %d host addresses (exceeds %d host limit); falling back to held addresses only", netRec.ID, hostCount, maxFallbackHosts)
+			// Leave AssignedAddrs with only held addresses (timestamp 0).
+			// No freed marks are added; allocation will reuse never-used addresses first.
+			return
+		}
+		// Iterate all host addresses (exclude network and broadcast).
+		// Use the same loop condition as the allocation logic: stop before broadcast.
+		for a := firstHost; cidr.Contains(a.Next()); a = a.Next() {
+			if !used[a] {
+				netRec.AssignedAddrs[a.String()] = 1
+			}
+		}
+		return
+	}
 
 	// Mark addresses from firstHost up to (not including) NextIP
 	// that are not currently used as freed (timestamp 1).

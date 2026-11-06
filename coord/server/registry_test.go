@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -1379,6 +1381,590 @@ func TestRegistry_AddressAllocation_PreUpgradeMigration_RemovePeerFirst(t *testi
 				// 10.0.0.4 (newly assigned) should have timestamp 0
 				if netRec.AssignedAddrs["10.0.0.4"] != 0 {
 					t.Errorf("10.0.0.4 should be assigned (0), got %d", netRec.AssignedAddrs["10.0.0.4"])
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("verify AssignedAddrs: %v", err)
+		}
+	}
+}
+
+// TestRegistry_AddressAllocation_PreUpgradeMigration_EmptyNextIP tests the case
+// where a pre-upgrade database has an empty NextIP. The migration should log a
+// warning and mark all non-held host addresses as freed with timestamp 1.
+// Allocation then reuses the oldest-freed address first.
+func TestRegistry_AddressAllocation_PreUpgradeMigration_EmptyNextIP(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+
+	// Capture log output
+	var buf strings.Builder
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	// Phase 1: Create network, register p1, p2, then remove p2.
+	// Simulate pre-upgrade with empty NextIP.
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry: %v", err)
+		}
+
+		cidr := netip.MustParsePrefix("10.0.0.0/24")
+		net := coordcore.Network{ID: "net1", CIDR: cidr, Name: "Test Network"}
+		if err := reg.CreateNetwork(net, "acc1"); err != nil {
+			t.Fatalf("CreateNetwork: %v", err)
+		}
+
+		for i := 1; i <= 2; i++ {
+			rec := peerRecord{
+				ID:            fmt.Sprintf("p%d", i),
+				Name:          fmt.Sprintf("Peer %d", i),
+				Ed25519Public: base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("pub%dxxxxxxxxxxxxxxxxxxxxxxxxx", i))),
+				X25519Public:  base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("x25519%dxxxxxxxxxxxxxxxxxxxxxxxx", i))),
+				RegisteredAt:  0,
+				LastSeen:      0,
+			}
+			if _, err := reg.RegisterPeer(rec, "net1", 0); err != nil {
+				t.Fatalf("RegisterPeer p%d: %v", i, err)
+			}
+		}
+
+		// Remove p2 (10.0.0.2)
+		if _, err := reg.RemovePeer("p2"); err != nil {
+			t.Fatalf("RemovePeer p2: %v", err)
+		}
+
+		// Set AssignedAddrs to nil AND NextIP to empty string
+		err = reg.db.Update(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			netRec.AssignedAddrs = nil
+			netRec.NextIP = ""
+			updated, err := json.Marshal(netRec)
+			if err != nil {
+				return err
+			}
+			return nb.Put([]byte("net1"), updated)
+		})
+		if err != nil {
+			t.Fatalf("manual DB update: %v", err)
+		}
+
+		reg.Close()
+	}
+
+	// Phase 2: Reopen registry (simulating upgrade), register p3.
+	// With empty NextIP fallback, all non-held addresses are marked freed (timestamp 1).
+	// Allocation picks the oldest freed (lowest address): 10.0.0.2.
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry (reopen): %v", err)
+		}
+		defer reg.Close()
+
+		rec := peerRecord{
+			ID:            "p3",
+			Name:          "Peer 3",
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("pub3xxxxxxxxxxxxxxxxxxxxxxxxxx")),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x255193xxxxxxxxxxxxxxxxxxxxxxxxx")),
+			RegisteredAt:  0,
+			LastSeen:      0,
+		}
+		vpnAddr, err := reg.RegisterPeer(rec, "net1", 0)
+		if err != nil {
+			t.Fatalf("RegisterPeer p3: %v", err)
+		}
+
+		// p3 gets the oldest freed address (10.0.0.2) because all non-held
+		// addresses were marked freed with timestamp 1.
+		if vpnAddr.String() != "10.0.0.2" {
+			t.Errorf("p3 got %s, want 10.0.0.2 (oldest freed)", vpnAddr)
+		}
+
+		// Verify warning was logged
+		output := buf.String()
+		if !strings.Contains(output, "network \"net1\" has invalid or empty NextIP") {
+			t.Errorf("expected warning about empty NextIP, got: %s", output)
+		}
+
+		// Verify AssignedAddrs: p1 (10.0.0.1) = 0, p2 (10.0.0.2) = 0 (now assigned to p3),
+		// all other hosts in CIDR (except broadcast) should be marked freed (timestamp 1)
+		err = reg.db.View(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			if netRec.AssignedAddrs == nil {
+				t.Errorf("AssignedAddrs is nil after migration")
+			} else {
+				if netRec.AssignedAddrs["10.0.0.1"] != 0 {
+					t.Errorf("10.0.0.1 should be assigned (0), got %d", netRec.AssignedAddrs["10.0.0.1"])
+				}
+				if netRec.AssignedAddrs["10.0.0.2"] != 0 {
+					t.Errorf("10.0.0.2 should be assigned (0), got %d", netRec.AssignedAddrs["10.0.0.2"])
+				}
+				// Check a few other addresses are marked freed
+				if netRec.AssignedAddrs["10.0.0.3"] != 1 {
+					t.Errorf("10.0.0.3 should be freed (1), got %d", netRec.AssignedAddrs["10.0.0.3"])
+				}
+				if netRec.AssignedAddrs["10.0.0.4"] != 1 {
+					t.Errorf("10.0.0.4 should be freed (1), got %d", netRec.AssignedAddrs["10.0.0.4"])
+				}
+				if netRec.AssignedAddrs["10.0.0.254"] != 1 {
+					t.Errorf("10.0.0.254 should be freed (1), got %d", netRec.AssignedAddrs["10.0.0.254"])
+				}
+				// Broadcast address (10.0.0.255) should not be in the map
+				if _, ok := netRec.AssignedAddrs["10.0.0.255"]; ok {
+					t.Errorf("10.0.0.255 (broadcast) should not be in AssignedAddrs")
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("verify AssignedAddrs: %v", err)
+		}
+	}
+}
+
+// TestRegistry_AddressAllocation_PreUpgradeMigration_InvalidNextIP tests the case
+// where a pre-upgrade database has an unparseable NextIP (e.g., "garbage").
+// The migration should log a warning and mark all non-held host addresses as freed with timestamp 1.
+func TestRegistry_AddressAllocation_PreUpgradeMigration_InvalidNextIP(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+
+	// Capture log output
+	var buf strings.Builder
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	// Phase 1: Create network, register p1, then simulate pre-upgrade with invalid NextIP.
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry: %v", err)
+		}
+
+		cidr := netip.MustParsePrefix("10.0.0.0/24")
+		net := coordcore.Network{ID: "net1", CIDR: cidr, Name: "Test Network"}
+		if err := reg.CreateNetwork(net, "acc1"); err != nil {
+			t.Fatalf("CreateNetwork: %v", err)
+		}
+
+		rec := peerRecord{
+			ID:            "p1",
+			Name:          "Peer 1",
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("pub1xxxxxxxxxxxxxxxxxxxxxxxxx")),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x255191xxxxxxxxxxxxxxxxxxxxxxxx")),
+			RegisteredAt:  0,
+			LastSeen:      0,
+		}
+		if _, err := reg.RegisterPeer(rec, "net1", 0); err != nil {
+			t.Fatalf("RegisterPeer p1: %v", err)
+		}
+
+		// Set AssignedAddrs to nil AND NextIP to "garbage"
+		err = reg.db.Update(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			netRec.AssignedAddrs = nil
+			netRec.NextIP = "garbage"
+			updated, err := json.Marshal(netRec)
+			if err != nil {
+				return err
+			}
+			return nb.Put([]byte("net1"), updated)
+		})
+		if err != nil {
+			t.Fatalf("manual DB update: %v", err)
+		}
+
+		reg.Close()
+	}
+
+	// Phase 2: Reopen registry (simulating upgrade), register p2.
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry (reopen): %v", err)
+		}
+		defer reg.Close()
+
+		rec := peerRecord{
+			ID:            "p2",
+			Name:          "Peer 2",
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("pub2xxxxxxxxxxxxxxxxxxxxxxxxxx")),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x255192xxxxxxxxxxxxxxxxxxxxxxxxx")),
+			RegisteredAt:  0,
+			LastSeen:      0,
+		}
+		vpnAddr, err := reg.RegisterPeer(rec, "net1", 0)
+		if err != nil {
+			t.Fatalf("RegisterPeer p2: %v", err)
+		}
+
+		// p2 gets the oldest freed address (10.0.0.2)
+		if vpnAddr.String() != "10.0.0.2" {
+			t.Errorf("p2 got %s, want 10.0.0.2 (oldest freed)", vpnAddr)
+		}
+
+		// Verify warning was logged
+		output := buf.String()
+		if !strings.Contains(output, "network \"net1\" has invalid or empty NextIP") {
+			t.Errorf("expected warning about invalid NextIP, got: %s", output)
+		}
+		if !strings.Contains(output, "garbage") {
+			t.Errorf("expected warning to contain the bad value 'garbage', got: %s", output)
+		}
+
+		// Verify AssignedAddrs: p1 (10.0.0.1) = 0, p2 (10.0.0.2) = 0
+		// All other hosts in CIDR should be marked freed (timestamp 1)
+		err = reg.db.View(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			if netRec.AssignedAddrs == nil {
+				t.Errorf("AssignedAddrs is nil after migration")
+			} else {
+				if netRec.AssignedAddrs["10.0.0.1"] != 0 {
+					t.Errorf("10.0.0.1 should be assigned (0), got %d", netRec.AssignedAddrs["10.0.0.1"])
+				}
+				if netRec.AssignedAddrs["10.0.0.2"] != 0 {
+					t.Errorf("10.0.0.2 should be assigned (0), got %d", netRec.AssignedAddrs["10.0.0.2"])
+				}
+				// Check a few other addresses are marked freed
+				if netRec.AssignedAddrs["10.0.0.3"] != 1 {
+					t.Errorf("10.0.0.3 should be freed (1), got %d", netRec.AssignedAddrs["10.0.0.3"])
+				}
+				if netRec.AssignedAddrs["10.0.0.254"] != 1 {
+					t.Errorf("10.0.0.254 should be freed (1), got %d", netRec.AssignedAddrs["10.0.0.254"])
+				}
+				// Broadcast address (10.0.0.255) should not be in the map
+				if _, ok := netRec.AssignedAddrs["10.0.0.255"]; ok {
+					t.Errorf("10.0.0.255 (broadcast) should not be in AssignedAddrs")
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("verify AssignedAddrs: %v", err)
+		}
+	}
+}
+
+// TestRegistry_AddressAllocation_PreUpgradeMigration_ValidNextIPOutsideCIDR tests the case
+// where a pre-upgrade database has a valid NextIP that is outside the network CIDR.
+// The migration should log a warning and fall back to marking all non-held host
+// addresses as freed with timestamp 1, so allocation reuses addresses oldest-first.
+func TestRegistry_AddressAllocation_PreUpgradeMigration_ValidNextIPOutsideCIDR(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+
+	// Capture log output
+	var buf strings.Builder
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	// Phase 1: Create network, register p1, p2, then remove p2.
+	// Simulate pre-upgrade with a valid NextIP that is outside the CIDR (numerically before).
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry: %v", err)
+		}
+
+		cidr := netip.MustParsePrefix("10.0.0.0/24")
+		net := coordcore.Network{ID: "net1", CIDR: cidr, Name: "Test Network"}
+		if err := reg.CreateNetwork(net, "acc1"); err != nil {
+			t.Fatalf("CreateNetwork: %v", err)
+		}
+
+		for i := 1; i <= 2; i++ {
+			rec := peerRecord{
+				ID:            fmt.Sprintf("p%d", i),
+				Name:          fmt.Sprintf("Peer %d", i),
+				Ed25519Public: base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("pub%dxxxxxxxxxxxxxxxxxxxxxxxxx", i))),
+				X25519Public:  base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("x25519%dxxxxxxxxxxxxxxxxxxxxxxxx", i))),
+				RegisteredAt:  0,
+				LastSeen:      0,
+			}
+			if _, err := reg.RegisterPeer(rec, "net1", 0); err != nil {
+				t.Fatalf("RegisterPeer p%d: %v", i, err)
+			}
+		}
+
+		// Remove p2 (10.0.0.2)
+		if _, err := reg.RemovePeer("p2"); err != nil {
+			t.Fatalf("RemovePeer p2: %v", err)
+		}
+
+		// Set AssignedAddrs to nil AND NextIP to a valid IP outside the CIDR
+		err = reg.db.Update(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			netRec.AssignedAddrs = nil
+			netRec.NextIP = "192.168.1.1" // Outside 10.0.0.0/24
+			updated, err := json.Marshal(netRec)
+			if err != nil {
+				return err
+			}
+			return nb.Put([]byte("net1"), updated)
+		})
+		if err != nil {
+			t.Fatalf("manual DB update: %v", err)
+		}
+
+		reg.Close()
+	}
+
+	// Phase 2: Reopen registry (simulating upgrade), register p3.
+	// With NextIP outside CIDR fallback, all non-held addresses are marked freed (timestamp 1).
+	// Allocation picks the oldest freed (lowest address): 10.0.0.2.
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry (reopen): %v", err)
+		}
+		defer reg.Close()
+
+		rec := peerRecord{
+			ID:            "p3",
+			Name:          "Peer 3",
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("pub3xxxxxxxxxxxxxxxxxxxxxxxxxx")),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x255193xxxxxxxxxxxxxxxxxxxxxxxxx")),
+			RegisteredAt:  0,
+			LastSeen:      0,
+		}
+		vpnAddr, err := reg.RegisterPeer(rec, "net1", 0)
+		if err != nil {
+			t.Fatalf("RegisterPeer p3: %v", err)
+		}
+
+		// p3 gets the oldest freed address (10.0.0.2) because all non-held
+		// addresses were marked freed with timestamp 1.
+		if vpnAddr.String() != "10.0.0.2" {
+			t.Errorf("p3 got %s, want 10.0.0.2 (oldest freed)", vpnAddr)
+		}
+
+		// Verify warning was logged
+		output := buf.String()
+		if !strings.Contains(output, "network \"net1\" has invalid or empty NextIP") {
+			t.Errorf("expected warning about NextIP outside CIDR, got: %s", output)
+		}
+		if !strings.Contains(output, "192.168.1.1") {
+			t.Errorf("expected warning to contain the bad value '192.168.1.1', got: %s", output)
+		}
+
+		// Verify AssignedAddrs: p1 (10.0.0.1) = 0, p2 (10.0.0.2) = 0 (now assigned to p3),
+		// all other hosts in CIDR (except broadcast) should be marked freed (timestamp 1)
+		err = reg.db.View(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			if netRec.AssignedAddrs == nil {
+				t.Errorf("AssignedAddrs is nil after migration")
+			} else {
+				if netRec.AssignedAddrs["10.0.0.1"] != 0 {
+					t.Errorf("10.0.0.1 should be assigned (0), got %d", netRec.AssignedAddrs["10.0.0.1"])
+				}
+				if netRec.AssignedAddrs["10.0.0.2"] != 0 {
+					t.Errorf("10.0.0.2 should be assigned (0), got %d", netRec.AssignedAddrs["10.0.0.2"])
+				}
+				// Check a few other addresses are marked freed
+				if netRec.AssignedAddrs["10.0.0.3"] != 1 {
+					t.Errorf("10.0.0.3 should be freed (1), got %d", netRec.AssignedAddrs["10.0.0.3"])
+				}
+				if netRec.AssignedAddrs["10.0.0.4"] != 1 {
+					t.Errorf("10.0.0.4 should be freed (1), got %d", netRec.AssignedAddrs["10.0.0.4"])
+				}
+				if netRec.AssignedAddrs["10.0.0.254"] != 1 {
+					t.Errorf("10.0.0.254 should be freed (1), got %d", netRec.AssignedAddrs["10.0.0.254"])
+				}
+				// Broadcast address (10.0.0.255) should not be in the map
+				if _, ok := netRec.AssignedAddrs["10.0.0.255"]; ok {
+					t.Errorf("10.0.0.255 (broadcast) should not be in AssignedAddrs")
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("verify AssignedAddrs: %v", err)
+		}
+	}
+}
+
+// TestRegistry_AddressAllocation_PreUpgradeMigration_LargeCIDRFallback tests the case
+// where a pre-upgrade database has an empty NextIP and a CIDR larger than 65536 hosts.
+// The migration should log a warning and leave AssignedAddrs with only the held addresses.
+func TestRegistry_AddressAllocation_PreUpgradeMigration_LargeCIDRFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+
+	// Capture log output
+	var buf strings.Builder
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	// Phase 1: Create network with /15 CIDR (131070 usable hosts), register p1, then simulate pre-upgrade with empty NextIP.
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry: %v", err)
+		}
+
+		// /15: 131070 usable hosts (exceeds 65536 cap)
+		cidr := netip.MustParsePrefix("10.0.0.0/15")
+		net := coordcore.Network{ID: "net1", CIDR: cidr, Name: "Test Network"}
+		if err := reg.CreateNetwork(net, "acc1"); err != nil {
+			t.Fatalf("CreateNetwork: %v", err)
+		}
+
+		rec := peerRecord{
+			ID:            "p1",
+			Name:          "Peer 1",
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("pub1xxxxxxxxxxxxxxxxxxxxxxxxx")),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x255191xxxxxxxxxxxxxxxxxxxxxxxx")),
+			RegisteredAt:  0,
+			LastSeen:      0,
+		}
+		if _, err := reg.RegisterPeer(rec, "net1", 0); err != nil {
+			t.Fatalf("RegisterPeer p1: %v", err)
+		}
+
+		// Set AssignedAddrs to nil AND NextIP to empty string
+		err = reg.db.Update(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			netRec.AssignedAddrs = nil
+			netRec.NextIP = ""
+			updated, err := json.Marshal(netRec)
+			if err != nil {
+				return err
+			}
+			return nb.Put([]byte("net1"), updated)
+		})
+		if err != nil {
+			t.Fatalf("manual DB update: %v", err)
+		}
+
+		reg.Close()
+	}
+
+	// Phase 2: Reopen registry (simulating upgrade), register p2.
+	// With large CIDR and empty NextIP, the fallback should be capped.
+	// Only held addresses (p1 at 10.0.0.1) should be in AssignedAddrs with timestamp 0.
+	// No freed marks should be added.
+	{
+		reg, err := NewRegistry(dbPath)
+		if err != nil {
+			t.Fatalf("NewRegistry (reopen): %v", err)
+		}
+		defer reg.Close()
+
+		rec := peerRecord{
+			ID:            "p2",
+			Name:          "Peer 2",
+			Ed25519Public: base64.StdEncoding.EncodeToString([]byte("pub2xxxxxxxxxxxxxxxxxxxxxxxxxx")),
+			X25519Public:  base64.StdEncoding.EncodeToString([]byte("x255192xxxxxxxxxxxxxxxxxxxxxxxxx")),
+			RegisteredAt:  0,
+			LastSeen:      0,
+		}
+		vpnAddr, err := reg.RegisterPeer(rec, "net1", 0)
+		if err != nil {
+			t.Fatalf("RegisterPeer p2: %v", err)
+		}
+
+		// p2 gets the next never-used address (10.0.0.2)
+		if vpnAddr.String() != "10.0.0.2" {
+			t.Errorf("p2 got %s, want 10.0.0.2 (next never-used)", vpnAddr)
+		}
+
+		// Verify warning was logged about large CIDR
+		output := buf.String()
+		if !strings.Contains(output, "network \"net1\" has invalid or empty NextIP") {
+			t.Errorf("expected warning about empty NextIP, got: %s", output)
+		}
+		if !strings.Contains(output, "exceeds 65536 host limit") {
+			t.Errorf("expected warning about CIDR exceeding 65536 host limit, got: %s", output)
+		}
+
+		// Verify AssignedAddrs only has held addresses (no freed marks)
+		err = reg.db.View(func(tx *bolt.Tx) error {
+			nb := tx.Bucket(bucketNetworks)
+			netData := nb.Get([]byte("net1"))
+			if netData == nil {
+				return fmt.Errorf("network not found")
+			}
+			var netRec networkRecord
+			if err := json.Unmarshal(netData, &netRec); err != nil {
+				return err
+			}
+			if netRec.AssignedAddrs == nil {
+				t.Errorf("AssignedAddrs is nil after migration")
+			} else {
+				// Only held addresses should be present (timestamp 0)
+				if netRec.AssignedAddrs["10.0.0.1"] != 0 {
+					t.Errorf("10.0.0.1 should be assigned (0), got %d", netRec.AssignedAddrs["10.0.0.1"])
+				}
+				if netRec.AssignedAddrs["10.0.0.2"] != 0 {
+					t.Errorf("10.0.0.2 should be assigned (0), got %d", netRec.AssignedAddrs["10.0.0.2"])
+				}
+				// No freed marks should exist
+				if len(netRec.AssignedAddrs) != 2 {
+					t.Errorf("expected only 2 entries in AssignedAddrs (held addresses only), got %d: %v", len(netRec.AssignedAddrs), netRec.AssignedAddrs)
 				}
 			}
 			return nil
