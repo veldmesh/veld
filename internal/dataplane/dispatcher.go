@@ -121,6 +121,14 @@ func (d *Dispatcher) SetSelfPeerID(id [32]byte) {
 	d.selfPeerID = id
 }
 
+// SetDropCounters sets the drop counters for this dispatcher.
+// This allows sharing drop counters with the policy loader for IPC status.
+func (d *Dispatcher) SetDropCounters(dc *acl.DropCounters) {
+	if dc != nil {
+		d.dropCounters = dc
+	}
+}
+
 // getPolicyDecider returns the current policy decider, or nil if not set.
 func (d *Dispatcher) getPolicyDecider() acl.PolicyDecider {
 	if v := d.policyDecider.Load(); v != nil {
@@ -290,7 +298,7 @@ func (d *Dispatcher) handleTunPacket(pkt []byte) {
 		srcPeerID := d.selfPeerID
 		dec := pd.Decide(srcPeerID, dstPeerID, flow.Proto, flow.DstPort)
 		if dec.Action == acl.ActionDeny {
-			d.recordDrop(dstPeerID, dec, kind)
+			d.recordDrop(dstPeerID, dec, kind, flow.Proto, flow.DstPort)
 			d.sendReject(entry, flow, pkt)
 			return
 		}
@@ -405,7 +413,7 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 				// New inbound connection start: check ACL before creating flow
 				dec := pd.Decide(srcPeerID, dstPeerID, flow.Proto, flow.DstPort)
 				if dec.Action == acl.ActionDeny {
-					d.recordDrop(srcPeerID, dec, kind)
+					d.recordDrop(srcPeerID, dec, kind, flow.Proto, flow.DstPort)
 					return
 				}
 				// Allowed: create flow entry as established
@@ -417,7 +425,7 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 				if !created && flowEntry != nil && flowEntry.State == acl.FlowStateEstablished {
 					d.flowTable.UpdateState(flow, acl.FlowStateClosing)
 				} else {
-					d.recordDrop(srcPeerID, acl.Decision{Action: acl.ActionDeny, RuleIndex: -1}, kind)
+					d.recordDrop(srcPeerID, acl.Decision{Action: acl.ActionDeny, RuleIndex: -1}, kind, flow.Proto, flow.DstPort)
 					return
 				}
 
@@ -425,7 +433,7 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 				// Fragments and ICMP errors: only pass for established flows
 				flowEntry, _, created := d.flowTable.Lookup(flow, false, acl.FlowStateNew)
 				if created || flowEntry == nil || flowEntry.State != acl.FlowStateEstablished {
-					d.recordDrop(srcPeerID, acl.Decision{Action: acl.ActionDeny, RuleIndex: -1}, kind)
+					d.recordDrop(srcPeerID, acl.Decision{Action: acl.ActionDeny, RuleIndex: -1}, kind, flow.Proto, flow.DstPort)
 					return
 				}
 				flowEntry.LastSeen = time.Now()
@@ -434,13 +442,13 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 				// Other packets (TCP ACK/data, UDP replies, etc.): only pass for established flows
 				flowEntry, _, created := d.flowTable.Lookup(flow, false, acl.FlowStateNew)
 				if created || flowEntry == nil || flowEntry.State != acl.FlowStateEstablished {
-					d.recordDrop(srcPeerID, acl.Decision{Action: acl.ActionDeny, RuleIndex: -1}, kind)
+					d.recordDrop(srcPeerID, acl.Decision{Action: acl.ActionDeny, RuleIndex: -1}, kind, flow.Proto, flow.DstPort)
 					return
 				}
 				flowEntry.LastSeen = time.Now()
 
 			default:
-				d.recordDrop(srcPeerID, acl.Decision{Action: acl.ActionDeny, RuleIndex: -1}, kind)
+				d.recordDrop(srcPeerID, acl.Decision{Action: acl.ActionDeny, RuleIndex: -1}, kind, flow.Proto, flow.DstPort)
 				return
 			}
 		}
@@ -481,7 +489,7 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 }
 
 // recordDrop records a dropped packet and logs the first drop per flow.
-func (d *Dispatcher) recordDrop(peerID [32]byte, dec acl.Decision, kind acl.Kind) {
+func (d *Dispatcher) recordDrop(peerID [32]byte, dec acl.Decision, kind acl.Kind, proto acl.Proto, port uint16) {
 	d.dropCounters.IncrementPeer(peerID)
 	if dec.RuleIndex >= 0 {
 		d.dropCounters.IncrementRule(dec.RuleIndex)
@@ -489,6 +497,9 @@ func (d *Dispatcher) recordDrop(peerID [32]byte, dec acl.Decision, kind acl.Kind
 	if dec.OutboundOnly {
 		d.dropCounters.IncrementOutboundOnly(peerID)
 	}
+
+	// Record recent drop event
+	d.dropCounters.RecordDrop(peerID, proto, port, dec.RuleIndex)
 
 	// Log first drop per flow (rate-limited by flow)
 	// We use a simple approach: log if it's been more than 60 seconds since last log

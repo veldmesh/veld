@@ -100,6 +100,87 @@ local_file = "/etc/veld/policy.toml"    # Optional; defaults to policy.toml next
 - Rate-limited logging: first drop per flow, then periodic summary (every 10s)
 - Never logs per packet, never logs payload
 
+## CLI Commands
+
+### `veld policy check <policy.toml>`
+
+Validate a policy file's syntax, resolve names/tags to IDs, and print warnings for unmatchable rules or unknown names. Exits with non-zero on errors.
+
+```bash
+$ veld policy check policy.toml
+Policy OK (version 1)
+  Default: deny
+  Peers (3):
+    alice: ed25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=
+    bob: ed25519:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=
+    carol: ed25519:cccccccccccccccccccccccccccccccccccccccccccc=
+  Tags (2):
+    admins: alice, bob
+    servers: carol
+  Rules (3):
+    [0] from=alice to=bob ports=tcp/22, tcp/8000-8099
+    [1] from=tag:admins to=tag:servers ports=tcp/443, udp/53
+    [2] from=* to=carol ports=icmp
+  Outbound-only peers: bob
+
+$ veld policy check bad_policy.toml
+policy: rule 0: from: unknown peer: "unknown"
+```
+
+### `veld policy test <policy.toml> <from> <to> <proto/port>`
+
+Test a policy decision against a policy file. `<from>` and `<to>` accept peer names or Ed25519 public key IDs (32-byte hex). `<proto/port>` examples: `tcp/22`, `udp/53`, `icmp`, `*`.
+
+Prints allow/deny and which rule (or default) decided. Honours outbound_only.
+
+```bash
+$ veld policy test policy.toml alice bob tcp/22
+ALLOW
+  Matched rule 0: from=alice to=bob ports=tcp/22, tcp/8000-8099
+
+$ veld policy test policy.toml bob alice tcp/22
+DENY
+  Default action: deny
+
+$ veld policy test policy.toml alice bob tcp/80
+DENY
+  Default action: deny
+
+$ veld policy test policy.toml alice carol icmp
+ALLOW
+  Matched rule 2: from=* to=carol ports=icmp
+```
+
+### `veld policy status`
+
+Show the active local policy path and hash, network policy version/signer/age (placeholder until the signed-policy story), drop counters per peer and rule, and the last N drops (peer, proto, port, time; no payload).
+
+```bash
+$ veld policy status
+Local Policy:
+  Path: /etc/veld/policy.toml
+  Hash: sha256:a1b2c3d4e5f67890...
+  Version: 1
+  Default: deny
+  Rules: 3
+
+Network Policy:
+  (none)
+
+Drop Counters:
+  By Peer:
+    aaaaaaaabbbbbbbb...: 5
+  By Rule:
+    rule 0: 2
+    rule 1: 3
+  By Outbound-Only:
+    bbbbbbbbcccccccc...: 1
+
+Recent Drops (last 5):
+  2026-01-15T10:30:45Z  peer=aaaaaaaa...  proto=TCP  port=22
+  2026-01-15T10:31:12Z  peer=bbbbbbbb...  proto=TCP  port=443
+```
+
 ## Examples
 
 ### Basic Server Access
@@ -198,7 +279,7 @@ ports = ["tcp/22"]
 
 ## Testing ACL Policies
 
-Use `veld acl test` (future CLI) or unit tests to verify policy logic before deploying.
+Use `veld policy check` and `veld policy test` to verify policy logic before deploying.
 
 ## Performance
 

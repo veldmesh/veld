@@ -51,6 +51,24 @@ const (
 	ProtoAny    Proto = 255
 )
 
+// String returns the string representation of the protocol.
+func (p Proto) String() string {
+	switch p {
+	case ProtoTCP:
+		return "TCP"
+	case ProtoUDP:
+		return "UDP"
+	case ProtoICMP:
+		return "ICMP"
+	case ProtoICMPv6:
+		return "ICMPv6"
+	case ProtoAny:
+		return "ANY"
+	default:
+		return fmt.Sprintf("Proto(%d)", p)
+	}
+}
+
 // PortRange represents a port or port range for a specific protocol.
 type PortRange struct {
 	Proto       Proto
@@ -80,6 +98,12 @@ func (pr PortRange) MatchesProto(proto Proto) bool {
 		return true
 	}
 	return false
+}
+
+// MatchesICMPv6 returns true if this port range was created from the "icmp" keyword
+// which matches both ICMPv4 and ICMPv6.
+func (pr PortRange) MatchesICMPv6() bool {
+	return pr.matchICMPv6
 }
 
 // Rule represents a single ACL rule.
@@ -247,7 +271,7 @@ func (r *rawPolicy) validateAndCompile() (*Policy, []string, error) {
 		outboundOnly = append(outboundOnly, name)
 	}
 
-	// Check for unmatchable rules (warnings)
+	// Check for unmatchable rules (warnings) - only reflexive rules (same peer to same peer)
 	for i, rule := range rules {
 		if isUnmatchable(rule, peers, tags) {
 			warnings = append(warnings, fmt.Sprintf("policy: rule %d: can never match (from=%q to=%q)", i, rule.From, rule.To))
@@ -394,26 +418,12 @@ func isUnmatchable(rule Rule, peers map[string]PeerKey, tags map[string][]string
 	fromSet := resolveSubject(rule.From, peers, tags)
 	toSet := resolveSubject(rule.To, peers, tags)
 
-	// Check if from and to resolve to the exact same single peer
+	// Check if from and to resolve to the exact same single peer (reflexive rule)
 	if len(fromSet) == 1 && len(toSet) == 1 {
 		for k := range fromSet {
 			if _, ok := toSet[k]; ok {
 				return true
 			}
-		}
-	}
-
-	// Check if from and to sets are disjoint (no overlap)
-	if len(fromSet) > 0 && len(toSet) > 0 {
-		disjoint := true
-		for k := range fromSet {
-			if _, ok := toSet[k]; ok {
-				disjoint = false
-				break
-			}
-		}
-		if disjoint {
-			return true
 		}
 	}
 	return false
