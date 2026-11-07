@@ -29,13 +29,24 @@ semantics (netlink `RTM_NEWROUTE` with `NLM_F_REPLACE`):
     left in place. Veld's metric-0 route is preferred by the kernel, so veld
     wins while it is installed, and the VPN's route is still there after
     veld closes.
-  - A VPN route at metric 0 for the same prefix is displaced. Veld does not
-    restore it on close, so the VPN must reinstall its route.
+  - A VPN route at metric 0 for the same prefix is displaced. Veld restores
+    it on a clean stop (Close); a crash or SIGKILL leaves the VPN route
+    displaced until the VPN reinstalls it.
 - **Explicit default metric.** Veldmesh requests metric 0 — the metric the
   kernel would use anyway for an unqualified route add, made explicit. The
   lowest metric wins for a prefix, which is what lets veld outrank a VPN route
   at a higher metric. (On IPv6 the kernel raises metric 0
   to 1024, `IP6_RT_PRIO_USER`, on install.)
+
+**Route restoration on clean stop.** Before installing its own route, veld
+looks for an existing route with the same destination, metric (0), and table
+(main). If one exists with a different gateway or link index — indicating
+another VPN installed it — veld remembers that full route. On `Close` (or
+`Remove` for that prefix), after deleting its own route, veld re-adds the
+remembered route with `RouteAdd` (not `Replace`). If the other VPN has already
+reinstalled its route, the `EEXIST` error is logged and ignored; if not, the
+VPN's route is back where it was. This survives a clean shutdown only.
+Persisting across a crash is out of scope.
 
 **Platform support for route management.** Subnet route installation,
 replacement, and removal are implemented only on Linux (via netlink).
@@ -69,8 +80,9 @@ time.
 | `veld: coexist: NordVPN detected (interface nordlynx): ...` | A known provider's tunnel is up. | Nothing, unless peers fail to connect — then follow the advice (add veld to the VPN's split tunneling, or disable its kill switch, and restart veld). |
 | `... full-tunnel — the default route passes through it ...` | All traffic, including veld's UDP hole-punching, is routed through the VPN. Direct peer connections may fail; relay fallback (if configured) usually still works. | Enable split tunneling for veld in the VPN, or configure a relay. |
 | `veld: coexist: mesh prefix 10.100.0.0/24: route 10.0.0.0/8 via tun0 covers ... but Veldmesh's more-specific route takes precedence` | A broader route covers the mesh prefix. Informational: longest-prefix match keeps mesh traffic on veld's route. | Nothing. |
-| `... conflicts with 10.100.0.0/24 via tun0: ... exact conflict; Veldmesh installs its route at metric 0, so it takes precedence while up — a VPN route at a higher metric is left in place, but a VPN route at metric 0 is displaced and not restored on close` | Another interface claims the exact same prefix. Veld's metric-0 route takes precedence; the VPN's route is left in place if at a higher metric, displaced only if also at metric 0. | Prefer moving one side to a different CIDR; the log suggests one (`consider using 10.109.0.0/24 instead`). |
+| `... conflicts with 10.100.0.0/24 via tun0: ... exact conflict; Veldmesh installs its route at metric 0, so it takes precedence while up — a VPN route at a higher metric is left in place, but a VPN route at metric 0 is displaced and restored when veld stops cleanly` | Another interface claims the exact same prefix. Veld's metric-0 route takes precedence; the VPN's route is left in place if at a higher metric, displaced only if also at metric 0. | Prefer moving one side to a different CIDR; the log suggests one (`consider using 10.109.0.0/24 instead`). |
 | `... conflicts with 10.100.0.128/25 via tun0: ... more specific ... never reaches the mesh` | A more-specific route carves destinations out of the mesh. Those destinations will not work over the mesh. | Change the mesh CIDR (the log suggests an alternative) or remove the other route. |
+| `route: failed to restore displaced route for 10.99.77.0/24: ...` | Veld tried to restore a VPN route it displaced on Close/Remove but the add failed (e.g., VPN already reinstalled it). | Nothing — the VPN's route is already back. If the error is not EEXIST, check VPN status. |
 
 Suggestions are same-size CIDRs inside RFC 1918 private space (`10.0.0.0/8`,
 `172.16.0.0/12`, `192.168.0.0/16`), generated for any prefix size those
@@ -92,13 +104,17 @@ range.
   Veldmesh resolves its own interface at each check time, so the exclusion
   applies as soon as a TUN exists.
 - On macOS and Windows, route metrics are not available from the parsed
-  command output, so collision findings may omit the metric.
+  command output, so collision findings on those platforms may omit the metric.
 - **The name `tun0` can no longer be requested.** Configs written by older
   veld versions carry `iface_name = "tun0"`; veld migrates that to the
   platform default and logs one line saying so. Literal `tun0` is rejected
   deliberately: `TUNSETIFF` fails with EEXIST when OpenVPN already owns
   the name, so veld could not even start next to an OpenVPN-based VPN with
   it.
+- **Route restoration is best-effort on clean stop only.** If veld crashes,
+  receives SIGKILL, or is stopped by the OOM killer, the displaced VPN route
+  is not restored. The VPN must reinstall its route (which it typically does
+  on reconnect or interface up).
 
 ## What veld does *not* do
 

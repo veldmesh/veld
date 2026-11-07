@@ -16,6 +16,7 @@ type TUN interface {
 	Name() string
 	Addr() netip.Prefix
 	MTU() int
+	LinkIndex() int // 0 if not supported/unknown
 }
 
 // ErrClosed is returned by Read/Write after Close is called.
@@ -132,6 +133,7 @@ func (m *MemTUN) Close() error {
 func (m *MemTUN) Name() string       { return m.name }
 func (m *MemTUN) Addr() netip.Prefix { return m.addr }
 func (m *MemTUN) MTU() int           { return m.mtu }
+func (m *MemTUN) LinkIndex() int     { return 0 }
 
 // Drain removes and discards all packets from the delivery channel.
 // Useful for tests to clear leftover packets between test cases.

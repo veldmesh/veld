@@ -89,3 +89,4 @@ func (t *darwinTUN) Close() error       { return t.dev.Close() }
 func (t *darwinTUN) Name() string       { return t.name }
 func (t *darwinTUN) Addr() netip.Prefix { return t.addr }
 func (t *darwinTUN) MTU() int           { return t.mtu }
+func (t *darwinTUN) LinkIndex() int     { return 0 }

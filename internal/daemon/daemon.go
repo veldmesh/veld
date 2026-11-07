@@ -266,6 +266,10 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 			d.mu.Lock()
 			d.tunDev = tunDev
 			d.mu.Unlock()
+			// Tell the route manager about our TUN link index.
+			if d.routeMgr != nil {
+				d.routeMgr.SetTUNLink(tunDev.LinkIndex())
+			}
 		}
 	}
 
@@ -582,6 +586,11 @@ func (d *Daemon) onVPNAddrAssigned(cfg *intconfig.Config, conn net.PacketConn, u
 			}
 			d.updateIPCStatus()
 			return
+		}
+
+		// Tell the route manager about our new TUN link index.
+		if d.routeMgr != nil {
+			d.routeMgr.SetTUNLink(newTun.LinkIndex())
 		}
 
 		// Wire the new TUN into the dispatcher before closing the old one.
