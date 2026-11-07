@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -14,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/veldmesh/veld/internal/acl"
+	"github.com/veldmesh/veld/internal/daemon/ipctypes"
 	"github.com/veldmesh/veld/internal/peer"
 )
 
@@ -33,25 +36,47 @@ type PeerStatus struct {
 	State    string `json:"state"`
 }
 
+// PolicyStatusProvider provides policy status for the IPC endpoint.
+type PolicyStatusProvider interface {
+	LocalPolicyStatus() ipctypes.LocalPolicyStatus
+	DropCounters() *acl.DropCounters
+	RecentDrops() []ipctypes.DropEvent
+}
+
 // IPCServer is an HTTP server on a Unix domain socket that exposes daemon state.
 type IPCServer struct {
-	socketPath string
-	mu         sync.Mutex
-	status     StatusResponse
-	stopFn     func()
-	srv        *http.Server
-	listener   net.Listener
+	socketPath     string
+	mu             sync.Mutex
+	status         StatusResponse
+	stopFn         func()
+	srv            *http.Server
+	listener       net.Listener
+	policyProvider PolicyStatusProvider
 }
 
 // NewIPCServer creates an IPC server at the given socket path.
 // stopFn is invoked when POST /api/shutdown is received.
-func NewIPCServer(socketPath string, stopFn func()) *IPCServer {
-	s := &IPCServer{socketPath: socketPath, stopFn: stopFn}
+// policyProvider provides policy status for /api/policy/status.
+func NewIPCServer(socketPath string, stopFn func(), policyProvider PolicyStatusProvider) *IPCServer {
+	s := &IPCServer{
+		socketPath:     socketPath,
+		stopFn:         stopFn,
+		policyProvider: policyProvider,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/shutdown", s.handleShutdown)
+	mux.HandleFunc("/api/policy/status", s.handlePolicyStatus)
 	s.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	return s
+}
+
+// SetPolicyProvider sets the policy status provider.
+// This should only be used if the provider wasn't available at construction time.
+func (s *IPCServer) SetPolicyProvider(p PolicyStatusProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.policyProvider = p
 }
 
 // UpdateStatus atomically replaces the cached status.
@@ -120,6 +145,57 @@ func (s *IPCServer) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	go s.stopFn()
+}
+
+func (s *IPCServer) handlePolicyStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var resp ipctypes.PolicyStatusResponse
+	s.mu.Lock()
+	provider := s.policyProvider
+	s.mu.Unlock()
+
+	if provider != nil {
+		resp.LocalPolicy = provider.LocalPolicyStatus()
+		resp.DropCounters = dropCountersToStatus(provider.DropCounters())
+		resp.RecentDrops = provider.RecentDrops()
+	}
+	// Network policy is a placeholder until the signed-policy story
+	resp.NetworkPolicy = ipctypes.NetworkPolicyStatus{}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
+}
+
+func dropCountersToStatus(dc *acl.DropCounters) ipctypes.DropCountersStatus {
+	if dc == nil {
+		return ipctypes.DropCountersStatus{
+			ByPeer:         make(map[string]uint64),
+			ByRule:         make(map[int]uint64),
+			ByOutboundOnly: make(map[string]uint64),
+		}
+	}
+	byPeer, byRule, byOO := dc.Snapshot()
+	resp := ipctypes.DropCountersStatus{
+		ByPeer:         make(map[string]uint64, len(byPeer)),
+		ByRule:         make(map[int]uint64, len(byRule)),
+		ByOutboundOnly: make(map[string]uint64, len(byOO)),
+	}
+	for k, v := range byPeer {
+		resp.ByPeer[hex.EncodeToString(k[:])] = v
+	}
+	for k, v := range byRule {
+		resp.ByRule[k] = v
+	}
+	for k, v := range byOO {
+		resp.ByOutboundOnly[hex.EncodeToString(k[:])] = v
+	}
+	return resp
 }
 
 // peerTableSnapshot returns the current peer table as PeerStatus slice.

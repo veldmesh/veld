@@ -35,6 +35,9 @@ type CompiledPolicy struct {
 
 	// Set of all known peer IDs (for quick membership check)
 	knownPeers map[[32]byte]struct{}
+
+	// Version from the original policy
+	version int
 }
 
 // compiledRule is a rule compiled for fast matching.
@@ -90,6 +93,7 @@ func (p *Policy) Compile() *CompiledPolicy {
 		defaultAction: Action(p.Default),
 		outboundOnly:  outboundOnly,
 		knownPeers:    knownPeers,
+		version:       p.Version,
 	}
 }
 
@@ -119,6 +123,24 @@ func resolveSubjectToPeers(subject string, peers map[string]PeerKey, tags map[st
 // OutboundOnly returns the set of outbound-only peer IDs.
 func (cp *CompiledPolicy) OutboundOnly() map[[32]byte]struct{} {
 	return cp.outboundOnly
+}
+
+// DefaultAction returns the default action for the policy.
+func (cp *CompiledPolicy) DefaultAction() string {
+	if cp.defaultAction == ActionAllow {
+		return "allow"
+	}
+	return "deny"
+}
+
+// Rules returns the number of rules in the policy.
+func (cp *CompiledPolicy) Rules() int {
+	return len(cp.rules)
+}
+
+// Version returns the policy version.
+func (cp *CompiledPolicy) Version() int {
+	return cp.version
 }
 
 // Decide evaluates a packet against the compiled policy.

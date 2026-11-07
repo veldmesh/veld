@@ -5,6 +5,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,8 +27,10 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/spf13/cobra"
 
+	"github.com/veldmesh/veld/internal/acl"
 	"github.com/veldmesh/veld/internal/config"
 	"github.com/veldmesh/veld/internal/daemon"
+	"github.com/veldmesh/veld/internal/daemon/ipctypes"
 	"github.com/veldmesh/veld/internal/tofu"
 )
 
@@ -34,6 +38,35 @@ var (
 	socketPath string
 	version    = "dev" // overridden by -ldflags "-X main.version=..."
 )
+
+// printer wraps a writer and keeps the first write error.
+type printer struct {
+	w   io.Writer
+	err error
+}
+
+func (p *printer) Write(b []byte) (int, error) {
+	if p.err != nil {
+		return len(b), nil // swallow writes after error
+	}
+	n, err := p.w.Write(b)
+	if err != nil {
+		p.err = err
+	}
+	return n, err
+}
+
+func (p *printer) Printf(format string, args ...any) {
+	_, _ = fmt.Fprintf(p, format, args...)
+}
+
+func (p *printer) Println(args ...any) {
+	_, _ = fmt.Fprintln(p, args...)
+}
+
+func (p *printer) Err() error {
+	return p.err
+}
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
@@ -49,14 +82,14 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&socketPath, "socket", "", "IPC socket path (default: platform default)")
-	rootCmd.AddCommand(upCmd, downCmd, statusCmd, loginCmd, joinCmd, versionCmd, tofuCmd)
+	rootCmd.AddCommand(upCmd, downCmd, statusCmd, loginCmd, joinCmd, versionCmd, tofuCmd, policyCmd)
 }
 
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print the version",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println(version)
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), version)
 	},
 }
 
@@ -85,11 +118,11 @@ func runUp(cobraCmd *cobra.Command, args []string) error {
 	if isRunning(sock) {
 		st, err := getStatus(sock)
 		if err == nil {
-			fmt.Printf("daemon already running\n")
-			fmt.Printf("  VPN Address: %s\n", st.VPNAddr)
-			fmt.Printf("  Peer ID: %s\n", st.PeerID)
-			fmt.Printf("  Network: %s\n", st.NetworkID)
-			fmt.Printf("  Peers: %d\n", len(st.Peers))
+			_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "daemon already running\n")
+			_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "  VPN Address: %s\n", st.VPNAddr)
+			_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "  Peer ID: %s\n", st.PeerID)
+			_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "  Network: %s\n", st.NetworkID)
+			_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "  Peers: %d\n", len(st.Peers))
 			return nil
 		}
 	}
@@ -98,13 +131,13 @@ func runUp(cobraCmd *cobra.Command, args []string) error {
 	cfg, err := loadConfig(upConfigPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			fmt.Println("no config found — run 'veld login' to get started")
+			_, _ = fmt.Fprintln(cobraCmd.OutOrStdout(), "no config found — run 'veld login' to get started")
 			return nil
 		}
 		return err
 	}
 	if cfg.Coord.Addr != "" && cfg.Coord.Token == "" {
-		fmt.Println("not logged in — run 'veld login' to authenticate")
+		_, _ = fmt.Fprintln(cobraCmd.OutOrStdout(), "not logged in — run 'veld login' to authenticate")
 		return nil
 	}
 
@@ -169,16 +202,16 @@ func runUp(cobraCmd *cobra.Command, args []string) error {
 		if isRunning(sock) {
 			st, _ := getStatus(sock)
 			if st != nil {
-				fmt.Printf("daemon started\n")
-				fmt.Printf("  VPN Address: %s\n", st.VPNAddr)
-				fmt.Printf("  Network: %s\n", st.NetworkID)
+				_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "daemon started\n")
+				_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "  VPN Address: %s\n", st.VPNAddr)
+				_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "  Network: %s\n", st.NetworkID)
 				return nil
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	fmt.Printf("daemon may still be starting; use 'veld status' to check\n")
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "daemon may still be starting; use 'veld status' to check\n")
 	return nil
 }
 
@@ -194,7 +227,7 @@ func runDown(cobraCmd *cobra.Command, args []string) error {
 	sock := getSocketPath()
 
 	if !isRunning(sock) {
-		fmt.Printf("daemon not running\n")
+		_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "daemon not running\n")
 		return nil
 	}
 
@@ -207,13 +240,13 @@ func runDown(cobraCmd *cobra.Command, args []string) error {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if !isRunning(sock) {
-			fmt.Printf("daemon stopped\n")
+			_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "daemon stopped\n")
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	fmt.Printf("daemon shutdown timeout\n")
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "daemon shutdown timeout\n")
 	return nil
 }
 
@@ -229,7 +262,7 @@ func runStatus(cobraCmd *cobra.Command, args []string) error {
 	sock := getSocketPath()
 
 	if !isRunning(sock) {
-		fmt.Printf("daemon not running\n")
+		_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "daemon not running\n")
 		return nil
 	}
 
@@ -239,29 +272,29 @@ func runStatus(cobraCmd *cobra.Command, args []string) error {
 	}
 
 	if st == nil {
-		fmt.Printf("daemon not responding\n")
+		_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "daemon not responding\n")
 		return nil
 	}
 
-	fmt.Printf("Daemon Status:\n")
-	fmt.Printf("  Running: %v\n", st.Running)
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "Daemon Status:\n")
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "  Running: %v\n", st.Running)
 	if st.VPNAddr != "" {
-		fmt.Printf("  VPN Address: %s\n", st.VPNAddr)
+		_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "  VPN Address: %s\n", st.VPNAddr)
 	}
 	if st.PeerID != "" {
-		fmt.Printf("  Peer ID: %s\n", st.PeerID)
+		_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "  Peer ID: %s\n", st.PeerID)
 	}
 	if st.NetworkID != "" {
-		fmt.Printf("  Network: %s\n", st.NetworkID)
+		_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "  Network: %s\n", st.NetworkID)
 	}
 	if st.CoordAddr != "" {
-		fmt.Printf("  Coordinator: %s\n", st.CoordAddr)
+		_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "  Coordinator: %s\n", st.CoordAddr)
 	}
-	fmt.Printf("  Peers (%d):\n", len(st.Peers))
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "  Peers (%d):\n", len(st.Peers))
 	for _, p := range st.Peers {
-		fmt.Printf("    %s (%s)\n", p.VPNAddr, p.State)
+		_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "    %s (%s)\n", p.VPNAddr, p.State)
 		if p.Endpoint != "" {
-			fmt.Printf("      Endpoint: %s\n", p.Endpoint)
+			_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "      Endpoint: %s\n", p.Endpoint)
 		}
 	}
 
@@ -311,10 +344,10 @@ func runLogin(cobraCmd *cobra.Command, args []string) error {
 		if token == "" {
 			return errors.New(`--server needs a token: pass --token - to read it from stdin, or set VELD_TOKEN`)
 		}
-		return saveCredentials(loginServer, loginNetworkID, token, cfgPath)
+		return saveCredentials(cobraCmd, loginServer, loginNetworkID, token, cfgPath)
 	}
 
-	return runBrowserAuthFlow(cfgPath)
+	return runBrowserAuthFlow(cobraCmd, cfgPath)
 }
 
 // resolveToken returns the token to use: flag "-" reads one line from stdin,
@@ -336,7 +369,7 @@ func resolveToken(flagValue string) (string, error) {
 	}
 }
 
-func saveCredentials(server, networkID, token, cfgPath string) error {
+func saveCredentials(cobraCmd *cobra.Command, server, networkID, token, cfgPath string) error {
 	cfg, err := loadConfigOrNew(cfgPath)
 	if err != nil {
 		return err
@@ -350,15 +383,15 @@ func saveCredentials(server, networkID, token, cfgPath string) error {
 		return err
 	}
 
-	fmt.Printf("Logged in. Credentials saved to %s\n", cfgPath)
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "Logged in. Credentials saved to %s\n", cfgPath)
 	return nil
 }
 
-func runBrowserAuthFlow(cfgPath string) error {
-	fmt.Printf("Opening %s in your browser...\n", cliAuthPageURL)
+func runBrowserAuthFlow(cobraCmd *cobra.Command, cfgPath string) error {
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "Opening %s in your browser...\n", cliAuthPageURL)
 	openBrowserURL(cliAuthPageURL)
 
-	fmt.Printf("Enter auth code: ")
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "Enter auth code: ")
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Scan()
 	code := strings.TrimSpace(scanner.Text())
@@ -371,7 +404,7 @@ func runBrowserAuthFlow(cfgPath string) error {
 		return err
 	}
 
-	return saveCredentials(server, networkID, token, cfgPath)
+	return saveCredentials(cobraCmd, server, networkID, token, cfgPath)
 }
 
 func openBrowserURL(rawURL string) {
@@ -464,8 +497,8 @@ func runJoin(cobraCmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf("saved token to %s\n", cfgPath)
-	fmt.Printf("use 'veld up' to connect\n")
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "saved token to %s\n", cfgPath)
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "use 'veld up' to connect\n")
 	return nil
 }
 
@@ -498,13 +531,13 @@ func runTofuList(cobraCmd *cobra.Command, args []string) error {
 
 	pins := tofuStore.List()
 	if len(pins) == 0 {
-		fmt.Println("no pinned fingerprints")
+		_, _ = fmt.Fprintln(cobraCmd.OutOrStdout(), "no pinned fingerprints")
 		return nil
 	}
 
-	fmt.Println("Pinned fingerprints (VPN address → SHA-256 fingerprint):")
+	_, _ = fmt.Fprintln(cobraCmd.OutOrStdout(), "Pinned fingerprints (VPN address → SHA-256 fingerprint):")
 	for vpnAddr, fp := range pins {
-		fmt.Printf("  %s → %s\n", vpnAddr, fp)
+		_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "  %s → %s\n", vpnAddr, fp)
 	}
 	return nil
 }
@@ -534,8 +567,8 @@ func runTofuForget(cobraCmd *cobra.Command, args []string) error {
 	if err := tofuStore.ForgetByVPNAddr(peerArg); err != nil {
 		return fmt.Errorf("forget: %w", err)
 	}
-	fmt.Printf("forgot pin for peer %s\n", peerArg)
-	fmt.Printf("the next handshake with this peer will re-pin their fingerprint\n")
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "forgot pin for peer %s\n", peerArg)
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "the next handshake with this peer will re-pin their fingerprint\n")
 	return nil
 }
 
@@ -564,6 +597,311 @@ func openTofuStore() (*tofu.Store, error) {
 		return nil, fmt.Errorf("load TOFU store: %w", err)
 	}
 	return store, nil
+}
+
+// --- POLICY command ---
+
+var policyCmd = &cobra.Command{
+	Use:   "policy",
+	Short: "Manage ACL policies",
+	Long:  "Validate, test, and inspect ACL policies.",
+}
+
+var (
+	policyConfigPath string
+)
+
+func init() {
+	policyCmd.PersistentFlags().StringVar(&policyConfigPath, "config", "", "config file path (default: ~/.config/veld/config.toml)")
+	policyCmd.AddCommand(policyCheckCmd, policyTestCmd, policyStatusCmd)
+}
+
+// --- POLICY CHECK command ---
+
+var policyCheckCmd = &cobra.Command{
+	Use:   "check <policy.toml>",
+	Short: "Validate a policy file",
+	Long: `Validate a policy file's syntax, resolve names/tags to IDs,
+and print warnings for unmatchable rules or unknown names.
+Exits with non-zero on errors.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPolicyCheck,
+}
+
+func runPolicyCheck(cobraCmd *cobra.Command, args []string) error {
+	policyPath := args[0]
+
+	data, err := os.ReadFile(policyPath)
+	if err != nil {
+		return fmt.Errorf("read policy file: %w", err)
+	}
+
+	p, warnings, err := acl.ParsePolicy(string(data))
+	if err != nil {
+		_, _ = fmt.Fprintf(cobraCmd.ErrOrStderr(), "policy: %v\n", err)
+		return err
+	}
+
+	// Print warnings
+	for _, w := range warnings {
+		_, _ = fmt.Fprintf(cobraCmd.ErrOrStderr(), "warning: %s\n", w)
+	}
+
+	// Print resolved policy summary
+	out := &printer{w: cobraCmd.OutOrStdout()}
+	out.Printf("Policy OK (version %d)\n", p.Version)
+	out.Printf("  Default: %s\n", p.Default)
+	out.Printf("  Peers (%d):\n", len(p.Peers))
+	for name, key := range p.Peers {
+		out.Printf("    %s: %s\n", name, formatPeerKey(key))
+	}
+	if len(p.Tags) > 0 {
+		out.Printf("  Tags (%d):\n", len(p.Tags))
+		for tag, peers := range p.Tags {
+			out.Printf("    %s: %s\n", tag, strings.Join(peers, ", "))
+		}
+	}
+	out.Printf("  Rules (%d):\n", len(p.Rules))
+	for i, rule := range p.Rules {
+		ports := make([]string, len(rule.Ports))
+		for j, pr := range rule.Ports {
+			ports[j] = formatPortRange(pr)
+		}
+		out.Printf("    [%d] from=%s to=%s ports=%s\n", i, rule.From, rule.To, strings.Join(ports, ", "))
+	}
+	if len(p.OutboundOnly) > 0 {
+		out.Printf("  Outbound-only peers: %s\n", strings.Join(p.OutboundOnly, ", "))
+	}
+
+	return out.Err()
+}
+
+// --- POLICY TEST command ---
+
+var policyTestCmd = &cobra.Command{
+	Use:   "test <policy.toml> <from> <to> <proto/port>",
+	Short: "Test a policy decision",
+	Long: `Test a policy decision against a policy file.
+<from> and <to> accept peer names or Ed25519 public key IDs (32-byte hex).
+Wildcards (*) and tags (tag:...) are not supported for from/to; use specific peer names or IDs.
+<proto/port> examples: tcp/22, udp/53, icmp, *.
+For port ranges like tcp/8000-8099, only the first port (8000) is tested.
+When "icmp" is specified, both ICMPv4 and ICMPv6 are tested against the policy.
+Prints allow/deny and which rule (or default) decided.
+Honours outbound_only.`,
+	Args: cobra.ExactArgs(4),
+	RunE: runPolicyTest,
+}
+
+func runPolicyTest(cobraCmd *cobra.Command, args []string) error {
+	policyPath := args[0]
+	fromArg := args[1]
+	toArg := args[2]
+	protoPort := args[3]
+
+	data, err := os.ReadFile(policyPath)
+	if err != nil {
+		return fmt.Errorf("read policy file: %w", err)
+	}
+
+	p, warnings, err := acl.ParsePolicy(string(data))
+	if err != nil {
+		_, _ = fmt.Fprintf(cobraCmd.ErrOrStderr(), "policy: %v\n", err)
+		return err
+	}
+
+	// Print warnings
+	for _, w := range warnings {
+		_, _ = fmt.Fprintf(cobraCmd.ErrOrStderr(), "warning: %s\n", w)
+	}
+
+	// Resolve from/to to peer keys
+	fromKey, err := resolveSubjectKey(fromArg, p)
+	if err != nil {
+		return fmt.Errorf("from: %w", err)
+	}
+	toKey, err := resolveSubjectKey(toArg, p)
+	if err != nil {
+		return fmt.Errorf("to: %w", err)
+	}
+
+	// Parse proto/port
+	protos, port, isPortRange, err := parseProtoPort(protoPort)
+	if err != nil {
+		return fmt.Errorf("proto/port: %w", err)
+	}
+
+	if isPortRange {
+		_, _ = fmt.Fprintf(cobraCmd.ErrOrStderr(), "warning: port range specified; only the first port (%d) is tested\n", port)
+	}
+
+	// Compile and decide
+	cp := p.Compile()
+
+	finalAction := acl.ActionDeny
+	finalRuleIdx := -1
+	var finalOutboundOnly bool
+
+	for _, proto := range protos {
+		dec := cp.Decide(fromKey, toKey, proto, port)
+
+		// If any proto allows, the result is allow (unless outbound-only)
+		if dec.Action == acl.ActionAllow {
+			finalAction = acl.ActionAllow
+			if dec.RuleIndex >= 0 {
+				finalRuleIdx = dec.RuleIndex
+			} else {
+				finalRuleIdx = -1
+			}
+			finalOutboundOnly = dec.OutboundOnly
+			// Allow short-circuits (unless we want to check if any proto is outbound-only)
+		} else if finalAction == acl.ActionDeny && dec.OutboundOnly {
+			finalOutboundOnly = true
+		}
+	}
+
+	// Print result
+	out := &printer{w: cobraCmd.OutOrStdout()}
+	actionStr := "ALLOW"
+	if finalAction == acl.ActionDeny {
+		actionStr = "DENY"
+	}
+	out.Printf("%s\n", actionStr)
+
+	if finalOutboundOnly {
+		out.Printf("  (outbound-only denial)\n")
+	}
+
+	if finalRuleIdx >= 0 {
+		rule := p.Rules[finalRuleIdx]
+		ports := make([]string, len(rule.Ports))
+		for j, pr := range rule.Ports {
+			ports[j] = formatPortRange(pr)
+		}
+		out.Printf("  Matched rule %d: from=%s to=%s ports=%s\n", finalRuleIdx, rule.From, rule.To, strings.Join(ports, ", "))
+	} else {
+		out.Printf("  Default action: %s\n", p.Default)
+	}
+
+	return out.Err()
+}
+
+// --- POLICY STATUS command ---
+
+var policyStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show active policy status from daemon",
+	Long: `Show the active local policy path and hash, network policy version/signer/age,
+drop counters per peer and rule, and the last N drops.`,
+	RunE: runPolicyStatus,
+}
+
+func runPolicyStatus(cobraCmd *cobra.Command, args []string) error {
+	sock := getSocketPath()
+
+	if !isRunning(sock) {
+		_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "daemon not running\n")
+		return nil
+	}
+
+	client := newSocketClient(sock)
+	resp, err := client.Get("http://daemon/api/policy/status")
+	if err != nil {
+		return fmt.Errorf("get policy status: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("policy status failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var result ipctypes.PolicyStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+
+	out := &printer{w: cobraCmd.OutOrStdout()}
+
+	// Print local policy info
+	out.Printf("Local Policy:\n")
+	if result.LocalPolicy.Path != "" {
+		out.Printf("  Path: %s\n", result.LocalPolicy.Path)
+		out.Printf("  Hash: %s\n", result.LocalPolicy.Hash)
+		out.Printf("  Version: %d\n", result.LocalPolicy.Version)
+		out.Printf("  Default: %s\n", result.LocalPolicy.Default)
+		out.Printf("  Rules: %d\n", result.LocalPolicy.Rules)
+	} else {
+		out.Printf("  (none)\n")
+	}
+
+	// Print network policy info
+	out.Printf("\nNetwork Policy:\n")
+	if result.NetworkPolicy.Version > 0 {
+		out.Printf("  Version: %d\n", result.NetworkPolicy.Version)
+		if result.NetworkPolicy.Signer != "" {
+			out.Printf("  Signer: %s\n", result.NetworkPolicy.Signer)
+		}
+		if result.NetworkPolicy.Age != "" {
+			out.Printf("  Age: %s\n", result.NetworkPolicy.Age)
+		}
+	} else {
+		out.Printf("  (none)\n")
+	}
+
+	// Print drop counters
+	out.Printf("\nDrop Counters:\n")
+	if len(result.DropCounters.ByPeer) > 0 {
+		out.Printf("  By Peer:\n")
+		for peerID, count := range result.DropCounters.ByPeer {
+			out.Printf("    %s: %d\n", peerID, count)
+		}
+	} else {
+		out.Printf("  By Peer: (none)\n")
+	}
+	if len(result.DropCounters.ByRule) > 0 {
+		out.Printf("  By Rule:\n")
+		for ruleIdx, count := range result.DropCounters.ByRule {
+			out.Printf("    rule %d: %d\n", ruleIdx, count)
+		}
+	} else {
+		out.Printf("  By Rule: (none)\n")
+	}
+	if len(result.DropCounters.ByOutboundOnly) > 0 {
+		out.Printf("  By Outbound-Only:\n")
+		for peerID, count := range result.DropCounters.ByOutboundOnly {
+			out.Printf("    %s: %d\n", peerID, count)
+		}
+	} else {
+		out.Printf("  By Outbound-Only: (none)\n")
+	}
+
+	// Print recent drops
+	out.Printf("\nRecent Drops (last %d):\n", len(result.RecentDrops))
+	if len(result.RecentDrops) == 0 {
+		out.Printf("  (none)\n")
+	} else {
+		for _, drop := range result.RecentDrops {
+			out.Printf("  %s  peer=%s  proto=%s  port=%d  rule=%s\n",
+				drop.Time.Format(time.RFC3339),
+				drop.PeerID,
+				drop.Proto,
+				drop.Port,
+				ruleIdxToString(drop.RuleIdx),
+			)
+		}
+	}
+
+	return out.Err()
+}
+
+func ruleIdxToString(idx int) string {
+	switch idx {
+	case -1:
+		return "default"
+	default:
+		return fmt.Sprintf("rule %d", idx)
+	}
 }
 
 // --- Helpers ---
@@ -715,4 +1053,144 @@ func ipcPost(sock string, path string) error {
 	_, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	return nil
+}
+
+func formatPeerKey(key acl.PeerKey) string {
+	return "ed25519:" + hex.EncodeToString(key[:])
+}
+
+func formatPortRange(pr acl.PortRange) string {
+	if pr.Proto == acl.ProtoAny {
+		return "*"
+	}
+	if pr.Proto == acl.ProtoICMP && pr.MatchesICMPv6() {
+		return "icmp"
+	}
+	var protoStr string
+	switch pr.Proto {
+	case acl.ProtoTCP:
+		protoStr = "tcp"
+	case acl.ProtoUDP:
+		protoStr = "udp"
+	case acl.ProtoICMP:
+		protoStr = "icmp"
+	case acl.ProtoICMPv6:
+		protoStr = "icmpv6"
+	default:
+		protoStr = fmt.Sprintf("proto%d", pr.Proto)
+	}
+	if pr.Start == 0 && pr.End == 65535 {
+		return protoStr + "/*"
+	}
+	if pr.Start == pr.End {
+		return fmt.Sprintf("%s/%d", protoStr, pr.Start)
+	}
+	return fmt.Sprintf("%s/%d-%d", protoStr, pr.Start, pr.End)
+}
+
+func resolveSubjectKey(arg string, p *acl.Policy) (acl.PeerKey, error) {
+	// Check if it's a hex-encoded Ed25519 public key (64 hex chars = 32 bytes)
+	if len(arg) == 64 {
+		if _, err := hex.DecodeString(arg); err == nil {
+			var key acl.PeerKey
+			decoded, _ := hex.DecodeString(arg)
+			copy(key[:], decoded)
+			return key, nil
+		}
+	}
+
+	// Check if it's a base64-encoded Ed25519 public key
+	if strings.HasPrefix(arg, "ed25519:") {
+		encoded := arg[len("ed25519:"):]
+		if decoded, err := base64.StdEncoding.DecodeString(encoded); err == nil {
+			if len(decoded) == 32 {
+				var key acl.PeerKey
+				copy(key[:], decoded)
+				return key, nil
+			}
+		}
+	}
+
+	// Try as peer name
+	if arg == "*" {
+		return acl.PeerKey{}, errors.New("wildcard '*' not supported for test from/to; use a specific peer name or ID")
+	}
+
+	if strings.HasPrefix(arg, "tag:") {
+		return acl.PeerKey{}, errors.New("tag not supported for test from/to; use a specific peer name or ID")
+	}
+
+	// Look up by peer name
+	if key, ok := p.Peers[arg]; ok {
+		return key, nil
+	}
+
+	// Not found
+	return acl.PeerKey{}, fmt.Errorf("unknown peer or ID: %q", arg)
+}
+
+// parseProtoPort parses a proto/port string and returns the protocol(s) to test,
+// the port, whether it was a port range, and any error.
+// For "icmp", returns both ICMPv4 and ICMPv6 to test.
+// For port ranges, returns the first port and isPortRange=true.
+func parseProtoPort(s string) ([]acl.Proto, uint16, bool, error) {
+	if s == "*" {
+		return []acl.Proto{acl.ProtoAny}, 0, false, nil
+	}
+	if strings.EqualFold(s, "icmp") {
+		// "icmp" keyword matches both ICMPv4 and ICMPv6 in policy
+		return []acl.Proto{acl.ProtoICMP, acl.ProtoICMPv6}, 0, false, nil
+	}
+
+	parts := strings.Split(s, "/")
+	if len(parts) != 2 {
+		return nil, 0, false, fmt.Errorf("invalid format: %q (expected proto/port or proto/start-end)", s)
+	}
+
+	protoStr := strings.ToLower(parts[0])
+	portStr := parts[1]
+
+	var proto acl.Proto
+	switch protoStr {
+	case "tcp":
+		proto = acl.ProtoTCP
+	case "udp":
+		proto = acl.ProtoUDP
+	case "icmp":
+		// Explicit "icmp" without range still matches both
+		return []acl.Proto{acl.ProtoICMP, acl.ProtoICMPv6}, 0, false, nil
+	default:
+		return nil, 0, false, fmt.Errorf("unknown protocol: %q", protoStr)
+	}
+
+	// Parse port or range (for testing, only the first port of a range is used)
+	if strings.Contains(portStr, "-") {
+		rangeParts := strings.Split(portStr, "-")
+		if len(rangeParts) != 2 {
+			return nil, 0, false, fmt.Errorf("invalid port range: %q", portStr)
+		}
+		start, err := parsePort(rangeParts[0])
+		if err != nil {
+			return nil, 0, false, err
+		}
+		return []acl.Proto{proto}, start, true, nil
+	}
+
+	port, err := parsePort(portStr)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return []acl.Proto{proto}, port, false, nil
+}
+
+func parsePort(s string) (uint16, error) {
+	var port uint64
+	_, err := fmt.Sscanf(s, "%d", &port)
+	if err != nil {
+		return 0, fmt.Errorf("invalid port number: %q", s)
+	}
+	if port > 65535 {
+		return 0, fmt.Errorf("port %d exceeds maximum 65535", port)
+	}
+	return uint16(port), nil
 }
