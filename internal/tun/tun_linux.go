@@ -16,10 +16,11 @@ import (
 )
 
 type linuxTUN struct {
-	dev  wgtun.Device
-	name string
-	addr netip.Prefix
-	mtu  int
+	dev     wgtun.Device
+	name    string
+	addr    netip.Prefix
+	mtu     int
+	linkIdx int
 }
 
 // DefaultIfaceName is the default Linux TUN interface name. A dedicated
@@ -62,7 +63,7 @@ func createTUN(name string, ip netip.Prefix, mtu int) (TUN, error) {
 		return nil, fmt.Errorf("netlink link up %s: %w", realName, err)
 	}
 
-	return &linuxTUN{dev: dev, name: realName, addr: ip, mtu: mtu}, nil
+	return &linuxTUN{dev: dev, name: realName, addr: ip, mtu: mtu, linkIdx: link.Attrs().Index}, nil
 }
 
 // createDevice opens a TUN device like wgtun.CreateTUN but without
@@ -114,6 +115,7 @@ func (t *linuxTUN) Close() error       { return t.dev.Close() }
 func (t *linuxTUN) Name() string       { return t.name }
 func (t *linuxTUN) Addr() netip.Prefix { return t.addr }
 func (t *linuxTUN) MTU() int           { return t.mtu }
+func (t *linuxTUN) LinkIndex() int     { return t.linkIdx }
 
 func prefixToIPNet(p netip.Prefix) *net.IPNet {
 	return &net.IPNet{
