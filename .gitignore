@@ -6,6 +6,7 @@ CLAUDE.md
 /veld
 /veld-coord
 /veld-daemon
+/http-client
 *.exe
 
 # Build output
