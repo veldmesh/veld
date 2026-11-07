@@ -144,20 +144,7 @@ func (t *NetstackTUN) DialContext(ctx context.Context, network, address string) 
 	return t.netstack.DialContext(ctx, network, address)
 }
 
-func (t *NetstackTUN) Dial(network, address string) (net.Conn, error) {
-	if t.netstack == nil {
-		return nil, errors.New("netstack not initialized")
-	}
-	return t.netstack.Dial(network, address)
-}
-
-func (t *NetstackTUN) ListenTCP(addr *net.TCPAddr) (net.Listener, error) {
-	if t.netstack == nil {
-		return nil, errors.New("netstack not initialized")
-	}
-	return t.netstack.ListenTCP(addr)
-}
-
+// ListenTCPAddrPort implements NetstackListener.
 func (t *NetstackTUN) ListenTCPAddrPort(addr netip.AddrPort) (net.Listener, error) {
 	if t.netstack == nil {
 		return nil, errors.New("netstack not initialized")
@@ -165,13 +152,7 @@ func (t *NetstackTUN) ListenTCPAddrPort(addr netip.AddrPort) (net.Listener, erro
 	return t.netstack.ListenTCPAddrPort(addr)
 }
 
-func (t *NetstackTUN) ListenUDP(laddr *net.UDPAddr) (net.PacketConn, error) {
-	if t.netstack == nil {
-		return nil, errors.New("netstack not initialized")
-	}
-	return t.netstack.ListenUDP(laddr)
-}
-
+// ListenUDPAddrPort implements NetstackListener.
 func (t *NetstackTUN) ListenUDPAddrPort(laddr netip.AddrPort) (net.PacketConn, error) {
 	if t.netstack == nil {
 		return nil, errors.New("netstack not initialized")

@@ -333,7 +333,7 @@ func (d *Dispatcher) handleTunPacket(pkt []byte) {
 
 	// Record flow for reply tracking (outbound direction)
 	if kind == acl.KindStart {
-		d.flowTable.Lookup(flow, true, acl.FlowStateNew)
+		d.flowTable.Lookup(flow, true, acl.FlowStateEstablished)
 	}
 
 	udpPkt := buildDataPacket(nonce, ct)

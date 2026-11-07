@@ -592,3 +592,160 @@ ports = ["tcp/8080"]
 		t.Fatal("timeout: allowed reply ACK not written to TUN")
 	}
 }
+
+// TestDispatcher_OutboundSYN_CreatesEstablishedFlow tests that an outbound SYN
+// from a node with outbound_only = ["self"] creates a flow in
+// FlowStateEstablished (not FlowStateNew), so the peer's SYN-ACK is accepted
+// but an unsolicited inbound SYN from that peer is still dropped.
+func TestDispatcher_OutboundSYN_CreatesEstablishedFlow(t *testing.T) {
+	sessA, sessB := newTestSessionPair(t)
+
+	peerTbl := peer.New()
+	var peerBID [32]byte
+	peerBID[0] = 0x02
+	ep := mustAddrPort("1.2.3.4:5000")
+	entryB := &peer.Entry{ID: peerBID, VPNAddr: mustAddr("10.0.0.2")}
+	entryB.SetEndpoint(ep)
+	entryB.SetSession(sessA)
+	peerTbl.Upsert(entryB)
+
+	// Self peer ID for ACL decisions - this node is outbound-only
+	var selfPeerID [32]byte
+	selfPeerID[0] = 0x01
+
+	// Set up outbound-only policy: SELF is outbound-only
+	// This means: self can make outbound connections, but cannot receive inbound connections
+	peers := make(map[string]acl.PeerKey)
+	peers["self"] = acl.PeerKey(selfPeerID)
+	peers["b"] = acl.PeerKey(peerBID)
+	policy := &acl.Policy{
+		Version:      1,
+		Default:      acl.DefaultAllow,
+		Peers:        peers,
+		OutboundOnly: []string{"self"},
+	}
+	compiled := policy.Compile()
+
+	// Create dispatcher with outbound-only policy
+	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
+	conn := newFakeConn()
+
+	d := New(tunDev, conn, peerTbl)
+	d.SetPolicyDecider(compiled)
+	d.SetSelfPeerID(selfPeerID)
+	d.Start()
+	defer d.Stop()
+
+	// Send an OUTBOUND SYN from self (10.0.0.1) to peer B (10.0.0.2)
+	// This should be ALLOWED (self is initiating outbound) and create a flow in FlowStateEstablished
+	outboundSYN := buildTCPSYNPacket(
+		[4]byte{10, 0, 0, 1}, // src
+		[4]byte{10, 0, 0, 2}, // dst
+		12345,                // src port
+		22,                   // dst port
+	)
+	tunDev.Inject(outboundSYN)
+
+	// Wait for the packet to be processed and sent over UDP
+	select {
+	case msg := <-conn.out:
+		if len(msg.data) < HeaderSize {
+			t.Fatalf("packet too short: %d", len(msg.data))
+		}
+		pktType, _, _ := parseHeader(msg.data[:HeaderSize])
+		if pktType != TypeData {
+			t.Errorf("pktType: got %d, want %d (TypeData)", pktType, TypeData)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout: no UDP packet sent for outbound SYN")
+	}
+
+	// Now simulate the INBOUND SYN-ACK from peer B (response to our SYN)
+	// This should be accepted because the flow is in Established state
+	inboundSYNACK := buildTCPSYNACKPacket(
+		[4]byte{10, 0, 0, 2}, // src (peer B)
+		[4]byte{10, 0, 0, 1}, // dst (self)
+		22,                   // src port
+		12345,                // dst port
+	)
+	nonce, ct, err := sessB.Encrypt(inboundSYNACK)
+	if err != nil {
+		t.Fatalf("encrypt SYN-ACK failed: %v", err)
+	}
+	conn.in <- udpMsg{data: buildDataPacket(nonce, ct), addr: &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5000}}
+
+	// Expect the SYN-ACK to be delivered to TUN
+	buf := make([]byte, 1500)
+	n, err := tunDev.ReadDelivered(buf)
+	if err != nil {
+		t.Fatalf("ReadDelivered failed: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("expected SYN-ACK to be delivered to TUN (flow is Established)")
+	}
+
+	// Now simulate an UNSOLICITED INBOUND SYN from peer B (new connection attempt)
+	// This should be DROPPED because self is outbound-only (cannot receive inbound)
+	unsolicitedSYN := buildTCPSYNPacket(
+		[4]byte{10, 0, 0, 2}, // src (peer B)
+		[4]byte{10, 0, 0, 1}, // dst (self)
+		80,                   // src port (different from SYN-ACK)
+		8080,                 // dst port
+	)
+	nonce2, ct2, err := sessB.Encrypt(unsolicitedSYN)
+	if err != nil {
+		t.Fatalf("encrypt unsolicited SYN failed: %v", err)
+	}
+	conn.in <- udpMsg{data: buildDataPacket(nonce2, ct2), addr: &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5000}}
+
+	// The unsolicited SYN should NOT be delivered to TUN
+	// Wait a bit to ensure no packet arrives
+	select {
+	case <-time.After(100 * time.Millisecond):
+		// Expected: no delivery
+	case n := <-func() chan int {
+		ch := make(chan int, 1)
+		go func() {
+			buf := make([]byte, 1500)
+			if n, err := tunDev.ReadDelivered(buf); err == nil {
+				ch <- n
+			}
+		}()
+		return ch
+	}():
+		t.Errorf("unsolicited inbound SYN to outbound-only node should be dropped, but was delivered (%d bytes)", n)
+	}
+}
+
+// buildTCPSYNACKPacket builds a minimal IPv4 TCP SYN-ACK packet.
+func buildTCPSYNACKPacket(src, dst [4]byte, srcPort, dstPort uint16) []byte {
+	totalLen := 20 + 20
+	pkt := make([]byte, totalLen)
+	pkt[0] = 0x45
+	pkt[1] = 0x00
+	pkt[2] = byte(totalLen >> 8)
+	pkt[3] = byte(totalLen)
+	pkt[4] = 0x00
+	pkt[5] = 0x00
+	pkt[6] = 0x00
+	pkt[7] = 0x00
+	pkt[8] = 64
+	pkt[9] = 6 // TCP
+	copy(pkt[12:16], src[:])
+	copy(pkt[16:20], dst[:])
+	pkt[20] = byte(srcPort >> 8)
+	pkt[21] = byte(srcPort)
+	pkt[22] = byte(dstPort >> 8)
+	pkt[23] = byte(dstPort)
+	pkt[24] = 0
+	pkt[25] = 0
+	pkt[26] = 0
+	pkt[27] = 0
+	pkt[28] = 0
+	pkt[29] = 0
+	pkt[30] = 0
+	pkt[31] = 0
+	pkt[32] = 0x50
+	pkt[33] = 0x12 // SYN|ACK
+	return pkt
+}

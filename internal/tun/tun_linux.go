@@ -5,6 +5,7 @@
 package tun
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
@@ -114,6 +115,10 @@ func (t *linuxTUN) Close() error       { return t.dev.Close() }
 func (t *linuxTUN) Name() string       { return t.name }
 func (t *linuxTUN) Addr() netip.Prefix { return t.addr }
 func (t *linuxTUN) MTU() int           { return t.mtu }
+
+func (t *linuxTUN) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return nil, ErrNotNetstack
+}
 
 func prefixToIPNet(p netip.Prefix) *net.IPNet {
 	return &net.IPNet{

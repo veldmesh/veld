@@ -5,6 +5,7 @@
 package tun
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
@@ -104,3 +105,7 @@ func (t *windowsTUN) Close() error       { return t.dev.Close() }
 func (t *windowsTUN) Name() string       { return t.name }
 func (t *windowsTUN) Addr() netip.Prefix { return t.addr }
 func (t *windowsTUN) MTU() int           { return t.mtu }
+
+func (t *windowsTUN) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return nil, ErrNotNetstack
+}
