@@ -56,6 +56,7 @@ type Daemon struct {
 	peerTbl          *peer.Table
 	localID          *crypto.Identity
 	networkID        [16]byte
+	conn             net.PacketConn // data-plane UDP socket
 
 	// ACL policy
 	policySwap    *acl.PolicySwap
@@ -99,8 +100,54 @@ func New(
 		localID:   localID,
 		networkID: networkID,
 		tunDev:    t,
+		conn:      conn,
 		now:       time.Now,
 	}
+}
+
+// --- Public accessors for embeddable package ---
+
+// LocalID returns the local node's identity.
+func (d *Daemon) LocalID() *crypto.Identity {
+	return d.localID
+}
+
+// NetworkID returns the network ID.
+func (d *Daemon) NetworkID() [16]byte {
+	return d.networkID
+}
+
+// PeerTable returns the peer table.
+func (d *Daemon) PeerTable() *peer.Table {
+	return d.peerTbl
+}
+
+// Conn returns the UDP packet connection.
+func (d *Daemon) Conn() net.PacketConn {
+	return d.conn
+}
+
+// HandshakeManager returns the handshake manager.
+func (d *Daemon) HandshakeManager() *handshake.Manager {
+	return d.hsMgr
+}
+
+// CoordClient returns the coordinator client (nil if not in coord mode).
+func (d *Daemon) CoordClient() *coord.Client {
+	return d.coordCli
+}
+
+// Dispatcher returns the dataplane dispatcher.
+func (d *Daemon) Dispatcher() *dataplane.Dispatcher {
+	return d.disp
+}
+
+// TUN returns the TUN device (netstack in userspace mode).
+// Returns nil if the TUN has not been created yet (coord mode before VPN address assignment).
+func (d *Daemon) TUN() tun.TUN {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.tunDev
 }
 
 // legacyIfaceName is the interface name older veld versions baked into every
