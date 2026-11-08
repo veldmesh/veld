@@ -294,6 +294,31 @@ Memory target for MIPS/ARMv6 builds: ≤30 MB RSS. Profile before shipping.
 
 ---
 
+## Release notes
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which writes the
+GitHub release notes with `packaging/release-notes.sh`:
+
+- **Highlights** — the annotated tag's message. Write two or three sentences
+  on what the release means for users:
+  `git tag -a v0.3.0 -m "Local ACL policies are enforced …"`. A lightweight tag,
+  or a message that is just the tag name, gets no Highlights section.
+- **Features / Fixes / Security / Other changes** — the subject line of every
+  commit since the previous tag, grouped by conventional-commit type
+  (`feat`/`perf`, `fix`, `sec`/`security`, anything else). Dependency bumps and
+  `ci`, `chore`, `build`, `test`, `style`, `refactor`, `docs` and `revert`
+  commits are left out; `feat!:` is marked **Breaking**. A final release counts
+  from the previous final release, so it also covers its release candidates.
+
+The subject line is the changelog entry, so keep it short and user-facing:
+`feat(route): restore a VPN route veld displaced, on clean stop (#46)`, not a
+list of files. Preview the notes before tagging with
+`git tag v0.3.0 && sh packaging/release-notes.sh v0.3.0; git tag -d v0.3.0`.
+`RELEASE_NOTES.md` stays the place for upgrade and coordination notes that
+need more than a line.
+
+---
+
 ## Key dependencies
 
 | Package | Reason for choice |
