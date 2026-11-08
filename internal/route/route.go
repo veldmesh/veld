@@ -17,6 +17,10 @@ type Manager interface {
 	Remove(prefix netip.Prefix) error
 	// Close removes all routes that were added via this manager.
 	Close() error
+	// SetTUNLink records the link index of veld's TUN interface. Device routes
+	// on this link are considered veld's own and will not be treated as displaced
+	// VPN routes. This is a no-op on non-Linux platforms.
+	SetTUNLink(linkIndex int)
 }
 
 // CheckPeerRoute reports whether a subnet route advertised by a peer may be
