@@ -5,6 +5,7 @@
 package tun
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
@@ -90,3 +91,7 @@ func (t *darwinTUN) Name() string       { return t.name }
 func (t *darwinTUN) Addr() netip.Prefix { return t.addr }
 func (t *darwinTUN) MTU() int           { return t.mtu }
 func (t *darwinTUN) LinkIndex() int     { return 0 }
+
+func (t *darwinTUN) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return nil, ErrNotNetstack
+}

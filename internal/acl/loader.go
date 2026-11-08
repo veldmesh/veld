@@ -307,12 +307,60 @@ func (l *LocalPolicyLoader) DropCounters() *DropCounters {
 	return l.dropCounters
 }
 
+// dynamicCombinedPolicy checks the local policy swap at decision time,
+// falling through to network policy / allow when no local policy is loaded.
+// This ensures hot-reloaded policy changes (including file deletion) take
+// effect immediately without requiring SIGHUP.
+type dynamicCombinedPolicy struct {
+	swap    *PolicySwap
+	network PolicyDecider
+}
+
+func (d *dynamicCombinedPolicy) Decide(src, dst [32]byte, proto Proto, port uint16) Decision {
+	// Check local policy at decision time
+	local := d.swap.Load()
+	if local == nil {
+		// No local policy: defer to network policy
+		if d.network == nil {
+			// No local + no network = allow all (no filtering, as pre-ACL)
+			return Decision{Action: ActionAllow, RuleIndex: -1}
+		}
+		return d.network.Decide(src, dst, proto, port)
+	}
+
+	// Local policy exists: combine with network (both must allow)
+	localDec := local.Decide(src, dst, proto, port)
+	if localDec.Action == ActionDeny {
+		return localDec
+	}
+	if d.network == nil {
+		return localDec
+	}
+	netDec := d.network.Decide(src, dst, proto, port)
+	if netDec.Action == ActionDeny {
+		return netDec
+	}
+	// Both allow - return the more specific decision (local takes precedence for rule index)
+	if localDec.RuleIndex >= 0 {
+		return localDec
+	}
+	return netDec
+}
+
 // CombinedPolicy returns a PolicyDecider that combines local and network policies.
+// The returned decider checks the local policy swap at decision time, so hot-reloaded
+// changes (including file deletion) take effect immediately without SIGHUP.
+// If no local policy is loaded, defers to network policy.
+// If both local and network are nil, allows all traffic (no filtering, as pre-ACL).
 func (l *LocalPolicyLoader) CombinedPolicy() PolicyDecider {
 	l.mu.RLock()
 	network := l.network
 	l.mu.RUnlock()
-	return Combine(l.swap, network)
+
+	return &dynamicCombinedPolicy{
+		swap:    l.swap,
+		network: network,
+	}
 }
 
 // SetNetworkPolicy updates the network policy.

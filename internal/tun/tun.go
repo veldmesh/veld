@@ -3,7 +3,9 @@
 package tun
 
 import (
+	"context"
 	"errors"
+	"net"
 	"net/netip"
 	"sync"
 )
@@ -17,10 +19,27 @@ type TUN interface {
 	Addr() netip.Prefix
 	MTU() int
 	LinkIndex() int // 0 if not supported/unknown
+
+	// DialContext establishes a network connection through the netstack.
+	// Only implemented for userspace (netstack) TUN; returns error for kernel TUN.
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+// NetstackListener is an optional interface for netstack TUN devices that support
+// listening for TCP and UDP connections. Implemented by NetstackTUN; kernel TUNs return
+// ErrNotNetstack.
+type NetstackListener interface {
+	// ListenTCPAddrPort listens for TCP connections on the netstack.
+	ListenTCPAddrPort(addr netip.AddrPort) (net.Listener, error)
+	// ListenUDPAddrPort listens for UDP packets on the netstack.
+	ListenUDPAddrPort(laddr netip.AddrPort) (net.PacketConn, error)
 }
 
 // ErrClosed is returned by Read/Write after Close is called.
 var ErrClosed = errors.New("tun: device closed")
+
+// ErrNotNetstack is returned when a netstack-only method is called on a kernel TUN.
+var ErrNotNetstack = errors.New("operation only supported on userspace netstack TUN")
 
 // CreateTUN creates a TUN device. If userspace is true, it creates a userspace
 // netstack TUN (no root, no TUN device, no OS routes). Otherwise it creates
@@ -134,6 +153,10 @@ func (m *MemTUN) Name() string       { return m.name }
 func (m *MemTUN) Addr() netip.Prefix { return m.addr }
 func (m *MemTUN) MTU() int           { return m.mtu }
 func (m *MemTUN) LinkIndex() int     { return 0 }
+
+func (m *MemTUN) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return nil, ErrNotNetstack
+}
 
 // Drain removes and discards all packets from the delivery channel.
 // Useful for tests to clear leftover packets between test cases.
