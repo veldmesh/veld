@@ -452,8 +452,7 @@ ports = ["tcp/22"]
 }
 
 func TestDecide_DisjointTagsWarning(t *testing.T) {
-	// Test that disjoint tags produce a warning
-	// this is a valid use case (e.g., admins accessing servers)
+	// Test that disjoint tags do NOT produce a warning (valid use case: admins accessing servers)
 	src := `
 version = 1
 default = "deny"
@@ -473,8 +472,8 @@ ports = ["tcp/22"]
 	if err != nil {
 		t.Fatalf("ParsePolicy: %v", err)
 	}
-	if len(warnings) == 0 {
-		t.Fatal("expected warning for disjoint tags")
+	if len(warnings) != 0 {
+		t.Fatalf("expected no warning for disjoint tags, got: %v", warnings)
 	}
 	_ = p
 }

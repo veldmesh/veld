@@ -1,0 +1,29 @@
+version = 1
+default = "deny"
+
+[peers]
+alice = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bob   = "ed25519:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+carol = "ed25519:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC="
+
+[tags]
+admins = ["alice", "bob"]
+servers = ["carol"]
+
+[[rule]]
+from = "alice"
+to   = "bob"
+ports = ["tcp/22", "tcp/8000-8099"]
+
+[[rule]]
+from = "tag:admins"
+to   = "tag:servers"
+ports = ["tcp/443", "udp/53"]
+
+[[rule]]
+from = "*"
+to   = "bob"
+ports = ["icmp"]
+
+[outbound_only]
+peers = ["carol"]

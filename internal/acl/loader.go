@@ -3,6 +3,7 @@
 package acl
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -14,37 +15,56 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// MaxRecentDrops is the maximum number of recent drop events to keep.
+const MaxRecentDrops = 100
+
 // LocalPolicyLoader loads and manages the local ACL policy file.
 // It handles validation, hot-reload on SIGHUP/file change, and integrates with the PolicySwap.
 type LocalPolicyLoader struct {
-	path         string
-	selfPeerID   [32]byte // this node's Ed25519 public key
-	peerLookup   func(name string) ([32]byte, bool)
-	swap         *PolicySwap
-	network      PolicyDecider // optional network policy
-	mu           sync.RWMutex
-	stopCh       chan struct{}
-	watcher      *fsnotify.Watcher
-	lastModTime  time.Time
-	lastErrorLog time.Time
-	dropCounters *DropCounters
-	wg           sync.WaitGroup
+	path          string
+	selfPeerID    [32]byte // this node's Ed25519 public key
+	peerLookup    func(name string) ([32]byte, bool)
+	swap          *PolicySwap
+	network       PolicyDecider // optional network policy
+	mu            sync.RWMutex
+	stopCh        chan struct{}
+	watcher       *fsnotify.Watcher
+	lastModTime   time.Time
+	lastErrorLog  time.Time
+	dropCounters  *DropCounters
+	wg            sync.WaitGroup
+	policyHash    string // hash of the policy bytes that were actually parsed
+	policyVersion int    // version of the loaded policy
+	policyDefault string // default action of the loaded policy
+	policyRules   int    // number of rules in the loaded policy
+}
+
+// DropEvent represents a dropped packet event for the policy status.
+type DropEvent struct {
+	Time    time.Time
+	PeerID  [32]byte
+	Proto   Proto
+	Port    uint16
+	RuleIdx int
 }
 
 // DropCounters tracks dropped packets per peer and per rule.
 type DropCounters struct {
-	mu             sync.Mutex
-	byPeer         map[[32]byte]uint64
-	byRule         map[int]uint64
-	byOutboundOnly map[[32]byte]uint64
+	mu              sync.Mutex
+	byPeer          map[[32]byte]uint64
+	byRule          map[int]uint64
+	byOutboundOnly  map[[32]byte]uint64
+	recentDrops     [MaxRecentDrops]DropEvent // ring buffer
+	recentDropsLen  int                       // current number of elements
+	recentDropsHead int                       // index of oldest element (next write position)
 }
 
 // NewDropCounters creates a new DropCounters.
 func NewDropCounters() *DropCounters {
 	return &DropCounters{
 		byPeer:         make(map[[32]byte]uint64),
-		byRule:         make(map[int]uint64),
-		byOutboundOnly: make(map[[32]byte]uint64),
+		byRule:         map[int]uint64{},
+		byOutboundOnly: map[[32]byte]uint64{},
 	}
 }
 
@@ -109,6 +129,43 @@ func (dc *DropCounters) Snapshot() (map[[32]byte]uint64, map[int]uint64, map[[32
 	return byPeer, byRule, byOO
 }
 
+// RecentDrops returns the recent drop events (up to MaxRecentDrops) in order from oldest to newest.
+func (dc *DropCounters) RecentDrops() []DropEvent {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	if dc.recentDropsLen == 0 {
+		return nil
+	}
+
+	result := make([]DropEvent, dc.recentDropsLen)
+	for i := 0; i < dc.recentDropsLen; i++ {
+		idx := (dc.recentDropsHead + i) % MaxRecentDrops
+		result[i] = dc.recentDrops[idx]
+	}
+	return result
+}
+
+// RecordDrop records a drop event for the policy status.
+func (dc *DropCounters) RecordDrop(peerID [32]byte, proto Proto, port uint16, ruleIdx int) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	event := DropEvent{
+		Time:    time.Now(),
+		PeerID:  peerID,
+		Proto:   proto,
+		Port:    port,
+		RuleIdx: ruleIdx,
+	}
+
+	dc.recentDrops[dc.recentDropsHead] = event
+	dc.recentDropsHead = (dc.recentDropsHead + 1) % MaxRecentDrops
+	if dc.recentDropsLen < MaxRecentDrops {
+		dc.recentDropsLen++
+	}
+}
+
 // NewLocalPolicyLoader creates a new LocalPolicyLoader.
 // selfPeerID is this node's Ed25519 public key.
 // peerLookup resolves a peer name (from the local policy) to an Ed25519 public key.
@@ -136,6 +193,12 @@ func (l *LocalPolicyLoader) Load() error {
 		if errors.Is(err, os.ErrNotExist) {
 			// No local policy file = defer to network policy
 			l.swap.Store(nil)
+			l.mu.Lock()
+			l.policyHash = ""
+			l.policyVersion = 0
+			l.policyDefault = ""
+			l.policyRules = 0
+			l.mu.Unlock()
 			return nil
 		}
 		return fmt.Errorf("stat policy file: %w", err)
@@ -163,14 +226,22 @@ func (l *LocalPolicyLoader) Load() error {
 		fmt.Printf("policy warning: %s\n", w)
 	}
 
+	// Compute hash from the bytes that were actually parsed
+	sum := sha256.Sum256(data)
+	hash := fmt.Sprintf("sha256:%x", sum)
+
 	// Compile the policy
 	cp := p.Compile()
 
 	// Store the compiled policy
 	l.swap.Store(cp)
 
-	// Update last mod time for file watching
+	// Store policy metadata for status (from the bytes that were actually parsed)
 	l.mu.Lock()
+	l.policyHash = hash
+	l.policyVersion = cp.Version()
+	l.policyDefault = cp.DefaultAction()
+	l.policyRules = cp.Rules()
 	l.lastModTime = info.ModTime()
 	l.mu.Unlock()
 
@@ -178,7 +249,7 @@ func (l *LocalPolicyLoader) Load() error {
 }
 
 // validatePolicyFilePermissions checks that the policy file is not group/world writable
-// and is owned by root (UID 0) on Linux, or by the current user on non-Linux.
+// and is owned by root (UID 0) or current user on Linux, or by the current user on non-Linux.
 func validatePolicyFilePermissions(path string, info os.FileInfo) error {
 	// On Windows, skip permission checks (Windows ACLs are used instead)
 	if runtime.GOOS == "windows" {
@@ -305,6 +376,38 @@ func (l *LocalPolicyLoader) logError(err error) {
 // DropCounters returns the drop counters for this loader.
 func (l *LocalPolicyLoader) DropCounters() *DropCounters {
 	return l.dropCounters
+}
+
+// RecentDrops returns the recent drop events (up to MaxRecentDrops).
+func (l *LocalPolicyLoader) RecentDrops() []DropEvent {
+	return l.dropCounters.RecentDrops()
+}
+
+// PolicyInfo returns the status of the local policy for the IPC endpoint.
+func (l *LocalPolicyLoader) PolicyInfo() PolicyInfo {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	if l.policyVersion == 0 {
+		return PolicyInfo{}
+	}
+
+	return PolicyInfo{
+		Path:    l.path,
+		Hash:    l.policyHash,
+		Version: l.policyVersion,
+		Default: l.policyDefault,
+		Rules:   l.policyRules,
+	}
+}
+
+// PolicyInfo represents the status of a local policy.
+type PolicyInfo struct {
+	Path    string
+	Hash    string
+	Version int
+	Default string
+	Rules   int
 }
 
 // dynamicCombinedPolicy checks the local policy swap at decision time,

@@ -24,6 +24,7 @@ import (
 	intconfig "github.com/veldmesh/veld/internal/config"
 	"github.com/veldmesh/veld/internal/coord"
 	"github.com/veldmesh/veld/internal/crypto"
+	"github.com/veldmesh/veld/internal/daemon/ipctypes"
 	"github.com/veldmesh/veld/internal/dataplane"
 	"github.com/veldmesh/veld/internal/dns"
 	"github.com/veldmesh/veld/internal/handshake"
@@ -272,6 +273,8 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	d.disp.SetPolicyDecider(d.policyDecider)
 	// Set the self peer ID for ACL decisions
 	d.disp.SetSelfPeerID(selfPeerID)
+	// Share drop counters with policy loader for IPC status
+	d.disp.SetDropCounters(d.policyLoader.DropCounters())
 
 	// Commercial VPN coexistence: detect VPN tunnels and routing conflicts
 	// at startup and log actionable guidance (kill switches, split tunneling,
@@ -477,7 +480,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 				if e, ok := peerTbl.LookupByID(id); ok {
 					for _, pfx := range e.SubnetRoutes {
 						if err := d.routeMgr.Remove(pfx); err != nil {
-							fmt.Printf("warning: remove route %s: %v\n", pfx, err)
+							fmt.Printf("warning: remove route %s via %s: %v\n", pfx, e.VPNAddr, err)
 						}
 					}
 				}
@@ -500,14 +503,14 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 		d.coordCli.OnVPNAddrAssigned = d.onVPNAddrAssigned(cfg, conn, userspace)
 	}
 
-	// Wire up IPC server
+	// Wire up IPC server with policy provider set before Start()
 	socketPath := cfg.Daemon.SocketPath
 	if socketPath == "" {
 		socketPath = intconfig.DefaultSocketPath()
 	}
 	d.ipcSrv = NewIPCServer(socketPath, func() {
 		d.Stop()
-	})
+	}, d)
 
 	// Wire up DNS stub resolver if enabled.
 	if cfg.DNS.Enabled {
@@ -1001,4 +1004,39 @@ func (d *Daemon) updateIPCStatus() {
 		Peers:     peers,
 	}
 	d.ipcSrv.UpdateStatus(st)
+}
+
+// PolicyStatusProvider implementation
+
+// LocalPolicyStatus returns the status of the local policy.
+func (d *Daemon) LocalPolicyStatus() ipctypes.LocalPolicyStatus {
+	aclInfo := d.policyLoader.PolicyInfo()
+	return ipctypes.LocalPolicyStatus{
+		Path:    aclInfo.Path,
+		Hash:    aclInfo.Hash,
+		Version: aclInfo.Version,
+		Default: aclInfo.Default,
+		Rules:   aclInfo.Rules,
+	}
+}
+
+// DropCounters returns the drop counters.
+func (d *Daemon) DropCounters() *acl.DropCounters {
+	return d.policyLoader.DropCounters()
+}
+
+// RecentDrops returns the recent drop events.
+func (d *Daemon) RecentDrops() []ipctypes.DropEvent {
+	aclEvents := d.policyLoader.RecentDrops()
+	result := make([]ipctypes.DropEvent, len(aclEvents))
+	for i, e := range aclEvents {
+		result[i] = ipctypes.DropEvent{
+			Time:    e.Time,
+			PeerID:  fmt.Sprintf("%x", e.PeerID[:]),
+			Proto:   e.Proto.String(),
+			Port:    e.Port,
+			RuleIdx: e.RuleIdx,
+		}
+	}
+	return result
 }
