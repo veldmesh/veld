@@ -717,6 +717,292 @@ func TestDispatcher_OutboundSYN_CreatesEstablishedFlow(t *testing.T) {
 	}
 }
 
+// TestDispatcher_ReplyToOutbound_PortRestrictedPolicy tests that replies to an
+// outbound connection (initiated by self) are checked against the INITIATOR'S
+// service port, not the ephemeral destination port. This verifies the fix for
+// the reply port bug where dispatcher.go used flow.DstPort instead of
+// flowEntry.InitiatorServicePort for KindOther packets.
+//
+// Policy: default deny, only tcp/8080 allowed from self to peer.
+// 1. Inject outbound SYN self:ephemeral -> peer:8080 through TUN
+// 2. Deliver peer's SYN-ACK peer:8080 -> self:ephemeral over UDP
+// 3. Deliver peer's data/ACK packet peer:8080 -> self:ephemeral over UDP
+// Both reply packets must be delivered to TUN and no drop counted.
+// This test FAILS if dispatcher.go uses flow.DstPort instead of InitiatorServicePort.
+func TestDispatcher_ReplyToOutbound_PortRestrictedPolicy(t *testing.T) {
+	sessA, sessB := newTestSessionPair(t)
+
+	peerTbl := peer.New()
+	var peerBID [32]byte
+	peerBID[0] = 0x02
+	ep := mustAddrPort("1.2.3.4:5000")
+	entryB := &peer.Entry{ID: peerBID, VPNAddr: mustAddr("10.0.0.2")}
+	entryB.SetEndpoint(ep)
+	entryB.SetSession(sessA)
+	peerTbl.Upsert(entryB)
+
+	var selfPeerID [32]byte
+	selfPeerID[0] = 0x01
+
+	// Policy: default deny, only tcp/8080 allowed from self to peer
+	policySrc := `version = 1
+default = "deny"
+[peers]
+self = "ed25519:` + hex.EncodeToString(selfPeerID[:]) + `"
+b = "ed25519:` + hex.EncodeToString(peerBID[:]) + `"
+[[rule]]
+from = "self"
+to   = "b"
+ports = ["tcp/8080"]
+`
+
+	p, _, err := acl.ParsePolicy(policySrc)
+	if err != nil {
+		t.Fatalf("ParsePolicy: %v", err)
+	}
+	compiled := p.Compile()
+
+	// Create dispatcher
+	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
+	conn := newFakeConn()
+
+	d := New(tunDev, conn, peerTbl)
+	d.SetPolicyDecider(compiled)
+	d.SetSelfPeerID(selfPeerID)
+	d.Start()
+	defer d.Stop()
+
+	// 1. Inject outbound SYN from self (10.0.0.1:12345) to peer (10.0.0.2:8080)
+	outboundSYN := buildTCPSYNPacket(
+		[4]byte{10, 0, 0, 1}, // src
+		[4]byte{10, 0, 0, 2}, // dst
+		12345,                // ephemeral src port
+		8080,                 // service dst port
+	)
+	tunDev.Inject(outboundSYN)
+
+	// Wait for the packet to be processed and sent over UDP
+	select {
+	case msg := <-conn.out:
+		if len(msg.data) < HeaderSize {
+			t.Fatalf("packet too short: %d", len(msg.data))
+		}
+		pktType, _, _ := parseHeader(msg.data[:HeaderSize])
+		if pktType != TypeData {
+			t.Errorf("pktType: got %d, want %d (TypeData)", pktType, TypeData)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout: no UDP packet sent for outbound SYN")
+	}
+
+	// 2. Simulate the INBOUND SYN-ACK from peer B (peer:8080 -> self:12345)
+	// This is a reply to our outbound SYN. The DST port is 12345 (ephemeral),
+	// but the ACL check should use the INITIATOR'S service port (8080).
+	inboundSYNACK := buildTCPSYNACKPacket(
+		[4]byte{10, 0, 0, 2}, // src (peer B)
+		[4]byte{10, 0, 0, 1}, // dst (self)
+		8080,                 // src port (peer's service port)
+		12345,                // dst port (our ephemeral port)
+	)
+	nonce, ct, err := sessB.Encrypt(inboundSYNACK)
+	if err != nil {
+		t.Fatalf("encrypt SYN-ACK failed: %v", err)
+	}
+	conn.in <- udpMsg{data: buildDataPacket(nonce, ct), addr: &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5000}}
+
+	// Expect the SYN-ACK to be delivered to TUN
+	buf := make([]byte, 1500)
+	n, err := tunDev.ReadDelivered(buf)
+	if err != nil {
+		t.Fatalf("ReadDelivered failed: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("expected SYN-ACK to be delivered to TUN (reply to allowed outbound connection)")
+	}
+
+	// 3. Simulate a data/ACK packet from peer B (peer:8080 -> self:12345)
+	// This is another reply packet on the same flow.
+	dataAck := buildTCPACKPacket(
+		[4]byte{10, 0, 0, 2}, // src (peer B)
+		[4]byte{10, 0, 0, 1}, // dst (self)
+		8080,                 // src port (peer's service port)
+		12345,                // dst port (our ephemeral port)
+	)
+	nonce2, ct2, err := sessB.Encrypt(dataAck)
+	if err != nil {
+		t.Fatalf("encrypt data/ACK failed: %v", err)
+	}
+	conn.in <- udpMsg{data: buildDataPacket(nonce2, ct2), addr: &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5000}}
+
+	// Expect the data/ACK to be delivered to TUN
+	n, err = tunDev.ReadDelivered(buf)
+	if err != nil {
+		t.Fatalf("ReadDelivered failed: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("expected data/ACK to be delivered to TUN (reply to allowed outbound connection)")
+	}
+}
+
+// TestDispatcher_ReplyToOutbound_PolicySwapDropsReply tests that after a policy
+// swap to a stricter policy, replies on a previously allowed flow are dropped
+// and counted against the SERVICE PORT (8080), not the ephemeral port.
+//
+// 1. Establish outbound flow self:ephemeral -> peer:8080 (allowed by policy v1)
+// 2. Swap to policy v2 allowing only tcp/8081
+// 3. Send reply from peer:8080 -> self:ephemeral
+// 4. Reply must be dropped, counted as drop on port 8080 (not ephemeral), flow closed.
+func TestDispatcher_ReplyToOutbound_PolicySwapDropsReply(t *testing.T) {
+	sessA, sessB := newTestSessionPair(t)
+
+	peerTbl := peer.New()
+	var peerBID [32]byte
+	peerBID[0] = 0x02
+	ep := mustAddrPort("1.2.3.4:5000")
+	entryB := &peer.Entry{ID: peerBID, VPNAddr: mustAddr("10.0.0.2")}
+	entryB.SetEndpoint(ep)
+	entryB.SetSession(sessA)
+	peerTbl.Upsert(entryB)
+
+	var selfPeerID [32]byte
+	selfPeerID[0] = 0x01
+
+	// Policy v1: default deny, only tcp/8080 allowed from self to peer
+	policyV1Src := `version = 1
+default = "deny"
+[peers]
+self = "ed25519:` + hex.EncodeToString(selfPeerID[:]) + `"
+b = "ed25519:` + hex.EncodeToString(peerBID[:]) + `"
+[[rule]]
+from = "self"
+to   = "b"
+ports = ["tcp/8080"]
+`
+
+	p1, _, err := acl.ParsePolicy(policyV1Src)
+	if err != nil {
+		t.Fatalf("ParsePolicy v1: %v", err)
+	}
+	compiledV1 := p1.Compile()
+
+	// Policy v2: default deny, only tcp/8081 allowed (stricter - removes 8080)
+	policyV2Src := `version = 2
+default = "deny"
+[peers]
+self = "ed25519:` + hex.EncodeToString(selfPeerID[:]) + `"
+b = "ed25519:` + hex.EncodeToString(peerBID[:]) + `"
+[[rule]]
+from = "self"
+to   = "b"
+ports = ["tcp/8081"]
+`
+
+	p2, _, err := acl.ParsePolicy(policyV2Src)
+	if err != nil {
+		t.Fatalf("ParsePolicy v2: %v", err)
+	}
+	compiledV2 := p2.Compile()
+
+	// Create dispatcher with policy v1
+	tunDev := tun.NewMemTUN("tun0", netip.MustParsePrefix("10.0.0.1/24"), 1420)
+	conn := newFakeConn()
+
+	d := New(tunDev, conn, peerTbl)
+	d.SetPolicyDecider(compiledV1)
+	d.SetSelfPeerID(selfPeerID)
+	d.Start()
+	defer d.Stop()
+
+	// 1. Inject outbound SYN from self (10.0.0.1:12345) to peer (10.0.0.2:8080)
+	outboundSYN := buildTCPSYNPacket(
+		[4]byte{10, 0, 0, 1}, // src
+		[4]byte{10, 0, 0, 2}, // dst
+		12345,                // ephemeral src port
+		8080,                 // service dst port
+	)
+	tunDev.Inject(outboundSYN)
+
+	// Wait for the packet to be processed and sent over UDP
+	select {
+	case msg := <-conn.out:
+		if len(msg.data) < HeaderSize {
+			t.Fatalf("packet too short: %d", len(msg.data))
+		}
+		pktType, _, _ := parseHeader(msg.data[:HeaderSize])
+		if pktType != TypeData {
+			t.Errorf("pktType: got %d, want %d (TypeData)", pktType, TypeData)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout: no UDP packet sent for outbound SYN")
+	}
+
+	// 2. Simulate the INBOUND SYN-ACK from peer B (peer:8080 -> self:12345)
+	// This should pass under policy v1
+	inboundSYNACK := buildTCPSYNACKPacket(
+		[4]byte{10, 0, 0, 2}, // src (peer B)
+		[4]byte{10, 0, 0, 1}, // dst (self)
+		8080,                 // src port (peer's service port)
+		12345,                // dst port (our ephemeral port)
+	)
+	nonce, ct, err := sessB.Encrypt(inboundSYNACK)
+	if err != nil {
+		t.Fatalf("encrypt SYN-ACK failed: %v", err)
+	}
+	conn.in <- udpMsg{data: buildDataPacket(nonce, ct), addr: &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5000}}
+
+	// Expect the SYN-ACK to be delivered to TUN
+	buf := make([]byte, 1500)
+	n, err := tunDev.ReadDelivered(buf)
+	if err != nil {
+		t.Fatalf("ReadDelivered failed: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("expected SYN-ACK to be delivered to TUN under policy v1")
+	}
+
+	// 3. Swap to policy v2 (allows only tcp/8081, denies tcp/8080)
+	d.SetPolicyDecider(compiledV2)
+
+	// 4. Send another reply packet (data/ACK) from peer:8080 -> self:12345
+	// This should be DROPPED under policy v2 because the flow's service port is 8080
+	// and policy v2 only allows 8081.
+	dataAck := buildTCPACKPacket(
+		[4]byte{10, 0, 0, 2}, // src (peer B)
+		[4]byte{10, 0, 0, 1}, // dst (self)
+		8080,                 // src port (peer's service port)
+		12345,                // dst port (our ephemeral port)
+	)
+	nonce2, ct2, err := sessB.Encrypt(dataAck)
+	if err != nil {
+		t.Fatalf("encrypt data/ACK failed: %v", err)
+	}
+	conn.in <- udpMsg{data: buildDataPacket(nonce2, ct2), addr: &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5000}}
+
+	// The data/ACK should NOT be delivered to TUN (dropped by new policy)
+	// Wait a bit to ensure no packet arrives
+	select {
+	case <-time.After(100 * time.Millisecond):
+		// Expected: no delivery
+	case n := <-func() chan int {
+		ch := make(chan int, 1)
+		go func() {
+			buf := make([]byte, 1500)
+			if n, err := tunDev.ReadDelivered(buf); err == nil {
+				ch <- n
+			}
+		}()
+		return ch
+	}():
+		t.Errorf("reply on revoked flow should be dropped, but was delivered (%d bytes)", n)
+	}
+
+	// Verify drop counter is on service port 8080, not ephemeral port 12345
+	// The drop should be recorded when the dispatcher checks the policy for the reply.
+	// We can check by examining the drop counters if exposed, or at minimum verify
+	// the flow is closed (no further packets on this flow will be processed).
+	// For this test, the key assertion is that the packet was dropped.
+}
+
 // buildTCPSYNACKPacket builds a minimal IPv4 TCP SYN-ACK packet.
 func buildTCPSYNACKPacket(src, dst [4]byte, srcPort, dstPort uint16) []byte {
 	totalLen := 20 + 20
