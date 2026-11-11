@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 
 	"github.com/veldmesh/veld/internal/acl"
@@ -21,71 +22,74 @@ var (
 	benchmarkUDPPacket          []byte
 	benchmarkPeerID             [32]byte
 	benchmarkOtherPeerID        [32]byte
+	benchmarkOnce               sync.Once
 )
 
-func init() {
-	// Create a test identity
-	id, _ := crypto.Generate()
-	copy(benchmarkPeerID[:], id.Ed25519Public)
+func setupBenchmarks() {
+	benchmarkOnce.Do(func() {
+		// Create a test identity
+		id, _ := crypto.Generate()
+		copy(benchmarkPeerID[:], id.Ed25519Public)
 
-	// Other peer ID
-	benchmarkOtherPeerID[0] = 1
-	benchmarkOtherPeerID[1] = 2
+		// Other peer ID
+		benchmarkOtherPeerID[0] = 1
+		benchmarkOtherPeerID[1] = 2
 
-	// Build a TCP SYN packet
-	benchmarkTCPSYNPacket = buildTCPSYNPacketForBench()
+		// Build a TCP SYN packet
+		benchmarkTCPSYNPacket = buildTCPSYNPacketForBench()
 
-	// Build a UDP packet
-	benchmarkUDPPacket = buildUDPPacketForBench()
+		// Build a UDP packet
+		benchmarkUDPPacket = buildUDPPacketForBench()
 
-	conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
-	defer conn.Close()
+		conn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+		defer conn.Close()
 
-	tunDev := tun.NewMemTUN("benchTUN", netip.MustParsePrefix("10.100.0.1/24"), 1420)
+		tunDev := tun.NewMemTUN("benchTUN", netip.MustParsePrefix("10.100.0.1/24"), 1420)
 
-	// Set up peer table with a valid session
-	tbl := peer.New()
-	entry := &peer.Entry{
-		ID:        benchmarkOtherPeerID,
-		X25519Pub: id.X25519Public,
-		VPNAddr:   netip.MustParseAddr("10.100.0.2"),
-		Name:      "peer2",
-	}
-	ep, _ := netip.ParseAddrPort(conn.LocalAddr().String())
-	entry.SetEndpoint(ep)
-	// Note: session is nil, so handleTunPacket will enqueue and return
-	tbl.Upsert(entry)
+		// Set up peer table with a valid session
+		tbl := peer.New()
+		entry := &peer.Entry{
+			ID:        benchmarkOtherPeerID,
+			X25519Pub: id.X25519Public,
+			VPNAddr:   netip.MustParseAddr("10.100.0.2"),
+			Name:      "peer2",
+		}
+		ep, _ := netip.ParseAddrPort(conn.LocalAddr().String())
+		entry.SetEndpoint(ep)
+		// Note: session is nil, so handleTunPacket will enqueue and return
+		tbl.Upsert(entry)
 
-	// Dispatcher with no policy
-	dispNoPolicy := New(tunDev, conn, tbl)
-	dispNoPolicy.SetSelfPeerID(benchmarkPeerID)
-	dispNoPolicy.Start()
-	benchmarkDispatcherNoPolicy = dispNoPolicy
+		// Dispatcher with no policy
+		dispNoPolicy := New(tunDev, conn, tbl)
+		dispNoPolicy.SetSelfPeerID(benchmarkPeerID)
+		dispNoPolicy.Start()
+		benchmarkDispatcherNoPolicy = dispNoPolicy
 
-	// Dispatcher with 50-rule policy
-	policy50 := create50RulePolicy(benchmarkPeerID, benchmarkOtherPeerID)
-	compiled50 := policy50.Compile()
+		// Dispatcher with 50-rule policy
+		policy50 := create50RulePolicy(benchmarkPeerID, benchmarkOtherPeerID)
+		compiled50 := policy50.Compile()
 
-	tunDev2 := tun.NewMemTUN("benchTUN2", netip.MustParsePrefix("10.100.0.1/24"), 1420)
-	conn2, _ := net.ListenPacket("udp", "127.0.0.1:0")
-	defer conn2.Close()
+		tunDev2 := tun.NewMemTUN("benchTUN2", netip.MustParsePrefix("10.100.0.1/24"), 1420)
+		conn2, _ := net.ListenPacket("udp", "127.0.0.1:0")
+		defer conn2.Close()
 
-	tbl2 := peer.New()
-	entry2 := &peer.Entry{
-		ID:        benchmarkOtherPeerID,
-		X25519Pub: id.X25519Public,
-		VPNAddr:   netip.MustParseAddr("10.100.0.2"),
-		Name:      "peer2",
-	}
-	ep2, _ := netip.ParseAddrPort(conn2.LocalAddr().String())
-	entry2.SetEndpoint(ep2)
-	tbl2.Upsert(entry2)
+		tbl2 := peer.New()
+		entry2 := &peer.Entry{
+			ID:        benchmarkOtherPeerID,
+			X25519Pub: id.X25519Public,
+			VPNAddr:   netip.MustParseAddr("10.100.0.2"),
+			Name:      "peer2",
+		}
+		ep2, _ := netip.ParseAddrPort(conn2.LocalAddr().String())
+		entry2.SetEndpoint(ep2)
+		tbl2.Upsert(entry2)
 
-	disp50 := New(tunDev2, conn2, tbl2)
-	disp50.SetSelfPeerID(benchmarkPeerID)
-	disp50.SetPolicyDecider(compiled50)
-	disp50.Start()
-	benchmarkDispatcher50Rules = disp50
+		disp50 := New(tunDev2, conn2, tbl2)
+		disp50.SetSelfPeerID(benchmarkPeerID)
+		disp50.SetPolicyDecider(compiled50)
+		disp50.Start()
+		benchmarkDispatcher50Rules = disp50
+	})
 }
 
 func buildTCPSYNPacketForBench() []byte {
@@ -155,6 +159,7 @@ func create50RulePolicy(selfPeerID, otherPeerID [32]byte) *acl.Policy {
 
 // BenchmarkHandleTunPacketACL benchmarks just the ACL check portion of handleTunPacket
 func BenchmarkHandleTunPacketACL_NoPolicy(b *testing.B) {
+	setupBenchmarks()
 	d := benchmarkDispatcherNoPolicy
 	pkt := benchmarkTCPSYNPacket
 
@@ -176,6 +181,7 @@ func BenchmarkHandleTunPacketACL_NoPolicy(b *testing.B) {
 }
 
 func BenchmarkHandleTunPacketACL_50Rules(b *testing.B) {
+	setupBenchmarks()
 	d := benchmarkDispatcher50Rules
 	pkt := benchmarkTCPSYNPacket
 
@@ -196,6 +202,7 @@ func BenchmarkHandleTunPacketACL_50Rules(b *testing.B) {
 
 // BenchmarkHandleUDPPacketACL benchmarks just the ACL check portion of handleUDPPacket
 func BenchmarkHandleUDPPacketACL_NoPolicy(b *testing.B) {
+	setupBenchmarks()
 	d := benchmarkDispatcherNoPolicy
 	pkt := benchmarkUDPPacket
 
@@ -213,6 +220,7 @@ func BenchmarkHandleUDPPacketACL_NoPolicy(b *testing.B) {
 }
 
 func BenchmarkHandleUDPPacketACL_50Rules(b *testing.B) {
+	setupBenchmarks()
 	d := benchmarkDispatcher50Rules
 	pkt := benchmarkUDPPacket
 
@@ -231,6 +239,7 @@ func BenchmarkHandleUDPPacketACL_50Rules(b *testing.B) {
 
 // BenchmarkFullHandleTunPacket_NoPolicy benchmarks the full handleTunPacket path (with nil session)
 func BenchmarkFullHandleTunPacket_NoPolicy(b *testing.B) {
+	setupBenchmarks()
 	d := benchmarkDispatcherNoPolicy
 	pkt := benchmarkTCPSYNPacket
 
@@ -241,6 +250,7 @@ func BenchmarkFullHandleTunPacket_NoPolicy(b *testing.B) {
 }
 
 func BenchmarkFullHandleTunPacket_50Rules(b *testing.B) {
+	setupBenchmarks()
 	d := benchmarkDispatcher50Rules
 	pkt := benchmarkTCPSYNPacket
 
@@ -252,6 +262,7 @@ func BenchmarkFullHandleTunPacket_50Rules(b *testing.B) {
 
 // BenchmarkFullHandleUDPPacket_NoPolicy benchmarks the full handleUDPPacket path
 func BenchmarkFullHandleUDPPacket_NoPolicy(b *testing.B) {
+	setupBenchmarks()
 	d := benchmarkDispatcherNoPolicy
 	// Build a full UDP packet with header
 	header := make([]byte, HeaderSize)
@@ -266,6 +277,7 @@ func BenchmarkFullHandleUDPPacket_NoPolicy(b *testing.B) {
 }
 
 func BenchmarkFullHandleUDPPacket_50Rules(b *testing.B) {
+	setupBenchmarks()
 	d := benchmarkDispatcher50Rules
 	header := make([]byte, HeaderSize)
 	binary.BigEndian.PutUint64(header[0:8], 1)

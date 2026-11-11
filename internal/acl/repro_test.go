@@ -43,7 +43,7 @@ func TestFlowTable_SameShardFlood(t *testing.T) {
 
 	// Now insert them all - this should trigger eviction after 64
 	for i, f := range flows {
-		ft.Lookup(f, true, FlowStateNew)
+		ft.Lookup(f, true, FlowStateNew, nil, 0)
 		if i%50 == 0 {
 			fmt.Printf("Inserted %d flows, table size: %d\n", i+1, ft.Len())
 		}
@@ -72,7 +72,7 @@ func TestFlowTable_MillionDistinctFlows(t *testing.T) {
 			Proto:   ProtoTCP,
 			IPv6:    false,
 		}
-		ft.Lookup(f, true, FlowStateNew)
+		ft.Lookup(f, true, FlowStateNew, nil, 0)
 	}
 
 	// Should have evicted to stay within bound
@@ -107,7 +107,7 @@ func TestFlowTable_ConcurrentMillionFlows(t *testing.T) {
 					Proto:   ProtoTCP,
 					IPv6:    false,
 				}
-				ft.Lookup(f, true, FlowStateNew)
+				ft.Lookup(f, true, FlowStateNew, nil, 0)
 			}
 		}(g)
 	}
@@ -139,7 +139,7 @@ func TestFlowTable_LRUListConsistency(t *testing.T) {
 			Proto:   ProtoTCP,
 			IPv6:    false,
 		}
-		ft.Lookup(f, true, FlowStateNew)
+		ft.Lookup(f, true, FlowStateNew, nil, 0)
 	}
 
 	// Count entries in LRU list

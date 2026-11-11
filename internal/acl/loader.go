@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 
@@ -25,7 +26,7 @@ type LocalPolicyLoader struct {
 	selfPeerID    [32]byte // this node's Ed25519 public key
 	peerLookup    func(name string) ([32]byte, bool)
 	swap          *PolicySwap
-	network       PolicyDecider // optional network policy
+	networkSwap   *PolicySwap // optional network policy swap
 	mu            sync.RWMutex
 	stopCh        chan struct{}
 	watcher       *fsnotify.Watcher
@@ -166,18 +167,77 @@ func (dc *DropCounters) RecordDrop(peerID [32]byte, proto Proto, port uint16, ru
 	}
 }
 
+// CombinedSnapshot returns a new DropCounters containing the merged data from
+// this counter and another, without mutating either original.
+// This is safe to call repeatedly for IPC status without double-counting.
+func (dc *DropCounters) CombinedSnapshot(other *DropCounters) *DropCounters {
+	result := NewDropCounters()
+
+	dc.mu.Lock()
+	for peerID, count := range dc.byPeer {
+		result.byPeer[peerID] = count
+	}
+	for ruleIdx, count := range dc.byRule {
+		result.byRule[ruleIdx] = count
+	}
+	for peerID, count := range dc.byOutboundOnly {
+		result.byOutboundOnly[peerID] = count
+	}
+	// Copy recent drops
+	if dc.recentDropsLen > 0 {
+		for i := 0; i < dc.recentDropsLen; i++ {
+			idx := (dc.recentDropsHead + i) % MaxRecentDrops
+			result.recentDrops[result.recentDropsHead] = dc.recentDrops[idx]
+			result.recentDropsHead = (result.recentDropsHead + 1) % MaxRecentDrops
+			result.recentDropsLen++
+		}
+	}
+	dc.mu.Unlock()
+
+	if other != nil {
+		other.mu.Lock()
+		for peerID, count := range other.byPeer {
+			result.byPeer[peerID] += count
+		}
+		for ruleIdx, count := range other.byRule {
+			result.byRule[ruleIdx] += count
+		}
+		for peerID, count := range other.byOutboundOnly {
+			result.byOutboundOnly[peerID] += count
+		}
+		// Merge recent drops (up to MaxRecentDrops)
+		otherEvents := other.RecentDrops()
+		for _, e := range otherEvents {
+			result.recentDrops[result.recentDropsHead] = e
+			result.recentDropsHead = (result.recentDropsHead + 1) % MaxRecentDrops
+			if result.recentDropsLen < MaxRecentDrops {
+				result.recentDropsLen++
+			}
+		}
+		// Sort recent drops by time (oldest first)
+		sort.Slice(result.recentDrops[:result.recentDropsLen], func(i, j int) bool {
+			return result.recentDrops[i].Time.Before(result.recentDrops[j].Time)
+		})
+		// After sorting, oldest is at index 0, so reset head to 0
+		result.recentDropsHead = 0
+		other.mu.Unlock()
+	}
+
+	return result
+}
+
 // NewLocalPolicyLoader creates a new LocalPolicyLoader.
 // selfPeerID is this node's Ed25519 public key.
 // peerLookup resolves a peer name (from the local policy) to an Ed25519 public key.
 // swap is the PolicySwap to update with the compiled local policy.
-// network is the optional network policy to combine with.
-func NewLocalPolicyLoader(path string, selfPeerID [32]byte, peerLookup func(name string) ([32]byte, bool), swap *PolicySwap, network PolicyDecider) *LocalPolicyLoader {
+// networkSwap is the optional network policy swap to combine with.
+func NewLocalPolicyLoader(path string, selfPeerID [32]byte, peerLookup func(name string) ([32]byte, bool), swap *PolicySwap, networkSwap *PolicySwap) *LocalPolicyLoader {
 	return &LocalPolicyLoader{
 		path:         path,
 		selfPeerID:   selfPeerID,
 		peerLookup:   peerLookup,
 		swap:         swap,
-		network:      network,
+		networkSwap:  networkSwap,
 		stopCh:       make(chan struct{}),
 		dropCounters: NewDropCounters(),
 	}
@@ -410,25 +470,27 @@ type PolicyInfo struct {
 	Rules   int
 }
 
-// dynamicCombinedPolicy checks the local policy swap at decision time,
+// dynamicCombinedPolicy checks the local and network policy swaps at decision time,
 // falling through to network policy / allow when no local policy is loaded.
+// An empty network swap (nil policy) means "no network policy" (same as nil).
 // This ensures hot-reloaded policy changes (including file deletion) take
 // effect immediately without requiring SIGHUP.
 type dynamicCombinedPolicy struct {
-	swap    *PolicySwap
-	network PolicyDecider
+	localSwap   *PolicySwap
+	networkSwap *PolicySwap
 }
 
 func (d *dynamicCombinedPolicy) Decide(src, dst [32]byte, proto Proto, port uint16) Decision {
 	// Check local policy at decision time
-	local := d.swap.Load()
+	local := d.localSwap.Load()
 	if local == nil {
 		// No local policy: defer to network policy
-		if d.network == nil {
+		netPolicy := d.networkSwap.Load()
+		if netPolicy == nil {
 			// No local + no network = allow all (no filtering, as pre-ACL)
 			return Decision{Action: ActionAllow, RuleIndex: -1}
 		}
-		return d.network.Decide(src, dst, proto, port)
+		return netPolicy.Decide(src, dst, proto, port)
 	}
 
 	// Local policy exists: combine with network (both must allow)
@@ -436,10 +498,11 @@ func (d *dynamicCombinedPolicy) Decide(src, dst [32]byte, proto Proto, port uint
 	if localDec.Action == ActionDeny {
 		return localDec
 	}
-	if d.network == nil {
+	netPolicy := d.networkSwap.Load()
+	if netPolicy == nil {
 		return localDec
 	}
-	netDec := d.network.Decide(src, dst, proto, port)
+	netDec := netPolicy.Decide(src, dst, proto, port)
 	if netDec.Action == ActionDeny {
 		return netDec
 	}
@@ -451,24 +514,20 @@ func (d *dynamicCombinedPolicy) Decide(src, dst [32]byte, proto Proto, port uint
 }
 
 // CombinedPolicy returns a PolicyDecider that combines local and network policies.
-// The returned decider checks the local policy swap at decision time, so hot-reloaded
+// The returned decider checks both policy swaps at decision time, so hot-reloaded
 // changes (including file deletion) take effect immediately without SIGHUP.
 // If no local policy is loaded, defers to network policy.
 // If both local and network are nil, allows all traffic (no filtering, as pre-ACL).
 func (l *LocalPolicyLoader) CombinedPolicy() PolicyDecider {
-	l.mu.RLock()
-	network := l.network
-	l.mu.RUnlock()
-
 	return &dynamicCombinedPolicy{
-		swap:    l.swap,
-		network: network,
+		localSwap:   l.swap,
+		networkSwap: l.networkSwap,
 	}
 }
 
-// SetNetworkPolicy updates the network policy.
-func (l *LocalPolicyLoader) SetNetworkPolicy(network PolicyDecider) {
+// SetNetworkPolicy sets the network policy swap.
+func (l *LocalPolicyLoader) SetNetworkPolicy(networkSwap *PolicySwap) {
 	l.mu.Lock()
-	l.network = network
+	l.networkSwap = networkSwap
 	l.mu.Unlock()
 }

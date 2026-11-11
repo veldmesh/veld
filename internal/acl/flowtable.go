@@ -12,10 +12,12 @@ import (
 // FlowEntry represents an entry in the flow table.
 type FlowEntry struct {
 	Flow
-	Created    time.Time
-	LastSeen   time.Time
-	State      FlowState
-	IsReplyDir bool // true if this entry represents the reply direction
+	Created              time.Time
+	LastSeen             time.Time
+	State                FlowState
+	IsReplyDir           bool     // true if this entry represents the reply direction
+	InitiatorPeerID      [32]byte // Ed25519 public key of the connection initiator
+	InitiatorServicePort uint16   // The destination port of the original SYN from initiator's perspective
 
 	// Eviction list pointers (used by FlowTable)
 	next *FlowEntry
@@ -260,7 +262,9 @@ func (ft *FlowTable) popOldestEntry() *FlowEntry {
 // Lookup looks up a flow by its key. Returns the entry and whether it was the reply direction.
 // If createIfMissing is true, creates a new entry with the given state.
 // Expired entries are treated as missing (deleted and nil returned).
-func (ft *FlowTable) Lookup(f Flow, createIfMissing bool, initialState FlowState) (*FlowEntry, bool, bool) {
+// If initiator is not nil and a new entry is created, the initiator is stored.
+// The initiatorServicePort is the destination port from the initiator's perspective (the service port).
+func (ft *FlowTable) Lookup(f Flow, createIfMissing bool, initialState FlowState, initiator *[32]byte, initiatorServicePort uint16) (*FlowEntry, bool, bool) {
 	key, isReply := NormalizeFlowKey(f)
 	shardIdx := ft.hashFlowKey(key) & uint64(ft.shardMask)
 	shard := ft.shards[shardIdx]
@@ -303,11 +307,16 @@ func (ft *FlowTable) Lookup(f Flow, createIfMissing bool, initialState FlowState
 	}
 
 	entry = &FlowEntry{
-		Flow:       f,
-		Created:    now,
-		LastSeen:   now,
-		State:      initialState,
-		IsReplyDir: isReply,
+		Flow:                 f,
+		Created:              now,
+		LastSeen:             now,
+		State:                initialState,
+		IsReplyDir:           isReply,
+		InitiatorPeerID:      [32]byte{},
+		InitiatorServicePort: initiatorServicePort,
+	}
+	if initiator != nil {
+		entry.InitiatorPeerID = *initiator
 	}
 	shard.flows[key] = entry
 	// Add to front of LRU list

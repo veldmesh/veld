@@ -5,6 +5,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -35,7 +36,7 @@ func TestIPCServer_Status(t *testing.T) {
 	socketPath := tempSock(t)
 
 	stopCh := make(chan struct{})
-	srv := NewIPCServer(socketPath, func() { close(stopCh) }, nil)
+	srv := NewIPCServer(socketPath, func() { close(stopCh) }, nil, nil)
 
 	err := srv.Start()
 	if err != nil {
@@ -81,7 +82,7 @@ func TestIPCServer_Status(t *testing.T) {
 func TestIPCServer_UpdateStatus(t *testing.T) {
 	socketPath := tempSock(t)
 
-	srv := NewIPCServer(socketPath, func() {}, nil)
+	srv := NewIPCServer(socketPath, func() {}, nil, nil)
 	err := srv.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -143,7 +144,7 @@ func TestIPCServer_Shutdown(t *testing.T) {
 	socketPath := tempSock(t)
 
 	stopped := make(chan struct{})
-	srv := NewIPCServer(socketPath, func() { close(stopped) }, nil)
+	srv := NewIPCServer(socketPath, func() { close(stopped) }, nil, nil)
 
 	err := srv.Start()
 	if err != nil {
@@ -184,7 +185,7 @@ func TestIPCServer_Shutdown(t *testing.T) {
 func TestIPCServer_MethodNotAllowed(t *testing.T) {
 	socketPath := tempSock(t)
 
-	srv := NewIPCServer(socketPath, func() {}, nil)
+	srv := NewIPCServer(socketPath, func() {}, nil, nil)
 	err := srv.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -242,7 +243,7 @@ func TestPeerTableSnapshot(t *testing.T) {
 func TestIPCServer_StartStop(t *testing.T) {
 	socketPath := tempSock(t)
 
-	srv := NewIPCServer(socketPath, func() {}, nil)
+	srv := NewIPCServer(socketPath, func() {}, nil, nil)
 
 	// Test that Start/Stop work
 	err := srv.Start()
@@ -295,12 +296,27 @@ func (m *mockPolicyProvider) LocalPolicyStatus() ipctypes.LocalPolicyStatus {
 	return m.localPolicy
 }
 
+func (m *mockPolicyProvider) NetworkPolicyStatus() ipctypes.NetworkPolicyStatus {
+	return ipctypes.NetworkPolicyStatus{}
+}
+
 func (m *mockPolicyProvider) DropCounters() *acl.DropCounters {
 	return m.dropCounters
 }
 
 func (m *mockPolicyProvider) RecentDrops() []ipctypes.DropEvent {
 	return m.recentDrops
+}
+
+// mockNetworkPolicyReloader implements NetworkPolicyReloader for testing.
+type mockNetworkPolicyReloader struct {
+	reloadCalled bool
+	reloadErr    error
+}
+
+func (m *mockNetworkPolicyReloader) ReloadNetworkPolicy() error {
+	m.reloadCalled = true
+	return m.reloadErr
 }
 
 // TestIPCServer_PolicyStatus tests the /api/policy/status endpoint.
@@ -364,7 +380,7 @@ ports = ["tcp/22"]
 		},
 	}
 
-	srv := NewIPCServer(socketPath, func() {}, mock)
+	srv := NewIPCServer(socketPath, func() {}, mock, nil)
 
 	err := srv.Start()
 	if err != nil {
@@ -472,7 +488,7 @@ func TestIPCServer_PolicyStatus_NoPolicy(t *testing.T) {
 		recentDrops:  nil,
 	}
 
-	srv := NewIPCServer(socketPath, func() {}, mock)
+	srv := NewIPCServer(socketPath, func() {}, mock, nil)
 
 	err := srv.Start()
 	if err != nil {
@@ -528,7 +544,7 @@ func TestIPCServer_PolicyStatus_NoPolicy(t *testing.T) {
 func TestIPCServer_PolicyStatus_MethodNotAllowed(t *testing.T) {
 	socketPath := tempSock(t)
 
-	srv := NewIPCServer(socketPath, func() {}, nil)
+	srv := NewIPCServer(socketPath, func() {}, nil, nil)
 	err := srv.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -556,3 +572,187 @@ func TestIPCServer_PolicyStatus_MethodNotAllowed(t *testing.T) {
 		t.Errorf("expected 405, got %d", resp.StatusCode)
 	}
 }
+
+// TestIPCServer_ReloadNetworkPolicy tests the /api/policy/reload-network endpoint.
+func TestIPCServer_ReloadNetworkPolicy(t *testing.T) {
+	socketPath := tempSock(t)
+
+	reloader := &mockNetworkPolicyReloader{}
+
+	srv := NewIPCServer(socketPath, func() {}, nil, reloader)
+
+	err := srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+
+	// First POST should succeed
+	resp, err := client.Post("http://daemon/api/policy/reload-network", "application/json", nil)
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("first POST: expected 200, got %d", resp.StatusCode)
+	}
+	if !reloader.reloadCalled {
+		t.Error("expected ReloadNetworkPolicy to be called")
+	}
+
+	// Immediate second POST should be rate limited (429)
+	reloader.reloadCalled = false
+	resp, err = client.Post("http://daemon/api/policy/reload-network", "application/json", nil)
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("second POST (rate limited): expected 429, got %d", resp.StatusCode)
+	}
+	if reloader.reloadCalled {
+		t.Error("expected ReloadNetworkPolicy NOT to be called due to rate limit")
+	}
+
+	// After waiting >1s, third POST should succeed
+	time.Sleep(1100 * time.Millisecond)
+	reloader.reloadCalled = false
+	resp, err = client.Post("http://daemon/api/policy/reload-network", "application/json", nil)
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("third POST (after wait): expected 200, got %d", resp.StatusCode)
+	}
+	if !reloader.reloadCalled {
+		t.Error("expected ReloadNetworkPolicy to be called after rate limit window")
+	}
+}
+
+// TestIPCServer_ReloadNetworkPolicy_NoReloader tests the endpoint when no reloader is configured.
+func TestIPCServer_ReloadNetworkPolicy_NoReloader(t *testing.T) {
+	socketPath := tempSock(t)
+
+	srv := NewIPCServer(socketPath, func() {}, nil, nil)
+
+	err := srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+
+	resp, err := client.Post("http://daemon/api/policy/reload-network", "application/json", nil)
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 (no network policy configured), got %d", resp.StatusCode)
+	}
+}
+
+// TestIPCServer_ReloadNetworkPolicy_MethodNotAllowed tests that GET to the reload endpoint fails.
+func TestIPCServer_ReloadNetworkPolicy_MethodNotAllowed(t *testing.T) {
+	socketPath := tempSock(t)
+
+	srv := NewIPCServer(socketPath, func() {}, nil, nil)
+
+	err := srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+
+	resp, err := client.Get("http://daemon/api/policy/reload-network")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", resp.StatusCode)
+	}
+}
+
+// TestIPCServer_ReloadNetworkPolicy_ReloadError tests that errors from the reloader are returned.
+func TestIPCServer_ReloadNetworkPolicy_ReloadError(t *testing.T) {
+	socketPath := tempSock(t)
+
+	reloader := &mockNetworkPolicyReloader{
+		reloadErr: errTestFailure,
+	}
+
+	srv := NewIPCServer(socketPath, func() {}, nil, reloader)
+
+	err := srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+
+	resp, err := client.Post("http://daemon/api/policy/reload-network", "application/json", nil)
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "test failure\n" {
+		t.Errorf("expected error message 'test failure\\n', got %q", string(body))
+	}
+}
+
+var errTestFailure = errors.New("test failure")

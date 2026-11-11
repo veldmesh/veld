@@ -39,34 +39,45 @@ type PeerStatus struct {
 // PolicyStatusProvider provides policy status for the IPC endpoint.
 type PolicyStatusProvider interface {
 	LocalPolicyStatus() ipctypes.LocalPolicyStatus
+	NetworkPolicyStatus() ipctypes.NetworkPolicyStatus
 	DropCounters() *acl.DropCounters
 	RecentDrops() []ipctypes.DropEvent
 }
 
+// NetworkPolicyReloader provides network policy reload capability via IPC.
+type NetworkPolicyReloader interface {
+	ReloadNetworkPolicy() error
+}
+
 // IPCServer is an HTTP server on a Unix domain socket that exposes daemon state.
 type IPCServer struct {
-	socketPath     string
-	mu             sync.Mutex
-	status         StatusResponse
-	stopFn         func()
-	srv            *http.Server
-	listener       net.Listener
-	policyProvider PolicyStatusProvider
+	socketPath        string
+	mu                sync.Mutex
+	status            StatusResponse
+	stopFn            func()
+	srv               *http.Server
+	listener          net.Listener
+	policyProvider    PolicyStatusProvider
+	netPolicyReloader NetworkPolicyReloader
+	lastReloadTime    time.Time
 }
 
 // NewIPCServer creates an IPC server at the given socket path.
 // stopFn is invoked when POST /api/shutdown is received.
 // policyProvider provides policy status for /api/policy/status.
-func NewIPCServer(socketPath string, stopFn func(), policyProvider PolicyStatusProvider) *IPCServer {
+// netPolicyReloader provides network policy reload capability (can be nil).
+func NewIPCServer(socketPath string, stopFn func(), policyProvider PolicyStatusProvider, netPolicyReloader NetworkPolicyReloader) *IPCServer {
 	s := &IPCServer{
-		socketPath:     socketPath,
-		stopFn:         stopFn,
-		policyProvider: policyProvider,
+		socketPath:        socketPath,
+		stopFn:            stopFn,
+		policyProvider:    policyProvider,
+		netPolicyReloader: netPolicyReloader,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/shutdown", s.handleShutdown)
 	mux.HandleFunc("/api/policy/status", s.handlePolicyStatus)
+	mux.HandleFunc("/api/policy/reload-network", s.handleReloadNetworkPolicy)
 	s.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	return s
 }
@@ -77,6 +88,13 @@ func (s *IPCServer) SetPolicyProvider(p PolicyStatusProvider) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.policyProvider = p
+}
+
+// SetNetworkPolicyReloader sets the network policy reloader.
+func (s *IPCServer) SetNetworkPolicyReloader(r NetworkPolicyReloader) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.netPolicyReloader = r
 }
 
 // UpdateStatus atomically replaces the cached status.
@@ -160,16 +178,45 @@ func (s *IPCServer) handlePolicyStatus(w http.ResponseWriter, r *http.Request) {
 
 	if provider != nil {
 		resp.LocalPolicy = provider.LocalPolicyStatus()
+		resp.NetworkPolicy = provider.NetworkPolicyStatus()
 		resp.DropCounters = dropCountersToStatus(provider.DropCounters())
 		resp.RecentDrops = provider.RecentDrops()
 	}
-	// Network policy is a placeholder until the signed-policy story
-	resp.NetworkPolicy = ipctypes.NetworkPolicyStatus{}
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 	}
+}
+
+func (s *IPCServer) handleReloadNetworkPolicy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.mu.Lock()
+	reloader := s.netPolicyReloader
+	now := time.Now()
+	if now.Sub(s.lastReloadTime) < time.Second {
+		s.mu.Unlock()
+		http.Error(w, "rate limited: wait 1 second between reloads", http.StatusTooManyRequests)
+		return
+	}
+	s.lastReloadTime = now
+	s.mu.Unlock()
+
+	if reloader == nil {
+		http.Error(w, "network policy not configured", http.StatusNotFound)
+		return
+	}
+
+	if err := reloader.ReloadNetworkPolicy(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
 
 func dropCountersToStatus(dc *acl.DropCounters) ipctypes.DropCountersStatus {

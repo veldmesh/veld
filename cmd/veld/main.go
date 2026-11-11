@@ -604,7 +604,7 @@ func openTofuStore() (*tofu.Store, error) {
 var policyCmd = &cobra.Command{
 	Use:   "policy",
 	Short: "Manage ACL policies",
-	Long:  "Validate, test, and inspect ACL policies.",
+	Long:  "Validate, test, sign, and inspect ACL policies.",
 }
 
 var (
@@ -613,7 +613,7 @@ var (
 
 func init() {
 	policyCmd.PersistentFlags().StringVar(&policyConfigPath, "config", "", "config file path (default: ~/.config/veld/config.toml)")
-	policyCmd.AddCommand(policyCheckCmd, policyTestCmd, policyStatusCmd)
+	policyCmd.AddCommand(policyCheckCmd, policyTestCmd, policyStatusCmd, policyKeygenCmd, policySignCmd, policyReloadCmd)
 }
 
 // --- POLICY CHECK command ---
@@ -902,6 +902,138 @@ func ruleIdxToString(idx int) string {
 	default:
 		return fmt.Sprintf("rule %d", idx)
 	}
+}
+
+// --- POLICY KEYGEN command ---
+
+var policyKeygenCmd = &cobra.Command{
+	Use:   "keygen",
+	Short: "Generate an admin key pair for signing network policies",
+	Long: `Generate an Ed25519 key pair for signing network policies.
+This key is separate from node keys and should be kept secure (offline if possible).
+The private key is written to a file with 0600 permissions.
+The public key is printed to stdout.`,
+	RunE: runPolicyKeygen,
+}
+
+var (
+	policyKeygenOut string
+)
+
+func init() {
+	policyKeygenCmd.Flags().StringVar(&policyKeygenOut, "out", "admin.key", "output file for private key")
+}
+
+func runPolicyKeygen(cobraCmd *cobra.Command, args []string) error {
+	privKey, pubKey, err := acl.GenerateAdminKey()
+	if err != nil {
+		return fmt.Errorf("generate admin key: %w", err)
+	}
+
+	// Write private key to file
+	if err := acl.WriteAdminKeyFile(policyKeygenOut, privKey); err != nil {
+		return fmt.Errorf("write admin key: %w", err)
+	}
+
+	// Print public key
+	encodedPub := base64.StdEncoding.EncodeToString(pubKey)
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "ed25519:%s\n", encodedPub)
+	_, _ = fmt.Fprintf(cobraCmd.ErrOrStderr(), "Private key written to %s (0600)\n", policyKeygenOut)
+	_, _ = fmt.Fprintf(cobraCmd.ErrOrStderr(), "Keep this key secure! It is used to sign network policies.\n")
+
+	return nil
+}
+
+// --- POLICY SIGN command ---
+
+var policySignCmd = &cobra.Command{
+	Use:   "sign <policy.toml>",
+	Short: "Sign a policy file with an admin key",
+	Long: `Sign a policy TOML file with an admin private key, producing a signed network policy envelope.
+The envelope includes the canonical policy, version, signer public key, and Ed25519 signature.
+Refuses to overwrite an existing output file if its version is >= the new policy's version.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPolicySign,
+}
+
+var (
+	policySignKey string
+	policySignOut string
+)
+
+func init() {
+	policySignCmd.Flags().StringVar(&policySignKey, "key", "", "admin private key file (required)")
+	policySignCmd.Flags().StringVar(&policySignOut, "out", "policy.signed", "output file for signed policy")
+	_ = policySignCmd.MarkFlagRequired("key")
+}
+
+func runPolicySign(cobraCmd *cobra.Command, args []string) error {
+	policyPath := args[0]
+
+	// Read policy TOML
+	policyData, err := os.ReadFile(policyPath)
+	if err != nil {
+		return fmt.Errorf("read policy file: %w", err)
+	}
+
+	// Read admin private key
+	privKey, err := acl.ReadAdminKeyFile(policySignKey)
+	if err != nil {
+		return fmt.Errorf("read admin key: %w", err)
+	}
+
+	// Sign the policy
+	envelope, err := acl.SignPolicy(string(policyData), privKey)
+	if err != nil {
+		return fmt.Errorf("sign policy: %w", err)
+	}
+
+	// Parse to get version for write check
+	p, _, err := acl.ParsePolicy(string(policyData))
+	if err != nil {
+		return fmt.Errorf("parse policy: %w", err)
+	}
+
+	// Write signed policy envelope
+	if err := acl.WriteNetworkPolicyFile(policySignOut, envelope, p.Version); err != nil {
+		return fmt.Errorf("write signed policy: %w", err)
+	}
+
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "Signed policy written to %s (version %d)\n", policySignOut, p.Version)
+	return nil
+}
+
+// --- POLICY RELOAD command ---
+
+var policyReloadCmd = &cobra.Command{
+	Use:   "reload",
+	Short: "Reload the network policy from disk via daemon IPC",
+	Long: `Triggers the running daemon to reload the network policy file.
+Requires the daemon to be running with a network policy configured.`,
+	RunE: runPolicyReload,
+}
+
+func runPolicyReload(cobraCmd *cobra.Command, args []string) error {
+	sock := getSocketPath()
+
+	if !isRunning(sock) {
+		return fmt.Errorf("daemon not running")
+	}
+
+	client := newSocketClient(sock)
+	resp, err := client.Post("http://daemon/api/policy/reload-network", "application/json", nil)
+	if err != nil {
+		return fmt.Errorf("reload request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("reload failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "network policy reloaded\n")
+	return nil
 }
 
 // --- Helpers ---

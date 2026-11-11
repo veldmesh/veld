@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/veldmesh/veld/internal/acl"
 )
 
 // DNSConfig configures the local DNS stub resolver.
@@ -60,9 +61,11 @@ type CoordConfig struct {
 	RelayX25519 string `toml:"relay_x25519"` // base64 32-byte pinned relay static key; required if relay_addr set
 }
 
-// PolicyConfig holds local ACL policy settings.
+// PolicyConfig holds ACL policy settings.
 type PolicyConfig struct {
-	LocalFile string `toml:"local_file"` // path to local policy TOML file; empty = no local policy
+	LocalFile   string   `toml:"local_file"`   // path to local policy TOML file; empty = no local policy
+	NetworkFile string   `toml:"network_file"` // path to signed network policy file; empty = no network policy
+	AdminKeys   []string `toml:"admin_keys"`   // pinned admin public keys for network policy verification; "ed25519:<base64 or hex>"
 }
 
 // DaemonConfig holds daemon process settings.
@@ -136,6 +139,13 @@ func (c *Config) Validate() error {
 		b, err := base64.StdEncoding.DecodeString(c.Coord.RelayX25519)
 		if err != nil || len(b) != 32 {
 			return fmt.Errorf("config: coord.relay_x25519 must be a base64-encoded 32-byte key when coord.relay_addr is set")
+		}
+	}
+
+	// Validate admin keys using acl.ParseAdminKeys (single implementation)
+	if len(c.Daemon.Policy.AdminKeys) > 0 {
+		if _, err := acl.ParseAdminKeys(c.Daemon.Policy.AdminKeys); err != nil {
+			return fmt.Errorf("config: daemon.policy.admin_keys: %w", err)
 		}
 	}
 

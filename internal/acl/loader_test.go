@@ -24,9 +24,10 @@ alice = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 	}
 
 	swap := &PolicySwap{}
+	networkSwap := &PolicySwap{}
 	loader := NewLocalPolicyLoader(policyPath, [32]byte{}, func(name string) ([32]byte, bool) {
 		return [32]byte{}, false
-	}, swap, nil)
+	}, swap, networkSwap)
 
 	err := loader.Load()
 	if err == nil {
@@ -71,9 +72,10 @@ ports = ["*"]
 	t.Logf("file mode: %o, full mode: %o", info.Mode().Perm(), info.Mode())
 
 	swap := &PolicySwap{}
+	networkSwap := &PolicySwap{}
 	loader := NewLocalPolicyLoader(policyPath, [32]byte{}, func(name string) ([32]byte, bool) {
 		return [32]byte{}, false
-	}, swap, nil)
+	}, swap, networkSwap)
 
 	err = loader.Load()
 	if err == nil {
@@ -115,9 +117,10 @@ ports = ["*"]
 	t.Logf("file mode: %o, full mode: %o", info.Mode().Perm(), info.Mode())
 
 	swap := &PolicySwap{}
+	networkSwap := &PolicySwap{}
 	loader := NewLocalPolicyLoader(policyPath, [32]byte{}, func(name string) ([32]byte, bool) {
 		return [32]byte{}, false
-	}, swap, nil)
+	}, swap, networkSwap)
 
 	err = loader.Load()
 	if err == nil {
@@ -145,9 +148,10 @@ ports = ["*"]
 	}
 
 	swap := &PolicySwap{}
+	networkSwap := &PolicySwap{}
 	loader := NewLocalPolicyLoader(policyPath, [32]byte{}, func(name string) ([32]byte, bool) {
 		return [32]byte{}, false
-	}, swap, nil)
+	}, swap, networkSwap)
 
 	err := loader.Load()
 	if err != nil {
@@ -160,9 +164,10 @@ func TestLocalPolicyLoader_Load_MissingFile(t *testing.T) {
 	policyPath := filepath.Join(tmpDir, "nonexistent.toml")
 
 	swap := &PolicySwap{}
+	networkSwap := &PolicySwap{}
 	loader := NewLocalPolicyLoader(policyPath, [32]byte{}, func(name string) ([32]byte, bool) {
 		return [32]byte{}, false
-	}, swap, nil)
+	}, swap, networkSwap)
 
 	err := loader.Load()
 	if err != nil {
@@ -187,12 +192,14 @@ func TestLocalPolicyLoader_Load_MissingFile_WithNetworkDeny(t *testing.T) {
 		"a": {1},
 		"b": {2},
 	}
-	network := makeTestPolicy(DefaultDeny, nil, peers, nil, nil)
+	networkPolicy := makeTestPolicy(DefaultDeny, nil, peers, nil, nil)
+	networkSwap := &PolicySwap{}
+	networkSwap.Store(networkPolicy)
 
 	swap := &PolicySwap{}
 	loader := NewLocalPolicyLoader(policyPath, [32]byte{}, func(name string) ([32]byte, bool) {
 		return [32]byte{}, false
-	}, swap, network)
+	}, swap, networkSwap)
 
 	err := loader.Load()
 	if err != nil {
@@ -229,9 +236,10 @@ ports = ["*"]
 	}
 
 	swap := &PolicySwap{}
+	networkSwap := &PolicySwap{}
 	loader := NewLocalPolicyLoader(policyPath, [32]byte{}, func(name string) ([32]byte, bool) {
 		return [32]byte{}, false
-	}, swap, nil)
+	}, swap, networkSwap)
 
 	if err := loader.Load(); err != nil {
 		t.Fatalf("first load failed: %v", err)
@@ -402,7 +410,8 @@ bob   = "ed25519:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
 	}
 
 	swap := &PolicySwap{}
-	loader := NewLocalPolicyLoader(policyPath, alice, peerLookup, swap, nil)
+	networkSwap := &PolicySwap{}
+	loader := NewLocalPolicyLoader(policyPath, alice, peerLookup, swap, networkSwap)
 
 	err := loader.Load()
 	if err != nil {
@@ -446,7 +455,8 @@ bob   = "ed25519:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
 	}
 
 	swap := &PolicySwap{}
-	loader := NewLocalPolicyLoader(policyPath, alice, peerLookup, swap, nil)
+	networkSwap := &PolicySwap{}
+	loader := NewLocalPolicyLoader(policyPath, alice, peerLookup, swap, networkSwap)
 
 	err := loader.Load()
 	if err != nil {
@@ -472,14 +482,16 @@ func TestLocalPolicyLoader_Load_NetworkPolicyWithMissingLocal(t *testing.T) {
 		"b": {2},
 	}
 	// Network policy allows a->b
-	network := makeTestPolicy(DefaultAllow, []Rule{
+	networkPolicy := makeTestPolicy(DefaultAllow, []Rule{
 		{From: "a", To: "b", Ports: []PortRange{{Proto: ProtoTCP, Start: 22, End: 22}}},
 	}, peers, nil, nil)
+	networkSwap := &PolicySwap{}
+	networkSwap.Store(networkPolicy)
 
 	swap := &PolicySwap{}
 	loader := NewLocalPolicyLoader(policyPath, [32]byte{}, func(name string) ([32]byte, bool) {
 		return [32]byte{}, false
-	}, swap, network)
+	}, swap, networkSwap)
 
 	err := loader.Load()
 	if err != nil {
@@ -493,14 +505,16 @@ func TestLocalPolicyLoader_Load_NetworkPolicyWithMissingLocal(t *testing.T) {
 	}
 
 	// Test with network deny default
-	networkDeny := makeTestPolicy(DefaultDeny, []Rule{
+	networkDenyPolicy := makeTestPolicy(DefaultDeny, []Rule{
 		{From: "a", To: "b", Ports: []PortRange{{Proto: ProtoTCP, Start: 22, End: 22}}},
 	}, peers, nil, nil)
+	networkDenySwap := &PolicySwap{}
+	networkDenySwap.Store(networkDenyPolicy)
 
 	swap2 := &PolicySwap{}
 	loader2 := NewLocalPolicyLoader(policyPath, [32]byte{}, func(name string) ([32]byte, bool) {
 		return [32]byte{}, false
-	}, swap2, networkDeny)
+	}, swap2, networkDenySwap)
 
 	if err := loader2.Load(); err != nil {
 		t.Fatalf("load: %v", err)
