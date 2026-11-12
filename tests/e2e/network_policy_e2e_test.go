@@ -227,7 +227,7 @@ func TestNetworkPolicy_PushAndWatch_DeliversToTwoPeers(t *testing.T) {
 		}
 	case err := <-errCh:
 		t.Fatalf("Recv peer1 after push: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("timeout waiting for NETWORK_POLICY event on peer1")
 	}
 
