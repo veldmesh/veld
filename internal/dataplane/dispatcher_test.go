@@ -220,10 +220,7 @@ func TestDispatcher_UDPToTun(t *testing.T) {
 
 	// Expect the decrypted packet to appear on TUN via ReadDelivered
 	buf := make([]byte, 1500)
-	n, err := tunDev.ReadDelivered(buf)
-	if err != nil {
-		t.Fatalf("ReadDelivered failed: %v", err)
-	}
+	n := mustReadDelivered(t, tunDev, buf, 2*time.Second)
 	if string(buf[:n]) != string(want) {
 		t.Errorf("decrypted payload mismatch: got %q, want %q", buf[:n], want)
 	}
