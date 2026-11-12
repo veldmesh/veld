@@ -339,9 +339,11 @@ func (d *Dispatcher) handleTunPacket(pkt []byte) {
 		return
 	}
 
-	// Record flow for reply tracking (outbound direction)
+	// Record flow for reply tracking (outbound direction).
+	// For connection starts (KindStart), we are the initiator.
 	if kind == acl.KindStart {
-		d.flowTable.Lookup(flow, true, acl.FlowStateEstablished)
+		// Store the service port (flow.DstPort) for reply checks
+		d.flowTable.Lookup(flow, true, acl.FlowStateEstablished, &d.selfPeerID, flow.DstPort)
 	}
 
 	udpPkt := buildDataPacket(nonce, ct)
@@ -402,26 +404,25 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 				return
 			}
 
-			// Only create flow entries for allowed connections.
-			// For connection starts (KindStart), check ACL first.
-			// For other kinds, only allow if they belong to an established flow.
 			srcPeerID := entry.ID
 			dstPeerID := d.selfPeerID
 
 			switch kind {
 			case acl.KindStart:
-				// New inbound connection start: check ACL before creating flow
+				// New inbound connection start: check ACL before creating flow.
+				// The peer (srcPeerID) is the initiator.
 				dec := pd.Decide(srcPeerID, dstPeerID, flow.Proto, flow.DstPort)
 				if dec.Action == acl.ActionDeny {
 					d.recordDrop(srcPeerID, dec, kind, flow.Proto, flow.DstPort)
 					return
 				}
-				// Allowed: create flow entry as established
-				d.flowTable.Lookup(flow, true, acl.FlowStateEstablished)
+				// Allowed: create flow entry as established with peer as initiator
+				// Store the service port (flow.DstPort) for reply checks
+				d.flowTable.Lookup(flow, true, acl.FlowStateEstablished, &srcPeerID, flow.DstPort)
 
 			case acl.KindEnd:
 				// Connection end (FIN/RST): only pass if flow exists and is established
-				flowEntry, _, created := d.flowTable.Lookup(flow, false, acl.FlowStateNew)
+				flowEntry, _, created := d.flowTable.Lookup(flow, false, acl.FlowStateNew, nil, 0)
 				if !created && flowEntry != nil && flowEntry.State == acl.FlowStateEstablished {
 					d.flowTable.UpdateState(flow, acl.FlowStateClosing)
 				} else {
@@ -431,7 +432,7 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 
 			case acl.KindFragment, acl.KindError:
 				// Fragments and ICMP errors: only pass for established flows
-				flowEntry, _, created := d.flowTable.Lookup(flow, false, acl.FlowStateNew)
+				flowEntry, _, created := d.flowTable.Lookup(flow, false, acl.FlowStateNew, nil, 0)
 				if created || flowEntry == nil || flowEntry.State != acl.FlowStateEstablished {
 					d.recordDrop(srcPeerID, acl.Decision{Action: acl.ActionDeny, RuleIndex: -1}, kind, flow.Proto, flow.DstPort)
 					return
@@ -439,10 +440,38 @@ func (d *Dispatcher) handleUDPPacket(pkt []byte, addr net.Addr) {
 				flowEntry.LastSeen = time.Now()
 
 			case acl.KindOther:
-				// Other packets (TCP ACK/data, UDP replies, etc.): only pass for established flows
-				flowEntry, _, created := d.flowTable.Lookup(flow, false, acl.FlowStateNew)
+				// Other packets (TCP ACK/data, UDP replies, etc.): check ACL using the
+				// ORIGINAL initiator's direction to respect policy swaps and allow replies.
+				// Only pass for established flows that are still allowed by current policy.
+				flowEntry, _, created := d.flowTable.Lookup(flow, false, acl.FlowStateNew, nil, 0)
 				if created || flowEntry == nil || flowEntry.State != acl.FlowStateEstablished {
 					d.recordDrop(srcPeerID, acl.Decision{Action: acl.ActionDeny, RuleIndex: -1}, kind, flow.Proto, flow.DstPort)
+					return
+				}
+				// ACL check for established flow using the stored initiator and SERVICE PORT.
+				// The initiator is the peer that started the connection.
+				initiator := flowEntry.InitiatorPeerID
+				var responder [32]byte
+				// Determine responder: if initiator is self, responder is peer; else responder is self.
+				switch initiator {
+				case d.selfPeerID:
+					responder = srcPeerID
+				case srcPeerID:
+					responder = d.selfPeerID
+				default:
+					// Unknown initiator (shouldn't happen for established flows), deny
+					d.recordDrop(srcPeerID, acl.Decision{Action: acl.ActionDeny, RuleIndex: -1}, kind, flow.Proto, flow.DstPort)
+					d.flowTable.UpdateState(flow, acl.FlowStateClosing)
+					return
+				}
+				// Use the stored service port (the destination port from the initiator's SYN)
+				// instead of the reply packet's destination port (which is the ephemeral port).
+				servicePort := flowEntry.InitiatorServicePort
+				dec := pd.Decide(initiator, responder, flow.Proto, servicePort)
+				if dec.Action == acl.ActionDeny {
+					d.recordDrop(srcPeerID, dec, kind, flow.Proto, servicePort)
+					// Expire the flow so subsequent packets are also dropped
+					d.flowTable.UpdateState(flow, acl.FlowStateClosing)
 					return
 				}
 				flowEntry.LastSeen = time.Now()

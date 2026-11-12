@@ -60,10 +60,12 @@ type Daemon struct {
 	conn             net.PacketConn // data-plane UDP socket
 
 	// ACL policy
-	policySwap    *acl.PolicySwap
-	policyLoader  *acl.LocalPolicyLoader
-	policyDecider acl.PolicyDecider // combined local + network
-	selfPeerID    [32]byte
+	localPolicySwap *acl.PolicySwap
+	netPolicySwap   *acl.PolicySwap
+	policyLoader    *acl.LocalPolicyLoader
+	netPolicyLoader *acl.NetworkPolicyLoader
+	policyDecider   acl.PolicyDecider // combined local + network
+	selfPeerID      [32]byte
 
 	mu              sync.Mutex
 	vpnAddr         netip.Addr
@@ -235,8 +237,9 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	d.selfPeerID = selfPeerID
 	userspace := cfg.Node.Userspace
 
-	// Initialize ACL policy swap and loader
-	d.policySwap = &acl.PolicySwap{}
+	// Initialize ACL policy swaps (separate for local and network)
+	d.localPolicySwap = &acl.PolicySwap{}
+	d.netPolicySwap = &acl.PolicySwap{}
 
 	// Determine local policy file path
 	localPolicyPath := ""
@@ -258,7 +261,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 		return [32]byte{}, false
 	}
 
-	d.policyLoader = acl.NewLocalPolicyLoader(localPolicyPath, selfPeerID, peerLookup, d.policySwap, nil)
+	d.policyLoader = acl.NewLocalPolicyLoader(localPolicyPath, selfPeerID, peerLookup, d.localPolicySwap, nil)
 
 	// Load local policy BEFORE creating TUN (no unfiltered window on restart)
 	if err := d.policyLoader.Load(); err != nil {
@@ -266,7 +269,41 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 		return nil, fmt.Errorf("load local policy: %w", err)
 	}
 
-	// Combined policy decider (local + network, network is nil for now)
+	// Parse admin keys for network policy verification
+	adminKeys, err := acl.ParseAdminKeys(cfg.Daemon.Policy.AdminKeys)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("parse admin keys: %w", err)
+	}
+
+	// Initialize network policy loader (always, so we can load stored policy)
+	// The loader watches the file only if NetworkFile is configured.
+	networkPolicyPath := cfg.Daemon.Policy.NetworkFile
+	d.netPolicyLoader = acl.NewNetworkPolicyLoader(networkPolicyPath, cfg.Node.IdentityPath, adminKeys, d.netPolicySwap)
+
+	// Load stored network policy BEFORE creating TUN (no unfiltered window on restart).
+	// This enforces the highest-version stored policy even if the network file is missing or invalid.
+	if err := d.netPolicyLoader.LoadStoredPolicy(); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("load stored network policy: %w", err)
+	}
+
+	// If a network policy file is configured, load it (may update the stored policy)
+	// and start the file watcher. Errors are logged but don't fail startup.
+	if networkPolicyPath != "" {
+		if err := d.netPolicyLoader.Load(); err != nil {
+			log.Printf("network policy: %v", err)
+		}
+		if err := d.netPolicyLoader.StartWatcher(); err != nil {
+			log.Printf("warning: network policy file watcher: %v", err)
+		}
+	}
+
+	// Register network policy decider (from netPolicySwap) with local policy loader
+	// MUST be called before CombinedPolicy() so the dynamicCombinedPolicy captures the network swap
+	d.policyLoader.SetNetworkPolicy(d.netPolicySwap)
+	// Combined policy decider (local + network)
+	// Local policy loader's CombinedPolicy reads from localPolicySwap and uses networkPolicySwap as network
 	d.policyDecider = d.policyLoader.CombinedPolicy()
 
 	// Set the policy decider on the dispatcher
@@ -510,7 +547,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	}
 	d.ipcSrv = NewIPCServer(socketPath, func() {
 		d.Stop()
-	}, d)
+	}, d, d)
 
 	// Wire up DNS stub resolver if enabled.
 	if cfg.DNS.Enabled {
@@ -540,7 +577,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 		}
 	}
 
-	// Start policy file watcher
+	// Start local policy file watcher
 	if err := d.policyLoader.StartWatcher(); err != nil {
 		log.Printf("warning: policy file watcher: %v", err)
 	}
@@ -551,15 +588,20 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	return d, nil
 }
 
-// startSIGHUPHandler starts a goroutine that reloads the local policy on SIGHUP.
+// startSIGHUPHandler starts a goroutine that reloads the local and network policies on SIGHUP.
 func (d *Daemon) startSIGHUPHandler() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGHUP)
 	go func() {
 		for range sigCh {
-			log.Printf("policy: received SIGHUP, reloading local policy")
+			log.Printf("policy: received SIGHUP, reloading policies")
 			if err := d.policyLoader.Reload(); err != nil {
-				log.Printf("policy: reload failed: %v", err)
+				log.Printf("local policy: reload failed: %v", err)
+			}
+			if d.netPolicyLoader != nil {
+				if err := d.netPolicyLoader.Reload(); err != nil {
+					log.Printf("network policy: reload failed: %v", err)
+				}
 			}
 			// Update the combined policy decider
 			d.policyDecider = d.policyLoader.CombinedPolicy()
@@ -791,12 +833,12 @@ func deriveMeshPrefix(vpnAddr netip.Addr, networkCIDR string) netip.Prefix {
 		log.Printf("warning: coordinator did not provide network_cidr; assuming /24")
 		return netip.PrefixFrom(vpnAddr, 24)
 	}
-	netCIDR, err := netip.ParsePrefix(networkCIDR)
+	parsedCIDR, err := netip.ParsePrefix(networkCIDR)
 	if err != nil {
 		log.Printf("warning: invalid network_cidr from coord %q: %v; falling back to /24", networkCIDR, err)
 		return netip.PrefixFrom(vpnAddr, 24)
 	}
-	return netip.PrefixFrom(vpnAddr, netCIDR.Bits())
+	return netip.PrefixFrom(vpnAddr, parsedCIDR.Bits())
 }
 
 // selfInterface returns the name of veld's own TUN interface, or "" while
@@ -891,7 +933,7 @@ func buildPeerTable(peerCfgs []intconfig.PeerConfig) (*peer.Table, error) {
 			}
 		}
 		if !tbl.Upsert(e) {
-			return nil, fmt.Errorf("peer %q: vpn_addr %s is already used by another peer", pc.Name, vpnAddr)
+			return nil, fmt.Errorf("peer %q: vpn_addr %s is already used by another peer", pc.Name, vpnAddr.String())
 		}
 	}
 	return tbl, nil
@@ -942,9 +984,12 @@ func (d *Daemon) Stop() {
 	if d.ipcSrv != nil {
 		d.ipcSrv.Stop()
 	}
-	// Stop policy watcher
+	// Stop policy watchers
 	if d.policyLoader != nil {
 		d.policyLoader.Wait()
+	}
+	if d.netPolicyLoader != nil {
+		d.netPolicyLoader.Wait()
 	}
 }
 
@@ -1020,14 +1065,38 @@ func (d *Daemon) LocalPolicyStatus() ipctypes.LocalPolicyStatus {
 	}
 }
 
-// DropCounters returns the drop counters.
-func (d *Daemon) DropCounters() *acl.DropCounters {
-	return d.policyLoader.DropCounters()
+// NetworkPolicyStatus returns the status of the network policy.
+func (d *Daemon) NetworkPolicyStatus() ipctypes.NetworkPolicyStatus {
+	if d.netPolicyLoader == nil {
+		return ipctypes.NetworkPolicyStatus{}
+	}
+	npStatus := d.netPolicyLoader.NetworkPolicyStatus()
+	return ipctypes.NetworkPolicyStatus{
+		Version: npStatus.Version,
+		Signer:  npStatus.Signer,
+		Age:     npStatus.Age,
+	}
 }
 
-// RecentDrops returns the recent drop events.
+// DropCounters returns the combined drop counters from local and network policies.
+func (d *Daemon) DropCounters() *acl.DropCounters {
+	localCounters := d.policyLoader.DropCounters()
+	if d.netPolicyLoader != nil {
+		return localCounters.CombinedSnapshot(d.netPolicyLoader.DropCounters())
+	}
+	return localCounters
+}
+
+// RecentDrops returns the combined recent drop events from local and network policies.
 func (d *Daemon) RecentDrops() []ipctypes.DropEvent {
-	aclEvents := d.policyLoader.RecentDrops()
+	localCounters := d.policyLoader.DropCounters()
+	var combined *acl.DropCounters
+	if d.netPolicyLoader != nil {
+		combined = localCounters.CombinedSnapshot(d.netPolicyLoader.DropCounters())
+	} else {
+		combined = localCounters
+	}
+	aclEvents := combined.RecentDrops()
 	result := make([]ipctypes.DropEvent, len(aclEvents))
 	for i, e := range aclEvents {
 		result[i] = ipctypes.DropEvent{
@@ -1039,4 +1108,18 @@ func (d *Daemon) RecentDrops() []ipctypes.DropEvent {
 		}
 	}
 	return result
+}
+
+// ReloadNetworkPolicy triggers a network policy reload via IPC.
+func (d *Daemon) ReloadNetworkPolicy() error {
+	if d.netPolicyLoader == nil {
+		return fmt.Errorf("no network policy configured")
+	}
+	if err := d.netPolicyLoader.Reload(); err != nil {
+		return err
+	}
+	// Update the combined policy decider (reads from swap at decision time, but update for consistency)
+	d.policyDecider = d.policyLoader.CombinedPolicy()
+	d.disp.SetPolicyDecider(d.policyDecider)
+	return nil
 }

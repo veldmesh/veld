@@ -167,7 +167,7 @@ func BenchmarkFlowTable_Lookup(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			benchmarkFlowTable.Lookup(f, true, FlowStateNew)
+			benchmarkFlowTable.Lookup(f, true, FlowStateNew, nil, 0)
 		}
 	})
 }
@@ -183,12 +183,12 @@ func BenchmarkFlowTable_Lookup_Hot(b *testing.B) {
 	}
 
 	// Pre-populate
-	benchmarkFlowTable.Lookup(f, true, FlowStateNew)
+	benchmarkFlowTable.Lookup(f, true, FlowStateNew, nil, 0)
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			benchmarkFlowTable.Lookup(f, false, FlowStateNew)
+			benchmarkFlowTable.Lookup(f, false, FlowStateNew, nil, 0)
 		}
 	})
 }

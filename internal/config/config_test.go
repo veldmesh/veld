@@ -4,6 +4,7 @@ package config
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"os"
 	"strings"
@@ -220,6 +221,50 @@ func TestParseConfig_RelayFallback(t *testing.T) {
 			"token      = \"tok\"\nrelay_addr = \"relay.example.com:7878\"\nrelay_x25519 = \"aGVsbG8=\"", 1)
 		if _, err := ParseConfig(src); err == nil {
 			t.Fatal("expected error for relay_x25519 that is not 32 bytes")
+		}
+	})
+}
+
+// TestParseConfig_AdminKeys validates admin_keys parsing (base64 and hex).
+func TestParseConfig_AdminKeys(t *testing.T) {
+	keyBytes := make([]byte, 32)
+	keyBytes[0] = 0x42
+	keyB64 := base64.StdEncoding.EncodeToString(keyBytes)
+	keyHex := hex.EncodeToString(keyBytes)
+
+	t.Run("valid base64 admin key", func(t *testing.T) {
+		src := coordModeTOML + "\n[daemon.policy]\nadmin_keys = [\"ed25519:" + keyB64 + "\"]"
+		cfg, err := ParseConfig(src)
+		if err != nil {
+			t.Fatalf("ParseConfig: %v", err)
+		}
+		if len(cfg.Daemon.Policy.AdminKeys) != 1 {
+			t.Errorf("admin_keys: got %d, want 1", len(cfg.Daemon.Policy.AdminKeys))
+		}
+	})
+
+	t.Run("valid hex admin key", func(t *testing.T) {
+		src := coordModeTOML + "\n[daemon.policy]\nadmin_keys = [\"ed25519:" + keyHex + "\"]"
+		cfg, err := ParseConfig(src)
+		if err != nil {
+			t.Fatalf("ParseConfig: %v", err)
+		}
+		if len(cfg.Daemon.Policy.AdminKeys) != 1 {
+			t.Errorf("admin_keys: got %d, want 1", len(cfg.Daemon.Policy.AdminKeys))
+		}
+	})
+
+	t.Run("invalid admin key format", func(t *testing.T) {
+		src := coordModeTOML + "\n[daemon.policy]\nadmin_keys = [\"invalid\"]"
+		if _, err := ParseConfig(src); err == nil {
+			t.Fatal("expected error for invalid admin key format")
+		}
+	})
+
+	t.Run("admin key wrong length", func(t *testing.T) {
+		src := coordModeTOML + "\n[daemon.policy]\nadmin_keys = [\"ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"]"
+		if _, err := ParseConfig(src); err == nil {
+			t.Fatal("expected error for wrong admin key length")
 		}
 	})
 }

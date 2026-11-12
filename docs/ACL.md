@@ -64,7 +64,7 @@ peers = ["self"]    # This node is outbound-only
 Veld enforces two policy layers:
 
 1. **Local Policy** — File next to the daemon config (root-owned, unsigned). Covers inbound traffic **to this peer**.
-2. **Network Policy** — Signed policy distributed by the coordinator (future). Covers all peers in the network.
+2. **Network Policy** — Signed policy file, verified against pinned admin keys. Covers all peers in the network.
 
 A packet passes only if **BOTH** policies allow it. Missing local policy = defer to network policy.
 
@@ -77,7 +77,9 @@ Add a `[daemon.policy]` section to your config:
 socket_path = "/run/veld/daemon.sock"
 
 [daemon.policy]
-local_file = "/etc/veld/policy.toml"    # Optional; defaults to policy.toml next to identity file
+local_file   = "/etc/veld/policy.toml"      # Optional; defaults to policy.toml next to identity file
+network_file = "/etc/veld/policy.signed"    # Optional; signed network policy file
+admin_keys   = ["ed25519:AAAA...", "ed25519:BBBB..."]  # Pinned admin public keys for verification
 ```
 
 ### File Requirements
@@ -87,11 +89,23 @@ local_file = "/etc/veld/policy.toml"    # Optional; defaults to policy.toml next
 - Missing file = no local policy (defer to network)
 - Invalid/unparseable file = daemon refuses to start (fail closed)
 
+### Network Policy Verification
+
+Network policies are only enforced when at least one admin key is pinned via `admin_keys`. Without pinned keys, network policy files are ignored (logged once at startup). The daemon verifies:
+
+1. **Signature validity** — Ed25519 signature over the canonical policy payload
+2. **Signer authorization** — Signer's public key must be in `admin_keys`
+3. **Version monotonicity** — New policy version must be higher than the stored highest version (rollback protection)
+
+The highest accepted version and the signed envelope are persisted next to the identity file (`network-policy.bin`, mode 0600) and loaded **before the tunnel comes up**, surviving daemon restarts.
+
 ## Policy Loading & Reloading
 
 - Local policy is loaded **before** the tunnel comes up (no unfiltered window on restart)
-- Hot-reload on SIGHUP: `kill -HUP <daemon-pid>`
+- Network policy is loaded **before** the tunnel comes up (no unfiltered window on restart)
+- Hot-reload on SIGHUP: `kill -HUP <daemon-pid>` (both local and network)
 - Automatic reload on file change (atomic swap; existing flows re-checked against new policy)
+- Manual reload via IPC: `veld policy reload` (network policy only)
 - A revoked peer loses open connections immediately
 
 ## Drop Counters & Logging
@@ -151,9 +165,40 @@ ALLOW
   Matched rule 2: from=* to=carol ports=icmp
 ```
 
+### `veld policy keygen [--out admin.key]`
+
+Generate an Ed25519 admin key pair for signing network policies. This key is **separate from node keys** and should be kept secure (offline if possible). The private key is written to a file with 0600 permissions. The public key is printed to stdout.
+
+```bash
+$ veld policy keygen --out admin.key
+ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Private key written to admin.key (0600)
+Keep this key secure! It is used to sign network policies.
+```
+
+**Key handling advice**: Keep the admin private key **offline** and off the coordinator. Use it only to sign policy files. Distribute the signed `policy.signed` file to peers; the private key never leaves your secure environment.
+
+### `veld policy sign <policy.toml> --key admin.key [--out policy.signed]`
+
+Sign a policy TOML file with an admin private key, producing a signed network policy envelope. The envelope includes the canonical policy, version, signer public key, and Ed25519 signature. Refuses to overwrite an existing output file if its version is >= the new policy's version.
+
+```bash
+$ veld policy sign policy.toml --key admin.key --out policy.signed
+Signed policy written to policy.signed (version 1)
+```
+
+### `veld policy reload`
+
+Triggers the running daemon to reload the network policy file via IPC. Requires the daemon to be running with a network policy configured.
+
+```bash
+$ veld policy reload
+network policy reloaded
+```
+
 ### `veld policy status`
 
-Show the active local policy path and hash, network policy version/signer/age (placeholder until the signed-policy story), drop counters per peer and rule, and the last N drops (peer, proto, port, time; no payload).
+Show the active local policy path and hash, network policy version/signer/age, drop counters per peer and rule, and the last N drops (peer, proto, port, time; no payload).
 
 ```bash
 $ veld policy status
@@ -165,7 +210,9 @@ Local Policy:
   Rules: 3
 
 Network Policy:
-  (none)
+  Version: 2
+  Signer: ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  Age: 5m30s
 
 Drop Counters:
   By Peer:
@@ -274,6 +321,10 @@ ports = ["tcp/22"]
 | Local policy file group/world-writable | Daemon refuses to start |
 | Local policy invalid (unknown peer, bad port) | Daemon refuses to start |
 | Network policy unavailable | Local policy only (if present) |
+| Network policy forged signature | Ignored, current policy kept, logged |
+| Network policy unpinned signer | Ignored, current policy kept, logged |
+| Network policy version <= stored | Ignored as rollback, current policy kept, logged |
+| Network policy truncated/invalid | Ignored, current policy kept, logged |
 | Both policies deny | Packet dropped, drop counter incremented |
 | Policy reload removes a rule | Existing flows re-checked; revoked connections dropped |
 

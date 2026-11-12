@@ -20,7 +20,7 @@ func TestFlowTable_BasicLookup(t *testing.T) {
 		IPv6:    false,
 	}
 
-	entry, isReply, created := ft.Lookup(f, true, FlowStateNew)
+	entry, isReply, created := ft.Lookup(f, true, FlowStateNew, nil, 0)
 	if !created {
 		t.Fatal("expected new entry to be created")
 	}
@@ -35,7 +35,7 @@ func TestFlowTable_BasicLookup(t *testing.T) {
 	}
 
 	// Lookup again - should get same entry
-	entry2, isReply2, created2 := ft.Lookup(f, true, FlowStateNew)
+	entry2, isReply2, created2 := ft.Lookup(f, true, FlowStateNew, nil, 0)
 	if created2 {
 		t.Error("expected existing entry, not created")
 	}
@@ -70,8 +70,8 @@ func TestFlowTable_BidirectionalNormalization(t *testing.T) {
 		IPv6:    false,
 	}
 
-	entry1, isReply1, _ := ft.Lookup(f1, true, FlowStateNew)
-	entry2, isReply2, _ := ft.Lookup(f2, true, FlowStateNew)
+	entry1, isReply1, _ := ft.Lookup(f1, true, FlowStateNew, nil, 0)
+	entry2, isReply2, _ := ft.Lookup(f2, true, FlowStateNew, nil, 0)
 
 	if entry1 != entry2 {
 		t.Fatal("forward and reply should map to same entry")
@@ -108,8 +108,8 @@ func TestFlowTable_IPv6Normalization(t *testing.T) {
 		IPv6:    true,
 	}
 
-	entry1, isReply1, _ := ft.Lookup(f1, true, FlowStateNew)
-	entry2, isReply2, _ := ft.Lookup(f2, true, FlowStateNew)
+	entry1, isReply1, _ := ft.Lookup(f1, true, FlowStateNew, nil, 0)
+	entry2, isReply2, _ := ft.Lookup(f2, true, FlowStateNew, nil, 0)
 
 	if entry1 != entry2 {
 		t.Fatal("IPv6 forward and reply should map to same entry")
@@ -134,7 +134,7 @@ func TestFlowTable_UDPFlow(t *testing.T) {
 		IPv6:    false,
 	}
 
-	entry, _, created := ft.Lookup(f, true, FlowStateNew)
+	entry, _, created := ft.Lookup(f, true, FlowStateNew, nil, 0)
 	if !created {
 		t.Fatal("expected new entry")
 	}
@@ -155,7 +155,7 @@ func TestFlowTable_ICMPFlow(t *testing.T) {
 		IPv6:    false,
 	}
 
-	entry, _, created := ft.Lookup(f, true, FlowStateNew)
+	entry, _, created := ft.Lookup(f, true, FlowStateNew, nil, 0)
 	if !created {
 		t.Fatal("expected new entry")
 	}
@@ -176,13 +176,13 @@ func TestFlowTable_UpdateState(t *testing.T) {
 		IPv6:    false,
 	}
 
-	ft.Lookup(f, true, FlowStateNew)
+	ft.Lookup(f, true, FlowStateNew, nil, 0)
 	ok := ft.UpdateState(f, FlowStateEstablished)
 	if !ok {
 		t.Fatal("UpdateState failed")
 	}
 
-	entry, _, _ := ft.Lookup(f, false, FlowStateNew)
+	entry, _, _ := ft.Lookup(f, false, FlowStateNew, nil, 0)
 	if entry.State != FlowStateEstablished {
 		t.Errorf("state: got %v, want %v", entry.State, FlowStateEstablished)
 	}
@@ -204,7 +204,7 @@ func TestFlowTable_ExpireOldFlows(t *testing.T) {
 		IPv6:    false,
 	}
 
-	ft.Lookup(f, true, FlowStateNew)
+	ft.Lookup(f, true, FlowStateNew, nil, 0)
 	if ft.Len() != 1 {
 		t.Fatalf("expected 1 flow, got %d", ft.Len())
 	}
@@ -235,7 +235,7 @@ func TestFlowTable_ExpireOldFlows_ClosedState(t *testing.T) {
 		IPv6:    false,
 	}
 
-	ft.Lookup(f, true, FlowStateNew)
+	ft.Lookup(f, true, FlowStateNew, nil, 0)
 	if ft.Len() != 1 {
 		t.Fatalf("expected 1 flow, got %d", ft.Len())
 	}
@@ -269,7 +269,7 @@ func TestFlowTable_RemoveFlow(t *testing.T) {
 	}
 
 	// Create a flow
-	_, _, created := ft.Lookup(f, true, FlowStateNew)
+	_, _, created := ft.Lookup(f, true, FlowStateNew, nil, 0)
 	if !created {
 		t.Fatal("expected new entry to be created")
 	}
@@ -315,8 +315,8 @@ func TestFlowTable_RemoveFlow_UpdatesEvictionList(t *testing.T) {
 		IPv6:    false,
 	}
 
-	ft.Lookup(f1, true, FlowStateNew)
-	ft.Lookup(f2, true, FlowStateNew)
+	ft.Lookup(f1, true, FlowStateNew, nil, 0)
+	ft.Lookup(f2, true, FlowStateNew, nil, 0)
 
 	if ft.Len() != 2 {
 		t.Fatalf("expected 2 flows, got %d", ft.Len())
@@ -334,7 +334,7 @@ func TestFlowTable_RemoveFlow_UpdatesEvictionList(t *testing.T) {
 		t.Errorf("expected 1 flow after removal, got %d", ft.Len())
 	}
 
-	_, _, _ = ft.Lookup(f2, false, FlowStateNew)
+	_, _, _ = ft.Lookup(f2, false, FlowStateNew, nil, 0)
 	if ft.Len() != 1 {
 		t.Error("f2 should still exist after f1 removal")
 	}
@@ -365,7 +365,7 @@ func TestFlowTable_Eviction(t *testing.T) {
 			Proto:   ProtoTCP,
 			IPv6:    false,
 		}
-		ft.Lookup(f, true, FlowStateNew)
+		ft.Lookup(f, true, FlowStateNew, nil, 0)
 	}
 
 	// Should have evicted some flows
@@ -389,7 +389,7 @@ func TestFlowTable_EvictionIsLRU(t *testing.T) {
 			Proto:   ProtoTCP,
 			IPv6:    false,
 		}
-		ft.Lookup(f, true, FlowStateNew)
+		ft.Lookup(f, true, FlowStateNew, nil, 0)
 	}
 
 	// Access the first flow to make it recently used
@@ -401,7 +401,7 @@ func TestFlowTable_EvictionIsLRU(t *testing.T) {
 		Proto:   ProtoTCP,
 		IPv6:    false,
 	}
-	e0, _, _ := ft.Lookup(f0, false, FlowStateNew)
+	e0, _, _ := ft.Lookup(f0, false, FlowStateNew, nil, 0)
 	if e0 == nil {
 		t.Fatal("flow 0 should exist")
 	}
@@ -415,10 +415,10 @@ func TestFlowTable_EvictionIsLRU(t *testing.T) {
 		Proto:   ProtoTCP,
 		IPv6:    false,
 	}
-	ft.Lookup(f5, true, FlowStateNew)
+	ft.Lookup(f5, true, FlowStateNew, nil, 0)
 
 	// Flow 0 should still exist (was recently accessed)
-	e0, _, _ = ft.Lookup(f0, false, FlowStateNew)
+	e0, _, _ = ft.Lookup(f0, false, FlowStateNew, nil, 0)
 	if e0 == nil {
 		t.Error("flow 0 should not have been evicted (recently accessed)")
 	}
@@ -432,7 +432,7 @@ func TestFlowTable_EvictionIsLRU(t *testing.T) {
 		Proto:   ProtoTCP,
 		IPv6:    false,
 	}
-	e1, _, _ := ft.Lookup(f1, false, FlowStateNew)
+	e1, _, _ := ft.Lookup(f1, false, FlowStateNew, nil, 0)
 	if e1 != nil {
 		t.Error("flow 1 should have been evicted (oldest idle)")
 	}
@@ -453,7 +453,7 @@ func TestFlowTable_ConcurrentAccess(t *testing.T) {
 				IPv6:    false,
 			}
 			for j := 0; j < 100; j++ {
-				ft.Lookup(f, true, FlowStateNew)
+				ft.Lookup(f, true, FlowStateNew, nil, 0)
 				ft.UpdateState(f, FlowStateEstablished)
 			}
 			done <- true
@@ -491,8 +491,8 @@ func TestFlowTable_Stats(t *testing.T) {
 		IPv6:    false,
 	}
 
-	ft.Lookup(f1, true, FlowStateNew)
-	ft.Lookup(f2, true, FlowStateEstablished)
+	ft.Lookup(f1, true, FlowStateNew, nil, 0)
+	ft.Lookup(f2, true, FlowStateEstablished, nil, 0)
 
 	stats := ft.Stats()
 	if stats.TotalFlows != 2 {
@@ -540,7 +540,7 @@ func TestFlowTable_BoundEnforcement_SingleGoroutine(t *testing.T) {
 			Proto:   ProtoTCP,
 			IPv6:    false,
 		}
-		ft.Lookup(f, true, FlowStateNew)
+		ft.Lookup(f, true, FlowStateNew, nil, 0)
 	}
 
 	// Should have evicted to stay within bound
@@ -575,7 +575,7 @@ func TestFlowTable_BoundEnforcement_Concurrent(t *testing.T) {
 					Proto:   ProtoTCP,
 					IPv6:    false,
 				}
-				ft.Lookup(f, true, FlowStateNew)
+				ft.Lookup(f, true, FlowStateNew, nil, 0)
 			}
 		}(g)
 	}
@@ -607,7 +607,7 @@ func TestFlowTable_ExpiredFlowsTreatedAsMissing(t *testing.T) {
 	}
 
 	// Create flow
-	entry, _, _ := ft.Lookup(f, true, FlowStateNew)
+	entry, _, _ := ft.Lookup(f, true, FlowStateNew, nil, 0)
 	if entry == nil {
 		t.Fatal("entry should be created")
 	}
@@ -616,7 +616,7 @@ func TestFlowTable_ExpiredFlowsTreatedAsMissing(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	// Lookup without createIfMissing - should return nil because flow is expired
-	entry, _, created := ft.Lookup(f, false, FlowStateNew)
+	entry, _, created := ft.Lookup(f, false, FlowStateNew, nil, 0)
 	if entry != nil {
 		t.Errorf("expired flow should be treated as missing, got entry with state %v", entry.State)
 	}
@@ -625,7 +625,7 @@ func TestFlowTable_ExpiredFlowsTreatedAsMissing(t *testing.T) {
 	}
 
 	// Lookup with createIfMissing should create a new entry
-	entry, _, created = ft.Lookup(f, true, FlowStateNew)
+	entry, _, created = ft.Lookup(f, true, FlowStateNew, nil, 0)
 	if entry == nil {
 		t.Fatal("new entry should be created")
 	}
@@ -649,7 +649,7 @@ func TestFlowTable_UpdateState_ExpiredEntry(t *testing.T) {
 	}
 
 	// Create flow
-	ft.Lookup(f, true, FlowStateNew)
+	ft.Lookup(f, true, FlowStateNew, nil, 0)
 	if ft.Len() != 1 {
 		t.Fatalf("expected 1 flow, got %d", ft.Len())
 	}
@@ -682,7 +682,7 @@ func TestFlowTable_EvictionPicksOldestIdle(t *testing.T) {
 			Proto:   ProtoTCP,
 			IPv6:    false,
 		}
-		ft.Lookup(f, true, FlowStateNew)
+		ft.Lookup(f, true, FlowStateNew, nil, 0)
 	}
 
 	// Access the first flow to make it recently used
@@ -694,7 +694,7 @@ func TestFlowTable_EvictionPicksOldestIdle(t *testing.T) {
 		Proto:   ProtoTCP,
 		IPv6:    false,
 	}
-	e0, _, _ := ft.Lookup(f0, false, FlowStateNew)
+	e0, _, _ := ft.Lookup(f0, false, FlowStateNew, nil, 0)
 	if e0 == nil {
 		t.Fatal("flow 0 should exist")
 	}
@@ -708,10 +708,10 @@ func TestFlowTable_EvictionPicksOldestIdle(t *testing.T) {
 		Proto:   ProtoTCP,
 		IPv6:    false,
 	}
-	ft.Lookup(f5, true, FlowStateNew)
+	ft.Lookup(f5, true, FlowStateNew, nil, 0)
 
 	// Flow 0 should still exist (was recently accessed)
-	e0, _, _ = ft.Lookup(f0, false, FlowStateNew)
+	e0, _, _ = ft.Lookup(f0, false, FlowStateNew, nil, 0)
 	if e0 == nil {
 		t.Error("flow 0 should not have been evicted (recently accessed)")
 	}
@@ -725,7 +725,7 @@ func TestFlowTable_EvictionPicksOldestIdle(t *testing.T) {
 		Proto:   ProtoTCP,
 		IPv6:    false,
 	}
-	e1, _, _ := ft.Lookup(f1, false, FlowStateNew)
+	e1, _, _ := ft.Lookup(f1, false, FlowStateNew, nil, 0)
 	if e1 != nil {
 		t.Error("flow 1 should have been evicted (oldest idle)")
 	}
@@ -754,7 +754,7 @@ func TestFlowTable_ShardDistribution(t *testing.T) {
 			Proto:   ProtoTCP,
 			IPv6:    false,
 		}
-		ft.Lookup(f, true, FlowStateNew)
+		ft.Lookup(f, true, FlowStateNew, nil, 0)
 	}
 
 	// Count flows per shard by examining the internal shard maps
