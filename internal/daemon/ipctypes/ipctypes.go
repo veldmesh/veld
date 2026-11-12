@@ -23,9 +23,11 @@ type LocalPolicyStatus struct {
 }
 
 type NetworkPolicyStatus struct {
-	Version int    `json:"version"`
-	Signer  string `json:"signer"`
-	Age     string `json:"age"`
+	Version            int    `json:"version"`
+	Signer             string `json:"signer"`
+	Age                string `json:"age"`
+	CoordinatorVersion int    `json:"coordinator_version"`
+	CoordinatorRefused bool   `json:"coordinator_refused"`
 }
 
 type DropCountersStatus struct {

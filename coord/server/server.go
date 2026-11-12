@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
 	"net/netip"
 	"sync"
@@ -18,6 +19,7 @@ import (
 
 	coordcore "github.com/veldmesh/veld/coord/core"
 	coordv1 "github.com/veldmesh/veld/gen/veld/coord/v1"
+	"github.com/veldmesh/veld/internal/acl"
 	"github.com/veldmesh/veld/internal/crypto"
 )
 
@@ -355,6 +357,9 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 		s.hooks.OnSubnetRouteAdvertised(ctx, peer, pfx)
 	}
 
+	// Fetch current network policy for the Register response.
+	policyEnvelope, _, _ := s.registry.GetNetworkPolicy(req.NetworkId)
+
 	// Publish JOIN event to all watchers in this network.
 	s.bus.Publish(req.NetworkId, &coordv1.PeerEvent{
 		Type: coordv1.EventType_JOIN,
@@ -370,10 +375,11 @@ func (s *Server) Register(ctx context.Context, req *coordv1.RegisterRequest) (*c
 	})
 
 	return &coordv1.RegisterResponse{
-		VpnAddr:     vpnAddr.String(),
-		PeerId:      peerID,
-		NetworkId:   req.NetworkId,
-		NetworkCidr: net.CIDR.String(),
+		VpnAddr:       vpnAddr.String(),
+		PeerId:        peerID,
+		NetworkId:     req.NetworkId,
+		NetworkCidr:   net.CIDR.String(),
+		NetworkPolicy: policyEnvelope,
 	}, nil
 }
 
@@ -452,6 +458,19 @@ func (s *Server) Watch(req *coordv1.WatchRequest, stream coordv1.Coord_WatchServ
 		sc := s.bus.SubscribeSignals(req.PeerId)
 		sigCh = sc
 		defer s.bus.UnsubscribeSignals(req.PeerId, sc)
+	}
+
+	// Send the current network policy as a NETWORK_POLICY event (initial snapshot).
+	if policyEnvelope, _, err := s.registry.GetNetworkPolicy(req.NetworkId); err == nil && len(policyEnvelope) > 0 {
+		ev := &coordv1.PeerEvent{
+			Type: coordv1.EventType_NETWORK_POLICY,
+			NetworkPolicy: &coordv1.NetworkPolicyEvent{
+				Envelope: policyEnvelope,
+			},
+		}
+		if err := stream.Send(ev); err != nil {
+			return err
+		}
 	}
 
 	// Send the current peer list as synthetic JOIN events. Any peer that
@@ -592,4 +611,99 @@ func (s *Server) Leave(ctx context.Context, req *coordv1.LeaveRequest) (*coordv1
 	})
 
 	return &coordv1.LeaveResponse{}, nil
+}
+
+// PushNetworkPolicy uploads a signed network policy envelope for the
+// network the token belongs to. The envelope is stored as an opaque blob.
+// The server verifies the envelope header (magic, format version, length),
+// checks the size cap (256 KiB), verifies the envelope signature against
+// the network's pinned admin keys, and that the policy version is strictly
+// greater than the currently stored version. The server never parses the
+// policy payload — verification and enforcement happen on peers.
+func (s *Server) PushNetworkPolicy(ctx context.Context, req *coordv1.PushNetworkPolicyRequest) (*coordv1.PushNetworkPolicyResponse, error) {
+	acc, err := s.accounts.Resolve(ctx, req.Token)
+	if err != nil {
+		return nil, status.Errorf(codes.Unauthenticated, "invalid token")
+	}
+
+	if err := s.authorizeNetwork(req.NetworkId, acc.ID); err != nil {
+		return nil, err
+	}
+
+	// Verify the caller is a registered peer in this network.
+	rec, err := s.authorizePeer(req.PeerId, req.NetworkId, acc.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Verify the call signature.
+	claims := crypto.PushNetworkPolicyClaims(req.PeerId, req.NetworkId, req.Envelope, req.TimestampUnix)
+	if err := s.verifyCall(rec, req.Signature, claims); err != nil {
+		return nil, err
+	}
+
+	// Check envelope size cap (defense in depth — registry also checks).
+	if len(req.Envelope) > maxNetworkPolicySize {
+		return nil, status.Errorf(codes.InvalidArgument, "policy envelope exceeds %d bytes", maxNetworkPolicySize)
+	}
+
+	// Get the network's pinned admin keys.
+	adminKeys, err := s.registry.GetNetworkAdminKeys(req.NetworkId)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "get admin keys: %v", err)
+	}
+	if len(adminKeys) == 0 {
+		return nil, status.Errorf(codes.FailedPrecondition, "no admin keys pinned for this network; cannot push policy")
+	}
+
+	// Verify the envelope signature and that the signer is a pinned admin key.
+	signerPubKey, err := acl.VerifyEnvelopeSignatureAndSigner(req.Envelope, adminKeys)
+	if err != nil {
+		_ = s.audit.Log(ctx, coordcore.AuditEvent{
+			Kind:      coordcore.AuditNetworkPolicyPushed,
+			AccountID: acc.ID,
+			NetworkID: req.NetworkId,
+			PeerID:    req.PeerId,
+			Detail:    "network policy push rejected: " + err.Error(),
+			At:        time.Now(),
+		})
+		return nil, status.Errorf(codes.InvalidArgument, "invalid policy envelope: %v", err)
+	}
+
+	// Extract version from envelope header (without full parsing).
+	version, err := acl.ExtractPolicyVersionFromEnvelope(req.Envelope)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid policy envelope: %v", err)
+	}
+
+	// Store the envelope. Registry enforces version monotonicity.
+	newVersion, err := s.registry.SetNetworkPolicy(req.NetworkId, req.Envelope, version)
+	if err != nil {
+		if errors.Is(err, ErrPolicyVersionNotHigher) {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+		if errors.Is(err, ErrPolicySizeExceeded) {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		return nil, status.Errorf(codes.Internal, "store network policy: %v", err)
+	}
+
+	// Publish NETWORK_POLICY event to all watchers in this network.
+	s.bus.Publish(req.NetworkId, &coordv1.PeerEvent{
+		Type: coordv1.EventType_NETWORK_POLICY,
+		NetworkPolicy: &coordv1.NetworkPolicyEvent{
+			Envelope: req.Envelope,
+		},
+	})
+
+	_ = s.audit.Log(ctx, coordcore.AuditEvent{
+		Kind:      coordcore.AuditNetworkPolicyPushed,
+		AccountID: acc.ID,
+		NetworkID: req.NetworkId,
+		PeerID:    req.PeerId,
+		Detail:    fmt.Sprintf("network policy pushed (version %d, signer %s)", newVersion, acl.FormatPeerKey(signerPubKey)),
+		At:        time.Now(),
+	})
+
+	return &coordv1.PushNetworkPolicyResponse{Version: int32(newVersion)}, nil
 }
