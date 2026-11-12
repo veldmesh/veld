@@ -547,24 +547,7 @@ ports = ["tcp/8080"]
 
 	// Should write SYN to TUN
 	buf := make([]byte, 1500)
-	done := make(chan bool, 1)
-	go func() {
-		n, err := tunDev.ReadDelivered(buf)
-		if err != nil || n == 0 {
-			done <- false
-		} else {
-			done <- true
-		}
-	}()
-
-	select {
-	case got := <-done:
-		if !got {
-			t.Fatal("timeout: allowed SYN not written to TUN")
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("timeout: allowed SYN not written to TUN")
-	}
+	mustReadDelivered(t, tunDev, buf, 500*time.Millisecond)
 
 	// Now bob sends a TCP ACK (reply) - should pass
 	// For the reply, src/dst are swapped, and ports are swapped
@@ -573,24 +556,7 @@ ports = ["tcp/8080"]
 	d.handleUDPPacket(encryptedACK, &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 5000})
 
 	// Should write ACK to TUN
-	done2 := make(chan bool, 1)
-	go func() {
-		n, err := tunDev.ReadDelivered(buf)
-		if err != nil || n == 0 {
-			done2 <- false
-		} else {
-			done2 <- true
-		}
-	}()
-
-	select {
-	case got := <-done2:
-		if !got {
-			t.Fatal("timeout: allowed reply ACK not written to TUN")
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("timeout: allowed reply ACK not written to TUN")
-	}
+	mustReadDelivered(t, tunDev, buf, 500*time.Millisecond)
 }
 
 // TestDispatcher_OutboundSYN_CreatesEstablishedFlow tests that an outbound SYN
@@ -676,13 +642,7 @@ func TestDispatcher_OutboundSYN_CreatesEstablishedFlow(t *testing.T) {
 
 	// Expect the SYN-ACK to be delivered to TUN
 	buf := make([]byte, 1500)
-	n, err := tunDev.ReadDelivered(buf)
-	if err != nil {
-		t.Fatalf("ReadDelivered failed: %v", err)
-	}
-	if n == 0 {
-		t.Fatal("expected SYN-ACK to be delivered to TUN (flow is Established)")
-	}
+	mustReadDelivered(t, tunDev, buf, 2*time.Second)
 
 	// Now simulate an UNSOLICITED INBOUND SYN from peer B (new connection attempt)
 	// This should be DROPPED because self is outbound-only (cannot receive inbound)
@@ -812,13 +772,7 @@ ports = ["tcp/8080"]
 
 	// Expect the SYN-ACK to be delivered to TUN
 	buf := make([]byte, 1500)
-	n, err := tunDev.ReadDelivered(buf)
-	if err != nil {
-		t.Fatalf("ReadDelivered failed: %v", err)
-	}
-	if n == 0 {
-		t.Fatal("expected SYN-ACK to be delivered to TUN (reply to allowed outbound connection)")
-	}
+	mustReadDelivered(t, tunDev, buf, 2*time.Second)
 
 	// 3. Simulate a data/ACK packet from peer B (peer:8080 -> self:12345)
 	// This is another reply packet on the same flow.
@@ -835,13 +789,7 @@ ports = ["tcp/8080"]
 	conn.in <- udpMsg{data: buildDataPacket(nonce2, ct2), addr: &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5000}}
 
 	// Expect the data/ACK to be delivered to TUN
-	n, err = tunDev.ReadDelivered(buf)
-	if err != nil {
-		t.Fatalf("ReadDelivered failed: %v", err)
-	}
-	if n == 0 {
-		t.Fatal("expected data/ACK to be delivered to TUN (reply to allowed outbound connection)")
-	}
+	mustReadDelivered(t, tunDev, buf, 2*time.Second)
 }
 
 // TestDispatcher_ReplyToOutbound_PolicySwapDropsReply tests that after a policy
@@ -952,13 +900,7 @@ ports = ["tcp/8081"]
 
 	// Expect the SYN-ACK to be delivered to TUN
 	buf := make([]byte, 1500)
-	n, err := tunDev.ReadDelivered(buf)
-	if err != nil {
-		t.Fatalf("ReadDelivered failed: %v", err)
-	}
-	if n == 0 {
-		t.Fatal("expected SYN-ACK to be delivered to TUN under policy v1")
-	}
+	mustReadDelivered(t, tunDev, buf, 2*time.Second)
 
 	// 3. Swap to policy v2 (allows only tcp/8081, denies tcp/8080)
 	d.SetPolicyDecider(compiledV2)
