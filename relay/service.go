@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/flynn/noise"
@@ -97,6 +98,23 @@ type Service struct {
 	maxConnsPerIP int
 	conns         int                // open connections, guarded by mu
 	connsByIP     map[netip.Addr]int // open connections per client IP
+
+	// nextSeq is a monotonically increasing sequence number assigned to
+	// each accepted connection. Used to ensure that when the same client
+	// reconnects, the newer connection wins over the older one.
+	nextSeq uint64
+
+	// maxSeqPerClientKey tracks the highest sequence number seen for each
+	// (channel, clientKey) pair. This ensures that even if a newer
+	// connection pairs and leaves waiting, an older stalled connection
+	// cannot re-register. Guarded by mu.
+	maxSeqPerClientKey map[[relayc.ChannelIDSize + 32]byte]uint64
+
+	// afterHandshake is called after the handshake reply (msg2) is written
+	// but before registration, only in tests. It allows tests to
+	// synchronize and force specific orderings between concurrent
+	// connections.
+	afterHandshake func(*serverConn)
 }
 
 // serverConn is one client connection on the relay side.
@@ -106,6 +124,7 @@ type serverConn struct {
 	channel    [relayc.ChannelIDSize]byte
 	clientKey  [32]byte // authenticated X25519 static key of this client
 	wmu        sync.Mutex
+	seq        uint64 // connection sequence number (newer = higher)
 }
 
 // Option configures a relay Service at construction time.
@@ -136,17 +155,17 @@ func MaxConns(total, perIP int) Option {
 // Clients must be configured with the identity's X25519 public key.
 func NewService(id *crypto.Identity, ln net.Listener, opts ...Option) *Service {
 	s := &Service{
-		id:          id,
-		ln:          ln,
-		waiting:     make(map[[relayc.ChannelIDSize]byte]*serverConn),
-		active:      make(map[*serverConn]struct{}),
-		done:        make(chan struct{}),
-		waitTimeout: waitingTimeout,
-
-		maxConns:      defaultMaxConns,
-		maxConnsPerIP: defaultMaxConnsPerIP,
-		connsByIP:     make(map[netip.Addr]int),
-		seenMsg1:      make(map[[32]byte]time.Time),
+		id:                 id,
+		ln:                 ln,
+		waiting:            make(map[[relayc.ChannelIDSize]byte]*serverConn),
+		active:             make(map[*serverConn]struct{}),
+		done:               make(chan struct{}),
+		waitTimeout:        waitingTimeout,
+		maxConns:           defaultMaxConns,
+		maxConnsPerIP:      defaultMaxConnsPerIP,
+		connsByIP:          make(map[netip.Addr]int),
+		seenMsg1:           make(map[[32]byte]time.Time),
+		maxSeqPerClientKey: make(map[[relayc.ChannelIDSize + 32]byte]uint64),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -218,7 +237,8 @@ func (s *Service) Serve(ctx context.Context) error {
 			_ = c.Close()
 			continue
 		}
-		go s.handleConn(lc)
+		seq := atomic.AddUint64(&s.nextSeq, 1)
+		go s.handleConn(lc, seq)
 	}
 }
 
@@ -290,6 +310,14 @@ func (s *Service) freshMsg1(msg1, payload []byte) bool {
 	return true
 }
 
+// maxSeqKey builds the composite key for maxSeq tracking: channel || clientKey.
+func (s *Service) maxSeqKey(sc *serverConn) [relayc.ChannelIDSize + 32]byte {
+	var key [relayc.ChannelIDSize + 32]byte
+	copy(key[:relayc.ChannelIDSize], sc.channel[:])
+	copy(key[relayc.ChannelIDSize:], sc.clientKey[:])
+	return key
+}
+
 // Close stops the service, closes all pending and active connections, and
 // waits for all splice goroutines to exit before returning.
 func (s *Service) Close() error {
@@ -326,7 +354,7 @@ func (s *Service) Close() error {
 // peer's X25519 key from message_1's encrypted payload, derives the channel
 // from the authenticated client key plus that payload, and pairs the
 // connection.
-func (s *Service) handleConn(raw net.Conn) {
+func (s *Service) handleConn(raw net.Conn, seq uint64) {
 	// Verbose-only, and truncated: full client addresses are never logged.
 	if from := logsafe.TruncIP(raw.RemoteAddr().String()); from != "" {
 		s.logf("connection from %s", from)
@@ -376,19 +404,27 @@ func (s *Service) handleConn(raw net.Conn) {
 		_ = raw.Close()
 		return
 	}
-	if err := relayc.WriteFrame(raw, msg2); err != nil {
-		_ = raw.Close()
-		return
-	}
-	_ = raw.SetDeadline(time.Time{})
 
-	// Responder: cs1 = recv (client→relay), cs2 = send (relay→client).
 	sc := &serverConn{
 		raw:       raw,
 		recv:      cs1,
 		send:      cs2,
 		channel:   relayc.ChannelID(clientKey, remoteKey),
 		clientKey: clientKey,
+		seq:       seq,
+	}
+
+	if err := relayc.WriteFrame(raw, msg2); err != nil {
+		_ = raw.Close()
+		return
+	}
+	_ = raw.SetDeadline(time.Time{})
+
+	// Test hook: called after msg2 is written (so the client observes the
+	// handshake as complete) but before registration. Allows tests to
+	// force ordering between concurrent connections.
+	if s.afterHandshake != nil {
+		s.afterHandshake(sc)
 	}
 
 	s.mu.Lock()
@@ -397,19 +433,44 @@ func (s *Service) handleConn(raw net.Conn) {
 		_ = raw.Close()
 		return
 	}
+
+	// Build the composite key for maxSeq tracking: channel || clientKey
+	maxSeqKey := s.maxSeqKey(sc)
+
+	// If we've seen a newer connection for this (channel, clientKey),
+	// this connection is stale and must close.
+	if maxSeq, ok := s.maxSeqPerClientKey[maxSeqKey]; ok && sc.seq < maxSeq {
+		s.mu.Unlock()
+		_ = raw.Close()
+		return
+	}
+
+	// Record this connection's sequence number as the newest seen.
+	s.maxSeqPerClientKey[maxSeqKey] = sc.seq
+
 	other := s.waiting[sc.channel]
 	if other != nil && other.clientKey == clientKey {
-		// Reconnect from the same client: replace the stale waiting
-		// connection instead of splicing the client to itself.
-		s.mu.Unlock()
-		s.evict(sc.channel, other)
-		s.mu.Lock()
-		if s.closed {
+		// Reconnect from the same client: only replace if the new
+		// connection is newer (higher sequence number). The newer
+		// connection must always win to avoid the race where an older
+		// handler acquires the lock after a newer one and evicts it.
+		if sc.seq > other.seq {
+			s.mu.Unlock()
+			s.evict(sc.channel, other)
+			s.mu.Lock()
+			if s.closed {
+				s.mu.Unlock()
+				_ = raw.Close()
+				return
+			}
+			other = s.waiting[sc.channel]
+		} else {
+			// New connection is older or same — close it and keep the
+			// existing (newer) waiting connection.
 			s.mu.Unlock()
 			_ = raw.Close()
 			return
 		}
-		other = s.waiting[sc.channel]
 	}
 	if other == nil {
 		s.waiting[sc.channel] = sc
@@ -438,14 +499,22 @@ func (s *Service) handleConn(raw net.Conn) {
 }
 
 // forget removes sc from the active set once its splice has exited.
+// If sc holds the highest sequence number for its (channel, clientKey),
+// the maxSeq entry is removed to prevent unbounded growth.
 func (s *Service) forget(sc *serverConn) {
 	s.mu.Lock()
 	delete(s.active, sc)
+	key := s.maxSeqKey(sc)
+	if s.maxSeqPerClientKey[key] == sc.seq {
+		delete(s.maxSeqPerClientKey, key)
+	}
 	s.mu.Unlock()
 }
 
 // evict removes sc from the waiting map (if it is still the entry for
-// channel) and closes it.
+// channel) and closes it. If sc holds the highest sequence number for its
+// (channel, clientKey), the maxSeq entry is removed to prevent unbounded
+// growth.
 func (s *Service) evict(channel [relayc.ChannelIDSize]byte, sc *serverConn) {
 	s.mu.Lock()
 	if s.waiting[channel] != sc {
@@ -453,6 +522,10 @@ func (s *Service) evict(channel [relayc.ChannelIDSize]byte, sc *serverConn) {
 		return
 	}
 	delete(s.waiting, channel)
+	key := s.maxSeqKey(sc)
+	if s.maxSeqPerClientKey[key] == sc.seq {
+		delete(s.maxSeqPerClientKey, key)
+	}
 	s.mu.Unlock()
 	_ = sc.raw.Close()
 }

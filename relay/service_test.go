@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -264,6 +265,247 @@ func TestReconnectReplacesWaiting(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Errorf("A2 got %q, want %q", got, want)
+	}
+}
+
+// TestReconnectReplacesWaitingDeterministic is a deterministic regression
+// test for the reconnect ordering race. It uses a test hook to force A2's
+// registration to happen before A1's, verifying that the newer connection
+// (A2) wins and the stale connection (A1) is closed. On the buggy code
+// (without sequence numbers), this test would fail because A1 would evict A2.
+func TestReconnectReplacesWaitingDeterministic(t *testing.T) {
+	relayID := mustIdentity(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	svc := NewService(relayID, ln)
+	go svc.Serve(context.Background()) //nolint:errcheck
+	t.Cleanup(func() { _ = svc.Close() })
+
+	idA, idB := mustIdentity(t), mustIdentity(t)
+	channel := relayc.ChannelID(idA.X25519Public, idB.X25519Public)
+
+	// Synchronization: A1 signals when it reaches the test hook (after
+	// handshake, before registration). The test waits for A1 ready, dials A2,
+	// then polls until A2 is registered in svc.waiting. A1 then proceeds and
+	// should find A2 already registered and close itself (since A1 is older).
+	a1Ready := make(chan struct{})
+	a1Done := make(chan struct{})
+
+	var hookCount int32
+	svc.afterHandshake = func(sc *serverConn) {
+		count := atomic.AddInt32(&hookCount, 1)
+		switch count {
+		case 1:
+			// First connection (A1): signal ready, wait for test to signal done
+			close(a1Ready)
+			<-a1Done
+		case 2:
+			// Second connection (A2): return immediately so it can register
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Dial A1 first (it will reach the hook first)
+	cA1, err := relayc.Dial(ctx, svc.Addr(), relayID.X25519Public, idA, idB.X25519Public)
+	if err != nil {
+		t.Fatalf("Dial A1: %v", err)
+	}
+
+	// Give A1 time to reach the hook
+	select {
+	case <-a1Ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("A1 did not reach test hook in time")
+	}
+
+	// Now dial A2 (it will register before A1 proceeds)
+	cA2, err := relayc.Dial(ctx, svc.Addr(), relayID.X25519Public, idA, idB.X25519Public)
+	if err != nil {
+		t.Fatalf("Dial A2: %v", err)
+	}
+
+	// Wait for A2 to actually register in svc.waiting
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		svc.mu.Lock()
+		registered := svc.waiting[channel] != nil
+		svc.mu.Unlock()
+		if registered {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("A2 did not register in svc.waiting before deadline")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Now let A1 proceed (it will see A2 registered and close itself)
+	close(a1Done)
+
+	// Wait for A1's handler to finish
+	select {
+	case <-a1Done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("A1 handler did not complete in time")
+	}
+
+	// A1 must be closed by the relay (newer A2 won)
+	if _, err := readWithTimeout(t, cA1, 3*time.Second); err == nil {
+		t.Error("stale connection A1 must be closed, got no error")
+	}
+
+	// B pairs with the fresh A2
+	cB, err := relayc.Dial(ctx, svc.Addr(), relayID.X25519Public, idB, idA.X25519Public)
+	if err != nil {
+		t.Fatalf("Dial B: %v", err)
+	}
+	t.Cleanup(func() { _ = cA2.Close(); _ = cB.Close() })
+
+	want := []byte("B reaches the new A")
+	if err := cB.WriteMessage(want); err != nil {
+		t.Fatalf("WriteMessage B: %v", err)
+	}
+	got, err := cA2.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage A2: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("A2 got %q, want %q", got, want)
+	}
+}
+
+// TestReconnectOlderStalledAfterNewerPaired verifies that if a newer
+// connection (A2) pairs with B and leaves waiting, an older stalled
+// connection (A1) cannot re-register itself in waiting. This is the
+// adversarial case where A1's handler was stalled between msg2 and
+// registration while A2 registered, paired, and left waiting.
+func TestReconnectOlderStalledAfterNewerPaired(t *testing.T) {
+	relayID := mustIdentity(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	svc := NewService(relayID, ln)
+	go svc.Serve(context.Background()) //nolint:errcheck
+	t.Cleanup(func() { _ = svc.Close() })
+
+	idA, idB := mustIdentity(t), mustIdentity(t)
+	channel := relayc.ChannelID(idA.X25519Public, idB.X25519Public)
+
+	// Synchronization:
+	// - A1 signals when it reaches the hook (after handshake, before registration)
+	// - A2 waits for A1 ready, then proceeds to registration
+	// - B dials and pairs with A2 (A2 leaves waiting)
+	// - A1 then proceeds and should be rejected because maxSeq for
+	//   (channel, clientKey) is A2's seq (which is higher than A1's)
+	a1Ready := make(chan struct{})
+	a2Paired := make(chan struct{})
+	a1Done := make(chan struct{})
+
+	var hookCount int32
+	svc.afterHandshake = func(sc *serverConn) {
+		count := atomic.AddInt32(&hookCount, 1)
+		switch count {
+		case 1:
+			// A1: signal ready, wait for A2 to pair
+			close(a1Ready)
+			<-a2Paired
+			close(a1Done)
+		case 2:
+			// A2: wait for A1 ready, then return immediately to register
+			<-a1Ready
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Dial A1 first (it will reach the hook first)
+	cA1, err := relayc.Dial(ctx, svc.Addr(), relayID.X25519Public, idA, idB.X25519Public)
+	if err != nil {
+		t.Fatalf("Dial A1: %v", err)
+	}
+
+	// Give A1 time to reach the hook
+	select {
+	case <-a1Ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("A1 did not reach test hook in time")
+	}
+
+	// Now dial A2 (it will register before A1 proceeds)
+	cA2, err := relayc.Dial(ctx, svc.Addr(), relayID.X25519Public, idA, idB.X25519Public)
+	if err != nil {
+		t.Fatalf("Dial A2: %v", err)
+	}
+
+	// Wait for A2 to actually register in svc.waiting
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		svc.mu.Lock()
+		registered := svc.waiting[channel] != nil
+		svc.mu.Unlock()
+		if registered {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("A2 did not register in svc.waiting before deadline")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Now dial B - it should pair with A2
+	cB, err := relayc.Dial(ctx, svc.Addr(), relayID.X25519Public, idB, idA.X25519Public)
+	if err != nil {
+		t.Fatalf("Dial B: %v", err)
+	}
+	t.Cleanup(func() { _ = cA2.Close(); _ = cB.Close() })
+
+	// Verify A2 and B are paired by sending a message
+	want := []byte("B reaches A2")
+	if err := cB.WriteMessage(want); err != nil {
+		t.Fatalf("WriteMessage B: %v", err)
+	}
+	got, err := cA2.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage A2: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("A2 got %q, want %q", got, want)
+	}
+
+	// Now A2 has paired and left waiting. Signal A1 to proceed.
+	close(a2Paired)
+
+	// Wait for A1's handler to finish (it should be rejected and close)
+	select {
+	case <-a1Done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("A1 handler did not complete in time")
+	}
+
+	// A1 must be closed by the relay (maxSeq check rejects it)
+	if _, err := readWithTimeout(t, cA1, 3*time.Second); err == nil {
+		t.Error("stale connection A1 must be closed, got no error")
+	}
+
+	// Verify A2 is still connected and working (not affected by A1's attempt)
+	want2 := []byte("B still reaches A2")
+	if err := cB.WriteMessage(want2); err != nil {
+		t.Fatalf("WriteMessage B again: %v", err)
+	}
+	got2, err := cA2.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage A2 again: %v", err)
+	}
+	if !bytes.Equal(got2, want2) {
+		t.Errorf("A2 got %q, want %q", got2, want2)
 	}
 }
 
