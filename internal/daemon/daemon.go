@@ -67,15 +67,17 @@ type Daemon struct {
 	policyDecider   acl.PolicyDecider // combined local + network
 	selfPeerID      [32]byte
 
-	mu              sync.Mutex
-	vpnAddr         netip.Addr
-	peerID          string
-	coordAddr       string
-	relayProxies    map[[32]byte]*relay.Proxy // one relay proxy per peer ID
-	tunDev          tun.TUN                   // veld's own TUN; nil in coord mode until the coordinator assigns the VPN address
-	tofuMismatchLog map[string]time.Time      // last log time per VPN address for TOFU mismatch rate limiting
-	tofuLastPrune   time.Time                 // last time the tofuMismatchLog was pruned
-	now             func() time.Time          // injectable clock for tests; defaults to time.Now
+	mu                 sync.Mutex
+	vpnAddr            netip.Addr
+	peerID             string
+	coordAddr          string
+	coordPolicyVer     int                       // network policy version received from coordinator (verified)
+	coordPolicyRefused bool                      // whether the coordinator's policy was refused
+	relayProxies       map[[32]byte]*relay.Proxy // one relay proxy per peer ID
+	tunDev             tun.TUN                   // veld's own TUN; nil in coord mode until the coordinator assigns the VPN address
+	tofuMismatchLog    map[string]time.Time      // last log time per VPN address for TOFU mismatch rate limiting
+	tofuLastPrune      time.Time                 // last time the tofuMismatchLog was pruned
+	now                func() time.Time          // injectable clock for tests; defaults to time.Now
 }
 
 // New creates a Daemon from pre-constructed components.
@@ -535,6 +537,28 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 
 		d.coordCli.OnSignal = d.natMgr.DeliverSignal
 
+		d.coordCli.OnNetworkPolicy = func(envelope []byte) {
+			if d.netPolicyLoader != nil {
+				stored, err := d.netPolicyLoader.StoreEnvelope(envelope)
+				if err != nil {
+					log.Printf("network policy: store envelope failed: %v", err)
+				}
+				// Track coordinator's policy version from the envelope ONLY after successful verification
+				d.mu.Lock()
+				if stored {
+					version, err := acl.ExtractPolicyVersionFromEnvelope(envelope)
+					if err == nil {
+						d.coordPolicyVer = version
+						d.coordPolicyRefused = false
+					}
+				} else {
+					// Envelope was refused (invalid or lower version)
+					d.coordPolicyRefused = true
+				}
+				d.mu.Unlock()
+			}
+		}
+
 		// When the coordinator assigns a VPN address, create the TUN so the
 		// data plane comes up. Extracted for direct testability.
 		d.coordCli.OnVPNAddrAssigned = d.onVPNAddrAssigned(cfg, conn, userspace)
@@ -547,7 +571,7 @@ func NewFromConfig(cfg *intconfig.Config) (*Daemon, error) {
 	}
 	d.ipcSrv = NewIPCServer(socketPath, func() {
 		d.Stop()
-	}, d, d)
+	}, d, d, d)
 
 	// Wire up DNS stub resolver if enabled.
 	if cfg.DNS.Enabled {
@@ -1071,10 +1095,16 @@ func (d *Daemon) NetworkPolicyStatus() ipctypes.NetworkPolicyStatus {
 		return ipctypes.NetworkPolicyStatus{}
 	}
 	npStatus := d.netPolicyLoader.NetworkPolicyStatus()
+	d.mu.Lock()
+	coordVersion := d.coordPolicyVer
+	coordRefused := d.coordPolicyRefused
+	d.mu.Unlock()
 	return ipctypes.NetworkPolicyStatus{
-		Version: npStatus.Version,
-		Signer:  npStatus.Signer,
-		Age:     npStatus.Age,
+		Version:            npStatus.Version,
+		Signer:             npStatus.Signer,
+		Age:                npStatus.Age,
+		CoordinatorVersion: coordVersion,
+		CoordinatorRefused: coordRefused,
 	}
 }
 
@@ -1122,4 +1152,14 @@ func (d *Daemon) ReloadNetworkPolicy() error {
 	d.policyDecider = d.policyLoader.CombinedPolicy()
 	d.disp.SetPolicyDecider(d.policyDecider)
 	return nil
+}
+
+// PushNetworkPolicy pushes a signed network policy envelope to the coordinator.
+func (d *Daemon) PushNetworkPolicy(envelope []byte) (int, error) {
+	if d.coordCli == nil {
+		return 0, fmt.Errorf("no coordinator configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return d.coordCli.PushNetworkPolicy(ctx, envelope)
 }

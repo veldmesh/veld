@@ -604,7 +604,7 @@ func openTofuStore() (*tofu.Store, error) {
 var policyCmd = &cobra.Command{
 	Use:   "policy",
 	Short: "Manage ACL policies",
-	Long:  "Validate, test, sign, and inspect ACL policies.",
+	Long:  "Validate, test, sign, push, and inspect ACL policies.",
 }
 
 var (
@@ -613,7 +613,7 @@ var (
 
 func init() {
 	policyCmd.PersistentFlags().StringVar(&policyConfigPath, "config", "", "config file path (default: ~/.config/veld/config.toml)")
-	policyCmd.AddCommand(policyCheckCmd, policyTestCmd, policyStatusCmd, policyKeygenCmd, policySignCmd, policyReloadCmd)
+	policyCmd.AddCommand(policyCheckCmd, policyTestCmd, policyStatusCmd, policyKeygenCmd, policySignCmd, policyPushCmd, policyReloadCmd)
 }
 
 // --- POLICY CHECK command ---
@@ -792,7 +792,9 @@ var policyStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show active policy status from daemon",
 	Long: `Show the active local policy path and hash, network policy version/signer/age,
-drop counters per peer and rule, and the last N drops.`,
+drop counters per peer and rule, and the last N drops. When using coordinator mode,
+also shows if the coordinator's version differs from the locally enforced version
+(stale peer visible).`,
 	RunE: runPolicyStatus,
 }
 
@@ -844,6 +846,13 @@ func runPolicyStatus(cobraCmd *cobra.Command, args []string) error {
 		}
 		if result.NetworkPolicy.Age != "" {
 			out.Printf("  Age: %s\n", result.NetworkPolicy.Age)
+		}
+		if result.NetworkPolicy.CoordinatorVersion > 0 {
+			syncStatus := "synced"
+			if result.NetworkPolicy.CoordinatorVersion != result.NetworkPolicy.Version {
+				syncStatus = "STALE (coordinator has newer version)"
+			}
+			out.Printf("  Coordinator Version: %d (%s)\n", result.NetworkPolicy.CoordinatorVersion, syncStatus)
 		}
 	} else {
 		out.Printf("  (none)\n")
@@ -1000,6 +1009,62 @@ func runPolicySign(cobraCmd *cobra.Command, args []string) error {
 	}
 
 	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "Signed policy written to %s (version %d)\n", policySignOut, p.Version)
+	return nil
+}
+
+// --- POLICY PUSH command ---
+
+var policyPushCmd = &cobra.Command{
+	Use:   "push <policy.signed>",
+	Short: "Push a signed network policy to the coordinator",
+	Long: `Push a signed network policy envelope to the coordinator.
+The coordinator verifies the envelope header, checks the size cap (256 KiB)
+and version monotonicity, stores it, and distributes it to all peers in
+the network via the Watch stream. Requires the daemon to be running and
+connected to a coordinator.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPolicyPush,
+}
+
+func runPolicyPush(cobraCmd *cobra.Command, args []string) error {
+	policyPath := args[0]
+
+	sock := getSocketPath()
+
+	if !isRunning(sock) {
+		return fmt.Errorf("daemon not running")
+	}
+
+	// Read the signed policy envelope
+	envelope, err := os.ReadFile(policyPath)
+	if err != nil {
+		return fmt.Errorf("read policy file: %w", err)
+	}
+
+	if len(envelope) == 0 {
+		return fmt.Errorf("empty policy envelope")
+	}
+
+	client := newSocketClient(sock)
+	resp, err := client.Post("http://daemon/api/policy/push", "application/octet-stream", strings.NewReader(string(envelope)))
+	if err != nil {
+		return fmt.Errorf("push request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("push failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var result struct {
+		Version int `json:"version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+
+	_, _ = fmt.Fprintf(cobraCmd.OutOrStdout(), "network policy pushed (version %d)\n", result.Version)
 	return nil
 }
 

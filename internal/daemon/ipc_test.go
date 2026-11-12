@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,7 +37,7 @@ func TestIPCServer_Status(t *testing.T) {
 	socketPath := tempSock(t)
 
 	stopCh := make(chan struct{})
-	srv := NewIPCServer(socketPath, func() { close(stopCh) }, nil, nil)
+	srv := NewIPCServer(socketPath, func() { close(stopCh) }, nil, nil, nil)
 
 	err := srv.Start()
 	if err != nil {
@@ -82,7 +83,7 @@ func TestIPCServer_Status(t *testing.T) {
 func TestIPCServer_UpdateStatus(t *testing.T) {
 	socketPath := tempSock(t)
 
-	srv := NewIPCServer(socketPath, func() {}, nil, nil)
+	srv := NewIPCServer(socketPath, func() {}, nil, nil, nil)
 	err := srv.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -144,7 +145,7 @@ func TestIPCServer_Shutdown(t *testing.T) {
 	socketPath := tempSock(t)
 
 	stopped := make(chan struct{})
-	srv := NewIPCServer(socketPath, func() { close(stopped) }, nil, nil)
+	srv := NewIPCServer(socketPath, func() { close(stopped) }, nil, nil, nil)
 
 	err := srv.Start()
 	if err != nil {
@@ -185,7 +186,7 @@ func TestIPCServer_Shutdown(t *testing.T) {
 func TestIPCServer_MethodNotAllowed(t *testing.T) {
 	socketPath := tempSock(t)
 
-	srv := NewIPCServer(socketPath, func() {}, nil, nil)
+	srv := NewIPCServer(socketPath, func() {}, nil, nil, nil)
 	err := srv.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -243,7 +244,7 @@ func TestPeerTableSnapshot(t *testing.T) {
 func TestIPCServer_StartStop(t *testing.T) {
 	socketPath := tempSock(t)
 
-	srv := NewIPCServer(socketPath, func() {}, nil, nil)
+	srv := NewIPCServer(socketPath, func() {}, nil, nil, nil)
 
 	// Test that Start/Stop work
 	err := srv.Start()
@@ -319,6 +320,23 @@ func (m *mockNetworkPolicyReloader) ReloadNetworkPolicy() error {
 	return m.reloadErr
 }
 
+// mockNetworkPolicyPusher implements NetworkPolicyPusher for testing.
+type mockNetworkPolicyPusher struct {
+	pushCalled   bool
+	pushErr      error
+	pushVersion  int
+	lastEnvelope []byte
+}
+
+func (m *mockNetworkPolicyPusher) PushNetworkPolicy(envelope []byte) (int, error) {
+	m.pushCalled = true
+	m.lastEnvelope = envelope
+	if m.pushErr != nil {
+		return 0, m.pushErr
+	}
+	return m.pushVersion, nil
+}
+
 // TestIPCServer_PolicyStatus tests the /api/policy/status endpoint.
 func TestIPCServer_PolicyStatus(t *testing.T) {
 	socketPath := tempSock(t)
@@ -380,7 +398,7 @@ ports = ["tcp/22"]
 		},
 	}
 
-	srv := NewIPCServer(socketPath, func() {}, mock, nil)
+	srv := NewIPCServer(socketPath, func() {}, mock, nil, nil)
 
 	err := srv.Start()
 	if err != nil {
@@ -488,7 +506,7 @@ func TestIPCServer_PolicyStatus_NoPolicy(t *testing.T) {
 		recentDrops:  nil,
 	}
 
-	srv := NewIPCServer(socketPath, func() {}, mock, nil)
+	srv := NewIPCServer(socketPath, func() {}, mock, nil, nil)
 
 	err := srv.Start()
 	if err != nil {
@@ -544,7 +562,7 @@ func TestIPCServer_PolicyStatus_NoPolicy(t *testing.T) {
 func TestIPCServer_PolicyStatus_MethodNotAllowed(t *testing.T) {
 	socketPath := tempSock(t)
 
-	srv := NewIPCServer(socketPath, func() {}, nil, nil)
+	srv := NewIPCServer(socketPath, func() {}, nil, nil, nil)
 	err := srv.Start()
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -579,7 +597,7 @@ func TestIPCServer_ReloadNetworkPolicy(t *testing.T) {
 
 	reloader := &mockNetworkPolicyReloader{}
 
-	srv := NewIPCServer(socketPath, func() {}, nil, reloader)
+	srv := NewIPCServer(socketPath, func() {}, nil, reloader, nil)
 
 	err := srv.Start()
 	if err != nil {
@@ -648,7 +666,7 @@ func TestIPCServer_ReloadNetworkPolicy(t *testing.T) {
 func TestIPCServer_ReloadNetworkPolicy_NoReloader(t *testing.T) {
 	socketPath := tempSock(t)
 
-	srv := NewIPCServer(socketPath, func() {}, nil, nil)
+	srv := NewIPCServer(socketPath, func() {}, nil, nil, nil)
 
 	err := srv.Start()
 	if err != nil {
@@ -682,7 +700,7 @@ func TestIPCServer_ReloadNetworkPolicy_NoReloader(t *testing.T) {
 func TestIPCServer_ReloadNetworkPolicy_MethodNotAllowed(t *testing.T) {
 	socketPath := tempSock(t)
 
-	srv := NewIPCServer(socketPath, func() {}, nil, nil)
+	srv := NewIPCServer(socketPath, func() {}, nil, nil, nil)
 
 	err := srv.Start()
 	if err != nil {
@@ -720,7 +738,7 @@ func TestIPCServer_ReloadNetworkPolicy_ReloadError(t *testing.T) {
 		reloadErr: errTestFailure,
 	}
 
-	srv := NewIPCServer(socketPath, func() {}, nil, reloader)
+	srv := NewIPCServer(socketPath, func() {}, nil, reloader, nil)
 
 	err := srv.Start()
 	if err != nil {
@@ -753,6 +771,315 @@ func TestIPCServer_ReloadNetworkPolicy_ReloadError(t *testing.T) {
 	if string(body) != "test failure\n" {
 		t.Errorf("expected error message 'test failure\\n', got %q", string(body))
 	}
+}
+
+// TestIPCServer_PolicyPush tests the /api/policy/push endpoint.
+func TestIPCServer_PolicyPush(t *testing.T) {
+	socketPath := tempSock(t)
+
+	adminPriv, adminPub, err := acl.GenerateAdminKey()
+	if err != nil {
+		t.Fatalf("generate admin key: %v", err)
+	}
+	var adminPubKey [32]byte
+	copy(adminPubKey[:], adminPub)
+
+	envelope, err := acl.SignPolicy(`
+version = 1
+default = "deny"
+[peers]
+alice = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bob   = "ed25519:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+[[rule]]
+from = "alice"
+to   = "bob"
+ports = ["tcp/22"]
+`, adminPriv)
+	if err != nil {
+		t.Fatalf("sign policy: %v", err)
+	}
+
+	pusher := &mockNetworkPolicyPusher{
+		pushVersion: 1,
+	}
+
+	srv := NewIPCServer(socketPath, func() {}, nil, nil, pusher)
+
+	err = srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+
+	// POST with valid envelope
+	resp, err := client.Post("http://daemon/api/policy/push", "application/octet-stream", strings.NewReader(string(envelope)))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Version int `json:"version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if result.Version != 1 {
+		t.Errorf("expected version=1, got %d", result.Version)
+	}
+	if !pusher.pushCalled {
+		t.Error("expected PushNetworkPolicy to be called")
+	}
+	if !bytesEqual(pusher.lastEnvelope, envelope) {
+		t.Error("envelope passed to pusher doesn't match input")
+	}
+}
+
+// TestIPCServer_PolicyPush_EmptyEnvelope tests that empty envelope is rejected.
+func TestIPCServer_PolicyPush_EmptyEnvelope(t *testing.T) {
+	socketPath := tempSock(t)
+
+	pusher := &mockNetworkPolicyPusher{}
+
+	srv := NewIPCServer(socketPath, func() {}, nil, nil, pusher)
+
+	err := srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+
+	resp, err := client.Post("http://daemon/api/policy/push", "application/octet-stream", strings.NewReader(""))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for empty envelope, got %d", resp.StatusCode)
+	}
+	if pusher.pushCalled {
+		t.Error("expected PushNetworkPolicy NOT to be called for empty envelope")
+	}
+}
+
+// TestIPCServer_PolicyPush_PusherError tests that errors from the pusher are returned.
+func TestIPCServer_PolicyPush_PusherError(t *testing.T) {
+	socketPath := tempSock(t)
+
+	pusher := &mockNetworkPolicyPusher{
+		pushErr: errors.New("coord not connected"),
+	}
+
+	srv := NewIPCServer(socketPath, func() {}, nil, nil, pusher)
+
+	err := srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+
+	adminPriv, _, _ := acl.GenerateAdminKey()
+	envelope, _ := acl.SignPolicy(`
+version = 1
+default = "deny"
+[peers]
+alice = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+[[rule]]
+from = "alice"
+to   = "alice"
+ports = ["tcp/22"]
+`, adminPriv)
+
+	resp, err := client.Post("http://daemon/api/policy/push", "application/octet-stream", strings.NewReader(string(envelope)))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "coord not connected") {
+		t.Errorf("expected error message to contain 'coord not connected', got %q", string(body))
+	}
+}
+
+// TestIPCServer_PolicyPush_NoPusher tests the endpoint when no pusher is configured.
+func TestIPCServer_PolicyPush_NoPusher(t *testing.T) {
+	socketPath := tempSock(t)
+
+	srv := NewIPCServer(socketPath, func() {}, nil, nil, nil)
+
+	err := srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+
+	adminPriv, _, _ := acl.GenerateAdminKey()
+	envelope, _ := acl.SignPolicy(`
+version = 1
+default = "deny"
+[peers]
+alice = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+[[rule]]
+from = "alice"
+to   = "alice"
+ports = ["tcp/22"]
+`, adminPriv)
+
+	resp, err := client.Post("http://daemon/api/policy/push", "application/octet-stream", strings.NewReader(string(envelope)))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 (no coordinator), got %d", resp.StatusCode)
+	}
+}
+
+// TestIPCServer_PolicyPush_MethodNotAllowed tests that GET to the push endpoint fails.
+func TestIPCServer_PolicyPush_MethodNotAllowed(t *testing.T) {
+	socketPath := tempSock(t)
+
+	srv := NewIPCServer(socketPath, func() {}, nil, nil, nil)
+
+	err := srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+
+	resp, err := client.Get("http://daemon/api/policy/push")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", resp.StatusCode)
+	}
+}
+
+// TestIPCServer_PolicyPush_EnvelopeSizeLimit tests that envelopes exceeding 256 KiB are truncated by LimitReader.
+func TestIPCServer_PolicyPush_EnvelopeSizeLimit(t *testing.T) {
+	socketPath := tempSock(t)
+
+	pusher := &mockNetworkPolicyPusher{}
+
+	srv := NewIPCServer(socketPath, func() {}, nil, nil, pusher)
+
+	err := srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+
+	// Create envelope larger than 256 KiB
+	largeEnvelope := make([]byte, 256<<10+1)
+
+	resp, err := client.Post("http://daemon/api/policy/push", "application/octet-stream", strings.NewReader(string(largeEnvelope)))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// The IPC handler reads with LimitReader(256 KiB), so it will only read 256 KiB
+	// and then the pusher will receive a truncated envelope. The handler doesn't explicitly
+	// check the size before calling the pusher, but the LimitReader caps it.
+	// This test verifies the pusher gets called with a truncated envelope (256 KiB).
+	if !pusher.pushCalled {
+		t.Error("expected PushNetworkPolicy to be called (with truncated envelope)")
+	}
+	if len(pusher.lastEnvelope) != 256<<10 {
+		t.Errorf("expected envelope to be truncated to 256 KiB, got %d bytes", len(pusher.lastEnvelope))
+	}
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 var errTestFailure = errors.New("test failure")
