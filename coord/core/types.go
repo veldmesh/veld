@@ -71,6 +71,7 @@ const (
 	AuditNetworkCreated       AuditEventKind = "network.created"
 	AuditSubnetRouteAdded     AuditEventKind = "subnet.route.added"
 	AuditRegistrationRejected AuditEventKind = "registration.rejected"
+	AuditNetworkPolicyPushed  AuditEventKind = "network_policy.pushed"
 )
 
 // AuditEvent is a single audit record.

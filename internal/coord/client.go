@@ -80,6 +80,9 @@ type Client struct {
 	// to this daemon. It provides the assigned VPN address and the network CIDR
 	// (empty string if the server did not provide one).
 	OnVPNAddrAssigned func(vpnAddr netip.Addr, networkCIDR string)
+	// OnNetworkPolicy is called when the coordinator sends a network policy
+	// envelope (on Register, initial Watch snapshot, or policy update).
+	OnNetworkPolicy func(envelope []byte)
 }
 
 // New creates a Client. Call Start to connect.
@@ -157,6 +160,39 @@ func (c *Client) SendSignal(ctx context.Context, toPeerID string, payload []byte
 			crypto.SendSignalClaims(fromPeerID, toPeerID, payload, ts)),
 	})
 	return err
+}
+
+// PushNetworkPolicy uploads a signed network policy envelope to the coordinator.
+// Returns the version of the stored policy.
+func (c *Client) PushNetworkPolicy(ctx context.Context, envelope []byte) (int, error) {
+	c.gcMu.Lock()
+	gc := c.gc
+	c.gcMu.Unlock()
+	if gc == nil {
+		return 0, errors.New("coord client not connected")
+	}
+	c.mu.Lock()
+	peerID := c.peerID
+	token := c.cfg.Token
+	networkID := c.cfg.NetworkID
+	c.mu.Unlock()
+	if peerID == "" {
+		return 0, errors.New("not registered yet")
+	}
+	ts := time.Now().Unix()
+	resp, err := gc.PushNetworkPolicy(ctx, &coordv1.PushNetworkPolicyRequest{
+		NetworkId:     networkID,
+		Token:         token,
+		PeerId:        peerID,
+		Envelope:      envelope,
+		TimestampUnix: ts,
+		Signature: crypto.SignCall(c.cfg.Identity.Ed25519Private,
+			crypto.PushNetworkPolicyClaims(peerID, networkID, envelope, ts)),
+	})
+	if err != nil {
+		return 0, err
+	}
+	return int(resp.Version), nil
 }
 
 func (c *Client) run(ctx context.Context) {
@@ -278,6 +314,11 @@ func (c *Client) registerAndWatch(ctx context.Context, gc coordv1.CoordClient) e
 	c.networkCidr = cidr
 	c.mu.Unlock()
 
+	// Handle network policy from Register response
+	if len(resp.NetworkPolicy) > 0 && c.OnNetworkPolicy != nil {
+		c.OnNetworkPolicy(resp.NetworkPolicy)
+	}
+
 	// Notify about VPN address assignment so the daemon can create its TUN.
 	if c.OnVPNAddrAssigned != nil {
 		c.OnVPNAddrAssigned(vpnAddr, cidr)
@@ -378,6 +419,11 @@ func (c *Client) handleEvent(ev *coordv1.PeerEvent, myID string) {
 		}
 		if c.OnRouteUpdate != nil {
 			c.OnRouteUpdate(id, routes)
+		}
+
+	case coordv1.EventType_NETWORK_POLICY:
+		if ev.NetworkPolicy != nil && c.OnNetworkPolicy != nil {
+			c.OnNetworkPolicy(ev.NetworkPolicy.Envelope)
 		}
 	}
 }

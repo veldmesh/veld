@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -49,6 +50,11 @@ type NetworkPolicyReloader interface {
 	ReloadNetworkPolicy() error
 }
 
+// NetworkPolicyPusher provides network policy push capability via IPC.
+type NetworkPolicyPusher interface {
+	PushNetworkPolicy(envelope []byte) (int, error)
+}
+
 // IPCServer is an HTTP server on a Unix domain socket that exposes daemon state.
 type IPCServer struct {
 	socketPath        string
@@ -59,6 +65,7 @@ type IPCServer struct {
 	listener          net.Listener
 	policyProvider    PolicyStatusProvider
 	netPolicyReloader NetworkPolicyReloader
+	netPolicyPusher   NetworkPolicyPusher
 	lastReloadTime    time.Time
 }
 
@@ -66,18 +73,21 @@ type IPCServer struct {
 // stopFn is invoked when POST /api/shutdown is received.
 // policyProvider provides policy status for /api/policy/status.
 // netPolicyReloader provides network policy reload capability (can be nil).
-func NewIPCServer(socketPath string, stopFn func(), policyProvider PolicyStatusProvider, netPolicyReloader NetworkPolicyReloader) *IPCServer {
+// netPolicyPusher provides network policy push capability (can be nil).
+func NewIPCServer(socketPath string, stopFn func(), policyProvider PolicyStatusProvider, netPolicyReloader NetworkPolicyReloader, netPolicyPusher NetworkPolicyPusher) *IPCServer {
 	s := &IPCServer{
 		socketPath:        socketPath,
 		stopFn:            stopFn,
 		policyProvider:    policyProvider,
 		netPolicyReloader: netPolicyReloader,
+		netPolicyPusher:   netPolicyPusher,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/shutdown", s.handleShutdown)
 	mux.HandleFunc("/api/policy/status", s.handlePolicyStatus)
 	mux.HandleFunc("/api/policy/reload-network", s.handleReloadNetworkPolicy)
+	mux.HandleFunc("/api/policy/push", s.handlePolicyPush)
 	s.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	return s
 }
@@ -95,6 +105,13 @@ func (s *IPCServer) SetNetworkPolicyReloader(r NetworkPolicyReloader) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.netPolicyReloader = r
+}
+
+// SetNetworkPolicyPusher sets the network policy pusher.
+func (s *IPCServer) SetNetworkPolicyPusher(p NetworkPolicyPusher) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.netPolicyPusher = p
 }
 
 // UpdateStatus atomically replaces the cached status.
@@ -217,6 +234,48 @@ func (s *IPCServer) handleReloadNetworkPolicy(w http.ResponseWriter, r *http.Req
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *IPCServer) handlePolicyPush(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.mu.Lock()
+	pusher := s.netPolicyPusher
+	s.mu.Unlock()
+
+	if pusher == nil {
+		http.Error(w, "network policy push not available (no coordinator)", http.StatusNotFound)
+		return
+	}
+
+	// Read the envelope from the request body
+	body, err := io.ReadAll(io.LimitReader(r.Body, 256<<10)) // 256 KiB max
+	if err != nil {
+		http.Error(w, "read request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body) == 0 {
+		http.Error(w, "empty policy envelope", http.StatusBadRequest)
+		return
+	}
+
+	version, err := pusher.PushNetworkPolicy(body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp := struct {
+		Version int `json:"version"`
+	}{Version: version}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
 }
 
 func dropCountersToStatus(dc *acl.DropCounters) ipctypes.DropCountersStatus {

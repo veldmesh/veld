@@ -68,6 +68,29 @@ Veld enforces two policy layers:
 
 A packet passes only if **BOTH** policies allow it. Missing local policy = defer to network policy.
 
+## Operating Modes
+
+### Static Mode (Local File Only)
+
+In static mode, the network policy is read from a local file (`network_file` in config). The daemon watches the file for changes and reloads on SIGHUP or file modification.
+
+### Coordinator Mode (Distributed via Coordinator)
+
+In coordinator mode, the signed network policy is **pushed to the coordinator** (`veld policy push`) which stores it as an opaque blob and distributes it to all peers via the `Watch` stream (initial snapshot + update events). The coordinator:
+
+- **Never parses the policy payload** — only validates the envelope header (magic, format version, length)
+- **Enforces size cap** — 256 KiB maximum
+- **Enforces version monotonicity** — new version must be strictly greater than stored version
+- **Authorizes pushes** — requires account token + call signature by a registered peer's key
+- **Survives restarts** — stored in bbolt per network
+
+Peers receive the current policy blob on `Register` and `Watch` and verify it exactly like a static network file:
+- Signature validity (Ed25519 over canonical payload)
+- Signer authorization (signer's public key in pinned `admin_keys`)
+- Version monotonicity (refuse unsigned/unpinned/lower versions)
+
+The coordinator **cannot widen or roll back** the policy — peers enforce the same verification locally.
+
 ## Daemon Configuration
 
 Add a `[daemon.policy]` section to your config:
@@ -78,7 +101,7 @@ socket_path = "/run/veld/daemon.sock"
 
 [daemon.policy]
 local_file   = "/etc/veld/policy.toml"      # Optional; defaults to policy.toml next to identity file
-network_file = "/etc/veld/policy.signed"    # Optional; signed network policy file
+network_file = "/etc/veld/policy.signed"    # Optional; signed network policy file (static mode)
 admin_keys   = ["ed25519:AAAA...", "ed25519:BBBB..."]  # Pinned admin public keys for verification
 ```
 
@@ -187,6 +210,15 @@ $ veld policy sign policy.toml --key admin.key --out policy.signed
 Signed policy written to policy.signed (version 1)
 ```
 
+### `veld policy push <policy.signed>`
+
+Push a signed network policy envelope to the coordinator. The coordinator verifies the envelope header, checks the size cap (256 KiB) and version monotonicity, stores it, and distributes it to all peers in the network via the Watch stream. Requires the daemon to be running and connected to a coordinator.
+
+```bash
+$ veld policy push policy.signed
+network policy pushed (version 2)
+```
+
 ### `veld policy reload`
 
 Triggers the running daemon to reload the network policy file via IPC. Requires the daemon to be running with a network policy configured.
@@ -198,7 +230,7 @@ network policy reloaded
 
 ### `veld policy status`
 
-Show the active local policy path and hash, network policy version/signer/age, drop counters per peer and rule, and the last N drops (peer, proto, port, time; no payload).
+Show the active local policy path and hash, network policy version/signer/age, drop counters per peer and rule, and the last N drops (peer, proto, port, time; no payload). When using coordinator mode, also shows if the coordinator's version differs from the locally enforced version (stale peer visible).
 
 ```bash
 $ veld policy status
@@ -213,6 +245,7 @@ Network Policy:
   Version: 2
   Signer: ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
   Age: 5m30s
+  Coordinator Version: 2  (synced)
 
 Drop Counters:
   By Peer:
@@ -327,6 +360,8 @@ ports = ["tcp/22"]
 | Network policy truncated/invalid | Ignored, current policy kept, logged |
 | Both policies deny | Packet dropped, drop counter incremented |
 | Policy reload removes a rule | Existing flows re-checked; revoked connections dropped |
+| Coordinator sends lower version | Refused by peer (rollback protection) |
+| Coordinator sends forged envelope | Refused by peer (signature/pinned key check) |
 
 ## Testing ACL Policies
 

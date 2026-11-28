@@ -3,6 +3,7 @@
 package server
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,8 +32,10 @@ type Registry struct {
 
 // Bucket names
 var (
-	bucketNetworks = []byte("networks")
-	bucketPeers    = []byte("peers")
+	bucketNetworks         = []byte("networks")
+	bucketPeers            = []byte("peers")
+	bucketNetworkPolicy    = []byte("network_policy")
+	bucketNetworkAdminKeys = []byte("network_admin_keys")
 )
 
 // networkRecord is the on-disk representation of a network.
@@ -61,6 +64,22 @@ type peerRecord struct {
 	RegisteredAt  int64    `json:"registered_at"`
 }
 
+// networkPolicyRecord is the on-disk representation of a network policy.
+// The coord stores the opaque signed envelope and its version.
+type networkPolicyRecord struct {
+	NetworkID string `json:"network_id"`
+	Version   int    `json:"version"`
+	Envelope  []byte `json:"envelope"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+// networkAdminKeysRecord is the on-disk representation of a network's pinned admin keys.
+type networkAdminKeysRecord struct {
+	NetworkID string   `json:"network_id"`
+	Keys      []string `json:"keys"` // base64-encoded Ed25519 public keys
+	UpdatedAt int64    `json:"updated_at"`
+}
+
 // lastSeenGranularity is the coarseness, in seconds, of persisted
 // last-seen timestamps: they are rounded down to the hour so the
 // registry does not retain more detail about a machine's online
@@ -71,6 +90,9 @@ const lastSeenGranularity = int64(time.Hour / time.Second)
 // during the migration fallback for invalid NextIP. This prevents allocating
 // millions of entries for large CIDRs (e.g., /8).
 const maxFallbackHosts = 65536
+
+// maxNetworkPolicySize is the maximum size of a network policy envelope (256 KiB).
+const maxNetworkPolicySize = 256 << 10
 
 // roundToHour rounds a unix timestamp in seconds down to the hour. Zero
 // (never seen) is preserved: the sweep treats it as "no heartbeat" and
@@ -96,7 +118,7 @@ func NewRegistry(path string) (*Registry, error) {
 		return nil, fmt.Errorf("open bbolt: %w", err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketNetworks, bucketPeers} {
+		for _, name := range [][]byte{bucketNetworks, bucketPeers, bucketNetworkPolicy, bucketNetworkAdminKeys} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -245,6 +267,148 @@ func (r *Registry) NetworkMachineCount(networkID string) (int, error) {
 	return count, err
 }
 
+// GetNetworkPolicy returns the stored network policy envelope and its version.
+// Returns (nil, 0, nil) if no policy is stored.
+func (r *Registry) GetNetworkPolicy(networkID string) ([]byte, int, error) {
+	var envelope []byte
+	var version int
+	err := r.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket(bucketNetworkPolicy).Get([]byte(networkID))
+		if data == nil {
+			return nil
+		}
+		var rec networkPolicyRecord
+		if err := json.Unmarshal(data, &rec); err != nil {
+			return err
+		}
+		envelope = rec.Envelope
+		version = rec.Version
+		return nil
+	})
+	return envelope, version, err
+}
+
+// SetNetworkPolicy stores a network policy envelope if its version is higher
+// than the currently stored version. Returns the new version, or 0 if not stored
+// (version not higher). The envelope is stored as an opaque blob; the coord
+// never parses the policy payload.
+func (r *Registry) SetNetworkPolicy(networkID string, envelope []byte, version int) (int, error) {
+	// Check size cap
+	if len(envelope) > maxNetworkPolicySize {
+		return 0, fmt.Errorf("policy envelope exceeds max size of %d bytes", maxNetworkPolicySize)
+	}
+
+	var newVersion int
+	err := r.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketNetworkPolicy)
+		key := []byte(networkID)
+
+		// Check existing version
+		existingData := b.Get(key)
+		if existingData != nil {
+			var existingRec networkPolicyRecord
+			if err := json.Unmarshal(existingData, &existingRec); err != nil {
+				return err
+			}
+			if existingRec.Version >= version {
+				return ErrPolicyVersionNotHigher
+			}
+		}
+
+		rec := networkPolicyRecord{
+			NetworkID: networkID,
+			Version:   version,
+			Envelope:  envelope,
+			UpdatedAt: time.Now().Unix(),
+		}
+		data, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		if err := b.Put(key, data); err != nil {
+			return err
+		}
+		newVersion = version
+		return nil
+	})
+	return newVersion, err
+}
+
+// GetNetworkAdminKeys returns the pinned admin public keys for a network.
+// Returns an empty slice if no keys are pinned.
+func (r *Registry) GetNetworkAdminKeys(networkID string) (map[[32]byte]struct{}, error) {
+	var keys []string
+	err := r.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket(bucketNetworkAdminKeys).Get([]byte(networkID))
+		if data == nil {
+			return nil
+		}
+		var rec networkAdminKeysRecord
+		if err := json.Unmarshal(data, &rec); err != nil {
+			return err
+		}
+		keys = rec.Keys
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[[32]byte]struct{}, len(keys))
+	for _, k := range keys {
+		var key [32]byte
+		decoded, err := base64.StdEncoding.DecodeString(k)
+		if err != nil || len(decoded) != 32 {
+			// Skip invalid keys
+			continue
+		}
+		copy(key[:], decoded)
+		result[key] = struct{}{}
+	}
+	return result, nil
+}
+
+// SetNetworkAdminKeys sets the pinned admin public keys for a network.
+// Only the account that owns the network can call this.
+// Keys must be base64-encoded Ed25519 public keys (32 bytes).
+func (r *Registry) SetNetworkAdminKeys(networkID, accountID string, keys []string) error {
+	// Validate all keys first
+	validKeys := make([]string, 0, len(keys))
+	for _, k := range keys {
+		decoded, err := base64.StdEncoding.DecodeString(k)
+		if err != nil || len(decoded) != 32 {
+			return fmt.Errorf("invalid admin key %q: must be base64-encoded 32-byte Ed25519 public key", k)
+		}
+		validKeys = append(validKeys, k)
+	}
+
+	return r.db.Update(func(tx *bolt.Tx) error {
+		// Verify the network exists and is owned by the account
+		netData := tx.Bucket(bucketNetworks).Get([]byte(networkID))
+		if netData == nil {
+			return fmt.Errorf("network %q not found", networkID)
+		}
+		var netRec networkRecord
+		if err := json.Unmarshal(netData, &netRec); err != nil {
+			return err
+		}
+		if netRec.AccountID != accountID {
+			return fmt.Errorf("network %q not owned by account %q", networkID, accountID)
+		}
+
+		rec := networkAdminKeysRecord{
+			NetworkID: networkID,
+			Keys:      validKeys,
+			UpdatedAt: time.Now().Unix(),
+		}
+		data, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(bucketNetworkAdminKeys).Put([]byte(networkID), data)
+	})
+}
+
 // ErrMachineLimit is returned by RegisterPeer when the network is at capacity.
 var ErrMachineLimit = fmt.Errorf("machine limit reached")
 
@@ -263,6 +427,14 @@ var ErrPeerIDTaken = fmt.Errorf("peer id already registered in another network")
 // stored for the peer. Re-registering daemons keep their identity; key
 // rotation needs a signed flow, so the stored key is never overwritten.
 var ErrPeerKeyMismatch = fmt.Errorf("peer x25519 public key mismatch")
+
+// ErrPolicyVersionNotHigher is returned when the policy version is not
+// strictly greater than the stored version.
+var ErrPolicyVersionNotHigher = fmt.Errorf("policy version not higher than stored version")
+
+// ErrPolicySizeExceeded is returned when the policy envelope exceeds the
+// maximum allowed size.
+var ErrPolicySizeExceeded = fmt.Errorf("policy envelope exceeds max size")
 
 // migrateAssignedAddrs initializes AssignedAddrs for a pre-upgrade database
 // (where it is nil). It marks currently assigned addresses with timestamp 0

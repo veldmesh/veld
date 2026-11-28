@@ -98,7 +98,7 @@ func ParseNetworkPolicyEnvelope(data []byte, adminKeys map[[32]byte]struct{}) (*
 	var signerPubKey [32]byte
 	copy(signerPubKey[:], signerPubKeyBytes)
 	if _, ok := adminKeys[signerPubKey]; !ok {
-		return nil, fmt.Errorf("signer %s not pinned", formatPeerKey(signerPubKey))
+		return nil, fmt.Errorf("signer %s not pinned", FormatPeerKey(signerPubKey))
 	}
 
 	// Verify signature covers magic || format_version || payload_len || payload
@@ -224,7 +224,7 @@ func canonicalizePolicy(p *Policy) (string, error) {
 	// Peers need to be serialized with ed25519: prefix (base64) - sort keys for determinism
 	peerNames := slices.Sorted(maps.Keys(p.Peers))
 	for _, name := range peerNames {
-		cp.Peers[name] = formatPeerKey(p.Peers[name])
+		cp.Peers[name] = FormatPeerKey(p.Peers[name])
 	}
 
 	// Tags - sort keys and values for determinism
@@ -361,7 +361,7 @@ func (s *NetworkPolicyStore) Load(adminKeys map[[32]byte]struct{}) (*NetworkPoli
 
 	// Verify signer is currently pinned; if not, treat as no stored policy (graceful admin key rotation)
 	if _, ok := adminKeys[env.SignerPubKey]; !ok {
-		log.Printf("network policy: stored policy signer %s not in current admin keys, ignoring (admin key rotation)", formatPeerKey(env.SignerPubKey))
+		log.Printf("network policy: stored policy signer %s not in current admin keys, ignoring (admin key rotation)", FormatPeerKey(env.SignerPubKey))
 		return nil, nil
 	}
 
@@ -436,7 +436,7 @@ func LoadNetworkPolicy(policyPath, identityPath string, adminKeys map[[32]byte]s
 		if newEnv.Version == storedEnv.Version {
 			// Same version already stored - use the stored one
 			compiled := storedEnv.Policy.Compile()
-			signerStr := formatPeerKey(storedEnv.SignerPubKey)
+			signerStr := FormatPeerKey(storedEnv.SignerPubKey)
 			age := computeAge(policyPath)
 			return &LoadedNetworkPolicy{
 				Envelope:  storedEnv,
@@ -464,7 +464,7 @@ func LoadNetworkPolicy(policyPath, identityPath string, adminKeys map[[32]byte]s
 	// Compile the policy
 	compiled := env.Policy.Compile()
 
-	signerStr := formatPeerKey(env.SignerPubKey)
+	signerStr := FormatPeerKey(env.SignerPubKey)
 	age := computeAge(policyPath)
 
 	return &LoadedNetworkPolicy{
@@ -492,7 +492,7 @@ func LoadNetworkPolicyFromStore(identityPath string, adminKeys map[[32]byte]stru
 		return nil, nil
 	}
 	compiled := storedEnv.Policy.Compile()
-	signerStr := formatPeerKey(storedEnv.SignerPubKey)
+	signerStr := FormatPeerKey(storedEnv.SignerPubKey)
 	// Age is unknown since we don't have the policy file path; use "stored"
 	age := "stored"
 	return &LoadedNetworkPolicy{
@@ -616,8 +616,9 @@ type NetworkPolicyLoader struct {
 	mu              sync.RWMutex
 	current         *LoadedNetworkPolicy
 	dropCounters    *DropCounters
-	loggedEmptyKeys bool      // whether we've logged the "no admin keys" message
-	lastModTime     time.Time // for debouncing file events
+	loggedEmptyKeys bool             // whether we've logged the "no admin keys" message
+	lastModTime     time.Time        // for debouncing file events
+	refusedVersions map[int]struct{} // versions we've logged a refusal for
 }
 
 // NewNetworkPolicyLoader creates a new network policy loader for static mode.
@@ -627,12 +628,13 @@ type NetworkPolicyLoader struct {
 // swap is the PolicySwap to update with the compiled network policy.
 func NewNetworkPolicyLoader(policyPath, identityPath string, adminKeys map[[32]byte]struct{}, swap *PolicySwap) *NetworkPolicyLoader {
 	return &NetworkPolicyLoader{
-		path:         policyPath,
-		identityPath: identityPath,
-		adminKeys:    adminKeys,
-		swap:         swap,
-		stopCh:       make(chan struct{}),
-		dropCounters: NewDropCounters(),
+		path:            policyPath,
+		identityPath:    identityPath,
+		adminKeys:       adminKeys,
+		swap:            swap,
+		stopCh:          make(chan struct{}),
+		dropCounters:    NewDropCounters(),
+		refusedVersions: make(map[int]struct{}),
 	}
 }
 
@@ -838,17 +840,83 @@ func (l *NetworkPolicyLoader) NetworkPolicyStatus() NetworkPolicyStatus {
 	}
 
 	return NetworkPolicyStatus{
-		Version: l.current.Envelope.Version,
-		Signer:  l.current.SignerStr,
-		Age:     l.current.Age,
+		Version:            l.current.Envelope.Version,
+		Signer:             l.current.SignerStr,
+		Age:                l.current.Age,
+		CoordinatorVersion: 0, // Will be set by daemon if coordinator mode
 	}
 }
 
 // NetworkPolicyStatus represents the status of a network policy.
 type NetworkPolicyStatus struct {
-	Version int    `json:"version"`
-	Signer  string `json:"signer"`
-	Age     string `json:"age"`
+	Version            int    `json:"version"`
+	Signer             string `json:"signer"`
+	Age                string `json:"age"`
+	CoordinatorVersion int    `json:"coordinator_version"`
+}
+
+// StoreEnvelope stores a network policy envelope received from the coordinator.
+// It verifies the envelope against admin keys, checks that the version is higher
+// than the currently enforced version (from any source), and if so, persists it
+// and updates the policy swap. Returns true if the envelope was stored (version was higher),
+// false if rejected (version not higher or invalid).
+func (l *NetworkPolicyLoader) StoreEnvelope(envelope []byte) (bool, error) {
+	if len(l.adminKeys) == 0 {
+		return false, errors.New("no admin keys pinned")
+	}
+
+	env, err := ParseNetworkPolicyEnvelope(envelope, l.adminKeys)
+	if err != nil {
+		log.Printf("network policy: invalid envelope from coordinator: %v", err)
+		return false, err
+	}
+
+	l.mu.RLock()
+	currentVersion := 0
+	if l.current != nil {
+		currentVersion = l.current.Envelope.Version
+	}
+	l.mu.RUnlock()
+
+	if env.Version <= currentVersion {
+		// Log once per version refused
+		l.mu.Lock()
+		if _, alreadyLogged := l.refusedVersions[env.Version]; alreadyLogged {
+			l.mu.Unlock()
+			return false, fmt.Errorf("version %d not higher than enforced version %d", env.Version, currentVersion)
+		}
+		l.refusedVersions[env.Version] = struct{}{}
+		l.mu.Unlock()
+		log.Printf("network policy: coordinator sent version %d, but we have %d (ignoring)", env.Version, currentVersion)
+		return false, fmt.Errorf("version %d not higher than enforced version %d", env.Version, currentVersion)
+	}
+
+	store := NewNetworkPolicyStore(l.identityPath)
+	stored, err := store.Store(env, l.adminKeys)
+	if err != nil {
+		log.Printf("network policy: failed to store envelope from coordinator: %v", err)
+		return false, err
+	}
+
+	if !stored {
+		return false, fmt.Errorf("version %d not higher than stored version", env.Version)
+	}
+
+	compiled := env.Policy.Compile()
+	l.swap.Store(compiled)
+
+	l.mu.Lock()
+	signerStr := FormatPeerKey(env.SignerPubKey)
+	l.current = &LoadedNetworkPolicy{
+		Envelope:  env,
+		Compiled:  compiled,
+		SignerStr: signerStr,
+		Age:       "received",
+	}
+	l.mu.Unlock()
+
+	log.Printf("network policy: accepted and stored version %d from coordinator (signer: %s)", env.Version, signerStr)
+	return true, nil
 }
 
 // ParseAdminKeys parses a list of "ed25519:<base64 or hex>" strings into a set of PeerKeys.
@@ -931,8 +999,8 @@ func ReadAdminKeyFile(path string) (ed25519.PrivateKey, error) {
 	return ed25519.PrivateKey(decoded), nil
 }
 
-// formatPeerKey formats a PeerKey as "ed25519:<base64>"
-func formatPeerKey(key [32]byte) string {
+// FormatPeerKey formats a PeerKey as "ed25519:<base64>"
+func FormatPeerKey(key [32]byte) string {
 	return "ed25519:" + base64.StdEncoding.EncodeToString(key[:])
 }
 

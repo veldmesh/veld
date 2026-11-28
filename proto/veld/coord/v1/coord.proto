@@ -36,6 +36,7 @@ message RegisterResponse {
   string peer_id      = 2;  // Ed25519 hex ID
   string network_id   = 3;  // echoed from request
   string network_cidr = 4;  // network CIDR prefix, e.g. "10.100.0.0/24"
+  bytes network_policy = 5;  // current network policy envelope, if any
 }
 
 message ListPeersRequest {
@@ -59,11 +60,12 @@ message WatchRequest {
 }
 
 enum EventType {
-  JOIN            = 0;
-  LEAVE           = 1;
-  ENDPOINT_UPDATE = 2;
-  ROUTE_UPDATE    = 3;
-  SIGNAL          = 4;  // peer-to-peer opaque signal (NAT candidates, etc.)
+  JOIN                = 0;
+  LEAVE               = 1;
+  ENDPOINT_UPDATE     = 2;
+  ROUTE_UPDATE        = 3;
+  SIGNAL              = 4;  // peer-to-peer opaque signal (NAT candidates, etc.)
+  NETWORK_POLICY      = 5;  // network policy updated
 }
 
 // SignalEvent carries an opaque peer-to-peer signal payload.
@@ -73,11 +75,18 @@ message SignalEvent {
   bytes  payload      = 2;
 }
 
+// NetworkPolicyEvent carries an opaque signed network policy envelope.
+// The coord server stores and forwards it without parsing beyond the header.
+message NetworkPolicyEvent {
+  bytes envelope = 1;  // full signed envelope (magic || ver || len || payload || signer || sig)
+}
+
 // PeerEvent is streamed by Watch.
 message PeerEvent {
-  EventType   type   = 1;
-  Peer        peer   = 2;
-  SignalEvent signal = 3;  // set when type == SIGNAL
+  EventType            type               = 1;
+  Peer                 peer               = 2;
+  SignalEvent          signal             = 3;  // set when type == SIGNAL
+  NetworkPolicyEvent   network_policy     = 4;  // set when type == NETWORK_POLICY
 }
 
 // SendSignalRequest relays an encrypted ICE candidate to a peer.
@@ -102,6 +111,24 @@ message LeaveRequest {
 
 message LeaveResponse {}
 
+// PushNetworkPolicyRequest uploads a signed network policy envelope.
+// Authorized like other signed calls: account token + call signature by the
+// peer's key. The coord checks size (cap 256 KiB), that the envelope's
+// version is greater than the stored one, and stores it per network.
+// The coord never parses the policy beyond the envelope header.
+message PushNetworkPolicyRequest {
+  string network_id     = 1;  // network to push policy to
+  string token          = 2;  // account token
+  string peer_id        = 3;  // caller's peer ID (Ed25519 hex)
+  bytes  envelope       = 4;  // full signed policy envelope
+  int64  timestamp_unix = 5;  // client clock when signing, unix seconds
+  bytes  signature      = 6;  // call signature by peer_id's key
+}
+
+message PushNetworkPolicyResponse {
+  int32 version = 1;  // version of the stored policy
+}
+
 service Coord {
   // Register assigns a VPN IP to the calling daemon and validates its Ed25519 sig:
   // only the holder of the private key matching ed25519_public can register or
@@ -119,11 +146,12 @@ service Coord {
   rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
 
   // Calls in which a peer acts as itself (Watch naming a peer_id,
-  // SendSignal, Leave) carry a call signature: an Ed25519 signature by that
-  // peer's key over "veld-coord-call-v1\0" followed by the length-prefixed
-  // method name and peer ID, the method's arguments as a length-prefixed
-  // list (Watch: network_id; SendSignal: to_peer_id and the hex SHA-256 of
-  // the payload; Leave: none) and timestamp_unix (big-endian uint64), with
+  // SendSignal, Leave, PushNetworkPolicy) carry a call signature: an Ed25519
+  // signature by that peer's key over "veld-coord-call-v1\0" followed by the
+  // length-prefixed method name and peer ID, the method's arguments as a
+  // length-prefixed list (Watch: network_id; SendSignal: to_peer_id and the
+  // hex SHA-256 of the payload; Leave: none; PushNetworkPolicy: network_id
+  // and SHA-256 of the envelope) and timestamp_unix (big-endian uint64), with
   // |now - timestamp_unix| <= 120 s. Each signature is accepted once. The
   // token alone only proves membership of the account.
 
@@ -136,4 +164,12 @@ service Coord {
 
   // Leave removes the calling daemon from the network.
   rpc Leave(LeaveRequest) returns (LeaveResponse);
+
+  // PushNetworkPolicy uploads a signed network policy envelope for the
+  // network the token belongs to. The envelope is stored as an opaque blob.
+  // The server verifies the envelope header (magic, format version, length),
+  // checks the size cap (256 KiB), and that the policy version is strictly
+  // greater than the currently stored version. The server never parses the
+  // policy payload — verification and enforcement happen on peers.
+  rpc PushNetworkPolicy(PushNetworkPolicyRequest) returns (PushNetworkPolicyResponse);
 }

@@ -29,6 +29,7 @@ const (
 	EventType_ENDPOINT_UPDATE EventType = 2
 	EventType_ROUTE_UPDATE    EventType = 3
 	EventType_SIGNAL          EventType = 4 // peer-to-peer opaque signal (NAT candidates, etc.)
+	EventType_NETWORK_POLICY  EventType = 5 // network policy updated
 )
 
 // Enum value maps for EventType.
@@ -39,6 +40,7 @@ var (
 		2: "ENDPOINT_UPDATE",
 		3: "ROUTE_UPDATE",
 		4: "SIGNAL",
+		5: "NETWORK_POLICY",
 	}
 	EventType_value = map[string]int32{
 		"JOIN":            0,
@@ -46,6 +48,7 @@ var (
 		"ENDPOINT_UPDATE": 2,
 		"ROUTE_UPDATE":    3,
 		"SIGNAL":          4,
+		"NETWORK_POLICY":  5,
 	}
 )
 
@@ -283,10 +286,11 @@ func (x *RegisterRequest) GetSignature() []byte {
 
 type RegisterResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	VpnAddr       string                 `protobuf:"bytes,1,opt,name=vpn_addr,json=vpnAddr,proto3" json:"vpn_addr,omitempty"`             // assigned VPN IP, e.g. "10.100.0.1"
-	PeerId        string                 `protobuf:"bytes,2,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`                // Ed25519 hex ID
-	NetworkId     string                 `protobuf:"bytes,3,opt,name=network_id,json=networkId,proto3" json:"network_id,omitempty"`       // echoed from request
-	NetworkCidr   string                 `protobuf:"bytes,4,opt,name=network_cidr,json=networkCidr,proto3" json:"network_cidr,omitempty"` // network CIDR prefix, e.g. "10.100.0.0/24"
+	VpnAddr       string                 `protobuf:"bytes,1,opt,name=vpn_addr,json=vpnAddr,proto3" json:"vpn_addr,omitempty"`                   // assigned VPN IP, e.g. "10.100.0.1"
+	PeerId        string                 `protobuf:"bytes,2,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`                      // Ed25519 hex ID
+	NetworkId     string                 `protobuf:"bytes,3,opt,name=network_id,json=networkId,proto3" json:"network_id,omitempty"`             // echoed from request
+	NetworkCidr   string                 `protobuf:"bytes,4,opt,name=network_cidr,json=networkCidr,proto3" json:"network_cidr,omitempty"`       // network CIDR prefix, e.g. "10.100.0.0/24"
+	NetworkPolicy []byte                 `protobuf:"bytes,5,opt,name=network_policy,json=networkPolicy,proto3" json:"network_policy,omitempty"` // current network policy envelope, if any
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -347,6 +351,13 @@ func (x *RegisterResponse) GetNetworkCidr() string {
 		return x.NetworkCidr
 	}
 	return ""
+}
+
+func (x *RegisterResponse) GetNetworkPolicy() []byte {
+	if x != nil {
+		return x.NetworkPolicy
+	}
+	return nil
 }
 
 type ListPeersRequest struct {
@@ -578,19 +589,66 @@ func (x *SignalEvent) GetPayload() []byte {
 	return nil
 }
 
+// NetworkPolicyEvent carries an opaque signed network policy envelope.
+// The coord server stores and forwards it without parsing beyond the header.
+type NetworkPolicyEvent struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Envelope      []byte                 `protobuf:"bytes,1,opt,name=envelope,proto3" json:"envelope,omitempty"` // full signed envelope (magic || ver || len || payload || signer || sig)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NetworkPolicyEvent) Reset() {
+	*x = NetworkPolicyEvent{}
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NetworkPolicyEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NetworkPolicyEvent) ProtoMessage() {}
+
+func (x *NetworkPolicyEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NetworkPolicyEvent.ProtoReflect.Descriptor instead.
+func (*NetworkPolicyEvent) Descriptor() ([]byte, []int) {
+	return file_veld_coord_v1_coord_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *NetworkPolicyEvent) GetEnvelope() []byte {
+	if x != nil {
+		return x.Envelope
+	}
+	return nil
+}
+
 // PeerEvent is streamed by Watch.
 type PeerEvent struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Type          EventType              `protobuf:"varint,1,opt,name=type,proto3,enum=veld.coord.v1.EventType" json:"type,omitempty"`
 	Peer          *Peer                  `protobuf:"bytes,2,opt,name=peer,proto3" json:"peer,omitempty"`
-	Signal        *SignalEvent           `protobuf:"bytes,3,opt,name=signal,proto3" json:"signal,omitempty"` // set when type == SIGNAL
+	Signal        *SignalEvent           `protobuf:"bytes,3,opt,name=signal,proto3" json:"signal,omitempty"`                                    // set when type == SIGNAL
+	NetworkPolicy *NetworkPolicyEvent    `protobuf:"bytes,4,opt,name=network_policy,json=networkPolicy,proto3" json:"network_policy,omitempty"` // set when type == NETWORK_POLICY
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PeerEvent) Reset() {
 	*x = PeerEvent{}
-	mi := &file_veld_coord_v1_coord_proto_msgTypes[7]
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -602,7 +660,7 @@ func (x *PeerEvent) String() string {
 func (*PeerEvent) ProtoMessage() {}
 
 func (x *PeerEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_veld_coord_v1_coord_proto_msgTypes[7]
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -615,7 +673,7 @@ func (x *PeerEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerEvent.ProtoReflect.Descriptor instead.
 func (*PeerEvent) Descriptor() ([]byte, []int) {
-	return file_veld_coord_v1_coord_proto_rawDescGZIP(), []int{7}
+	return file_veld_coord_v1_coord_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *PeerEvent) GetType() EventType {
@@ -639,6 +697,13 @@ func (x *PeerEvent) GetSignal() *SignalEvent {
 	return nil
 }
 
+func (x *PeerEvent) GetNetworkPolicy() *NetworkPolicyEvent {
+	if x != nil {
+		return x.NetworkPolicy
+	}
+	return nil
+}
+
 // SendSignalRequest relays an encrypted ICE candidate to a peer.
 // The coord server treats payload as opaque bytes — it never reads them.
 type SendSignalRequest struct {
@@ -655,7 +720,7 @@ type SendSignalRequest struct {
 
 func (x *SendSignalRequest) Reset() {
 	*x = SendSignalRequest{}
-	mi := &file_veld_coord_v1_coord_proto_msgTypes[8]
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -667,7 +732,7 @@ func (x *SendSignalRequest) String() string {
 func (*SendSignalRequest) ProtoMessage() {}
 
 func (x *SendSignalRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_veld_coord_v1_coord_proto_msgTypes[8]
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -680,7 +745,7 @@ func (x *SendSignalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SendSignalRequest.ProtoReflect.Descriptor instead.
 func (*SendSignalRequest) Descriptor() ([]byte, []int) {
-	return file_veld_coord_v1_coord_proto_rawDescGZIP(), []int{8}
+	return file_veld_coord_v1_coord_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *SendSignalRequest) GetToken() string {
@@ -733,7 +798,7 @@ type SendSignalResponse struct {
 
 func (x *SendSignalResponse) Reset() {
 	*x = SendSignalResponse{}
-	mi := &file_veld_coord_v1_coord_proto_msgTypes[9]
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -745,7 +810,7 @@ func (x *SendSignalResponse) String() string {
 func (*SendSignalResponse) ProtoMessage() {}
 
 func (x *SendSignalResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_veld_coord_v1_coord_proto_msgTypes[9]
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -758,7 +823,7 @@ func (x *SendSignalResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SendSignalResponse.ProtoReflect.Descriptor instead.
 func (*SendSignalResponse) Descriptor() ([]byte, []int) {
-	return file_veld_coord_v1_coord_proto_rawDescGZIP(), []int{9}
+	return file_veld_coord_v1_coord_proto_rawDescGZIP(), []int{10}
 }
 
 type LeaveRequest struct {
@@ -773,7 +838,7 @@ type LeaveRequest struct {
 
 func (x *LeaveRequest) Reset() {
 	*x = LeaveRequest{}
-	mi := &file_veld_coord_v1_coord_proto_msgTypes[10]
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -785,7 +850,7 @@ func (x *LeaveRequest) String() string {
 func (*LeaveRequest) ProtoMessage() {}
 
 func (x *LeaveRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_veld_coord_v1_coord_proto_msgTypes[10]
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -798,7 +863,7 @@ func (x *LeaveRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LeaveRequest.ProtoReflect.Descriptor instead.
 func (*LeaveRequest) Descriptor() ([]byte, []int) {
-	return file_veld_coord_v1_coord_proto_rawDescGZIP(), []int{10}
+	return file_veld_coord_v1_coord_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *LeaveRequest) GetToken() string {
@@ -837,7 +902,7 @@ type LeaveResponse struct {
 
 func (x *LeaveResponse) Reset() {
 	*x = LeaveResponse{}
-	mi := &file_veld_coord_v1_coord_proto_msgTypes[11]
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -849,7 +914,7 @@ func (x *LeaveResponse) String() string {
 func (*LeaveResponse) ProtoMessage() {}
 
 func (x *LeaveResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_veld_coord_v1_coord_proto_msgTypes[11]
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -862,7 +927,140 @@ func (x *LeaveResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LeaveResponse.ProtoReflect.Descriptor instead.
 func (*LeaveResponse) Descriptor() ([]byte, []int) {
-	return file_veld_coord_v1_coord_proto_rawDescGZIP(), []int{11}
+	return file_veld_coord_v1_coord_proto_rawDescGZIP(), []int{12}
+}
+
+// PushNetworkPolicyRequest uploads a signed network policy envelope.
+// Authorized like other signed calls: account token + call signature by the
+// peer's key. The coord checks size (cap 256 KiB), that the envelope's
+// version is greater than the stored one, and stores it per network.
+// The coord never parses the policy beyond the envelope header.
+type PushNetworkPolicyRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NetworkId     string                 `protobuf:"bytes,1,opt,name=network_id,json=networkId,proto3" json:"network_id,omitempty"`              // network to push policy to
+	Token         string                 `protobuf:"bytes,2,opt,name=token,proto3" json:"token,omitempty"`                                       // account token
+	PeerId        string                 `protobuf:"bytes,3,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`                       // caller's peer ID (Ed25519 hex)
+	Envelope      []byte                 `protobuf:"bytes,4,opt,name=envelope,proto3" json:"envelope,omitempty"`                                 // full signed policy envelope
+	TimestampUnix int64                  `protobuf:"varint,5,opt,name=timestamp_unix,json=timestampUnix,proto3" json:"timestamp_unix,omitempty"` // client clock when signing, unix seconds
+	Signature     []byte                 `protobuf:"bytes,6,opt,name=signature,proto3" json:"signature,omitempty"`                               // call signature by peer_id's key
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PushNetworkPolicyRequest) Reset() {
+	*x = PushNetworkPolicyRequest{}
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PushNetworkPolicyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PushNetworkPolicyRequest) ProtoMessage() {}
+
+func (x *PushNetworkPolicyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PushNetworkPolicyRequest.ProtoReflect.Descriptor instead.
+func (*PushNetworkPolicyRequest) Descriptor() ([]byte, []int) {
+	return file_veld_coord_v1_coord_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *PushNetworkPolicyRequest) GetNetworkId() string {
+	if x != nil {
+		return x.NetworkId
+	}
+	return ""
+}
+
+func (x *PushNetworkPolicyRequest) GetToken() string {
+	if x != nil {
+		return x.Token
+	}
+	return ""
+}
+
+func (x *PushNetworkPolicyRequest) GetPeerId() string {
+	if x != nil {
+		return x.PeerId
+	}
+	return ""
+}
+
+func (x *PushNetworkPolicyRequest) GetEnvelope() []byte {
+	if x != nil {
+		return x.Envelope
+	}
+	return nil
+}
+
+func (x *PushNetworkPolicyRequest) GetTimestampUnix() int64 {
+	if x != nil {
+		return x.TimestampUnix
+	}
+	return 0
+}
+
+func (x *PushNetworkPolicyRequest) GetSignature() []byte {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
+}
+
+type PushNetworkPolicyResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Version       int32                  `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"` // version of the stored policy
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PushNetworkPolicyResponse) Reset() {
+	*x = PushNetworkPolicyResponse{}
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PushNetworkPolicyResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PushNetworkPolicyResponse) ProtoMessage() {}
+
+func (x *PushNetworkPolicyResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_veld_coord_v1_coord_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PushNetworkPolicyResponse.ProtoReflect.Descriptor instead.
+func (*PushNetworkPolicyResponse) Descriptor() ([]byte, []int) {
+	return file_veld_coord_v1_coord_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *PushNetworkPolicyResponse) GetVersion() int32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
 }
 
 var File_veld_coord_v1_coord_proto protoreflect.FileDescriptor
@@ -888,13 +1086,14 @@ const file_veld_coord_v1_coord_proto_rawDesc = "" +
 	"\bendpoint\x18\x06 \x01(\tR\bendpoint\x12#\n" +
 	"\rsubnet_routes\x18\a \x03(\tR\fsubnetRoutes\x12%\n" +
 	"\x0etimestamp_unix\x18\b \x01(\x03R\rtimestampUnix\x12\x1c\n" +
-	"\tsignature\x18\t \x01(\fR\tsignature\"\x88\x01\n" +
+	"\tsignature\x18\t \x01(\fR\tsignature\"\xaf\x01\n" +
 	"\x10RegisterResponse\x12\x19\n" +
 	"\bvpn_addr\x18\x01 \x01(\tR\avpnAddr\x12\x17\n" +
 	"\apeer_id\x18\x02 \x01(\tR\x06peerId\x12\x1d\n" +
 	"\n" +
 	"network_id\x18\x03 \x01(\tR\tnetworkId\x12!\n" +
-	"\fnetwork_cidr\x18\x04 \x01(\tR\vnetworkCidr\"G\n" +
+	"\fnetwork_cidr\x18\x04 \x01(\tR\vnetworkCidr\x12%\n" +
+	"\x0enetwork_policy\x18\x05 \x01(\fR\rnetworkPolicy\"G\n" +
 	"\x10ListPeersRequest\x12\x1d\n" +
 	"\n" +
 	"network_id\x18\x01 \x01(\tR\tnetworkId\x12\x14\n" +
@@ -911,11 +1110,14 @@ const file_veld_coord_v1_coord_proto_rawDesc = "" +
 	"\vSignalEvent\x12 \n" +
 	"\ffrom_peer_id\x18\x01 \x01(\tR\n" +
 	"fromPeerId\x12\x18\n" +
-	"\apayload\x18\x02 \x01(\fR\apayload\"\x96\x01\n" +
+	"\apayload\x18\x02 \x01(\fR\apayload\"0\n" +
+	"\x12NetworkPolicyEvent\x12\x1a\n" +
+	"\benvelope\x18\x01 \x01(\fR\benvelope\"\xe0\x01\n" +
 	"\tPeerEvent\x12,\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x18.veld.coord.v1.EventTypeR\x04type\x12'\n" +
 	"\x04peer\x18\x02 \x01(\v2\x13.veld.coord.v1.PeerR\x04peer\x122\n" +
-	"\x06signal\x18\x03 \x01(\v2\x1a.veld.coord.v1.SignalEventR\x06signal\"\xc8\x01\n" +
+	"\x06signal\x18\x03 \x01(\v2\x1a.veld.coord.v1.SignalEventR\x06signal\x12H\n" +
+	"\x0enetwork_policy\x18\x04 \x01(\v2!.veld.coord.v1.NetworkPolicyEventR\rnetworkPolicy\"\xc8\x01\n" +
 	"\x11SendSignalRequest\x12\x14\n" +
 	"\x05token\x18\x01 \x01(\tR\x05token\x12 \n" +
 	"\ffrom_peer_id\x18\x02 \x01(\tR\n" +
@@ -931,21 +1133,33 @@ const file_veld_coord_v1_coord_proto_rawDesc = "" +
 	"\apeer_id\x18\x02 \x01(\tR\x06peerId\x12%\n" +
 	"\x0etimestamp_unix\x18\x03 \x01(\x03R\rtimestampUnix\x12\x1c\n" +
 	"\tsignature\x18\x04 \x01(\fR\tsignature\"\x0f\n" +
-	"\rLeaveResponse*S\n" +
+	"\rLeaveResponse\"\xc9\x01\n" +
+	"\x18PushNetworkPolicyRequest\x12\x1d\n" +
+	"\n" +
+	"network_id\x18\x01 \x01(\tR\tnetworkId\x12\x14\n" +
+	"\x05token\x18\x02 \x01(\tR\x05token\x12\x17\n" +
+	"\apeer_id\x18\x03 \x01(\tR\x06peerId\x12\x1a\n" +
+	"\benvelope\x18\x04 \x01(\fR\benvelope\x12%\n" +
+	"\x0etimestamp_unix\x18\x05 \x01(\x03R\rtimestampUnix\x12\x1c\n" +
+	"\tsignature\x18\x06 \x01(\fR\tsignature\"5\n" +
+	"\x19PushNetworkPolicyResponse\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\x05R\aversion*g\n" +
 	"\tEventType\x12\b\n" +
 	"\x04JOIN\x10\x00\x12\t\n" +
 	"\x05LEAVE\x10\x01\x12\x13\n" +
 	"\x0fENDPOINT_UPDATE\x10\x02\x12\x10\n" +
 	"\fROUTE_UPDATE\x10\x03\x12\n" +
 	"\n" +
-	"\x06SIGNAL\x10\x042\xfd\x02\n" +
+	"\x06SIGNAL\x10\x04\x12\x12\n" +
+	"\x0eNETWORK_POLICY\x10\x052\xe5\x03\n" +
 	"\x05Coord\x12K\n" +
 	"\bRegister\x12\x1e.veld.coord.v1.RegisterRequest\x1a\x1f.veld.coord.v1.RegisterResponse\x12N\n" +
 	"\tListPeers\x12\x1f.veld.coord.v1.ListPeersRequest\x1a .veld.coord.v1.ListPeersResponse\x12@\n" +
 	"\x05Watch\x12\x1b.veld.coord.v1.WatchRequest\x1a\x18.veld.coord.v1.PeerEvent0\x01\x12Q\n" +
 	"\n" +
 	"SendSignal\x12 .veld.coord.v1.SendSignalRequest\x1a!.veld.coord.v1.SendSignalResponse\x12B\n" +
-	"\x05Leave\x12\x1b.veld.coord.v1.LeaveRequest\x1a\x1c.veld.coord.v1.LeaveResponseB4Z2github.com/veldmesh/veld/gen/veld/coord/v1;coordv1b\x06proto3"
+	"\x05Leave\x12\x1b.veld.coord.v1.LeaveRequest\x1a\x1c.veld.coord.v1.LeaveResponse\x12f\n" +
+	"\x11PushNetworkPolicy\x12'.veld.coord.v1.PushNetworkPolicyRequest\x1a(.veld.coord.v1.PushNetworkPolicyResponseB4Z2github.com/veldmesh/veld/gen/veld/coord/v1;coordv1b\x06proto3"
 
 var (
 	file_veld_coord_v1_coord_proto_rawDescOnce sync.Once
@@ -960,42 +1174,48 @@ func file_veld_coord_v1_coord_proto_rawDescGZIP() []byte {
 }
 
 var file_veld_coord_v1_coord_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_veld_coord_v1_coord_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_veld_coord_v1_coord_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_veld_coord_v1_coord_proto_goTypes = []any{
-	(EventType)(0),             // 0: veld.coord.v1.EventType
-	(*Peer)(nil),               // 1: veld.coord.v1.Peer
-	(*RegisterRequest)(nil),    // 2: veld.coord.v1.RegisterRequest
-	(*RegisterResponse)(nil),   // 3: veld.coord.v1.RegisterResponse
-	(*ListPeersRequest)(nil),   // 4: veld.coord.v1.ListPeersRequest
-	(*ListPeersResponse)(nil),  // 5: veld.coord.v1.ListPeersResponse
-	(*WatchRequest)(nil),       // 6: veld.coord.v1.WatchRequest
-	(*SignalEvent)(nil),        // 7: veld.coord.v1.SignalEvent
-	(*PeerEvent)(nil),          // 8: veld.coord.v1.PeerEvent
-	(*SendSignalRequest)(nil),  // 9: veld.coord.v1.SendSignalRequest
-	(*SendSignalResponse)(nil), // 10: veld.coord.v1.SendSignalResponse
-	(*LeaveRequest)(nil),       // 11: veld.coord.v1.LeaveRequest
-	(*LeaveResponse)(nil),      // 12: veld.coord.v1.LeaveResponse
+	(EventType)(0),                    // 0: veld.coord.v1.EventType
+	(*Peer)(nil),                      // 1: veld.coord.v1.Peer
+	(*RegisterRequest)(nil),           // 2: veld.coord.v1.RegisterRequest
+	(*RegisterResponse)(nil),          // 3: veld.coord.v1.RegisterResponse
+	(*ListPeersRequest)(nil),          // 4: veld.coord.v1.ListPeersRequest
+	(*ListPeersResponse)(nil),         // 5: veld.coord.v1.ListPeersResponse
+	(*WatchRequest)(nil),              // 6: veld.coord.v1.WatchRequest
+	(*SignalEvent)(nil),               // 7: veld.coord.v1.SignalEvent
+	(*NetworkPolicyEvent)(nil),        // 8: veld.coord.v1.NetworkPolicyEvent
+	(*PeerEvent)(nil),                 // 9: veld.coord.v1.PeerEvent
+	(*SendSignalRequest)(nil),         // 10: veld.coord.v1.SendSignalRequest
+	(*SendSignalResponse)(nil),        // 11: veld.coord.v1.SendSignalResponse
+	(*LeaveRequest)(nil),              // 12: veld.coord.v1.LeaveRequest
+	(*LeaveResponse)(nil),             // 13: veld.coord.v1.LeaveResponse
+	(*PushNetworkPolicyRequest)(nil),  // 14: veld.coord.v1.PushNetworkPolicyRequest
+	(*PushNetworkPolicyResponse)(nil), // 15: veld.coord.v1.PushNetworkPolicyResponse
 }
 var file_veld_coord_v1_coord_proto_depIdxs = []int32{
 	1,  // 0: veld.coord.v1.ListPeersResponse.peers:type_name -> veld.coord.v1.Peer
 	0,  // 1: veld.coord.v1.PeerEvent.type:type_name -> veld.coord.v1.EventType
 	1,  // 2: veld.coord.v1.PeerEvent.peer:type_name -> veld.coord.v1.Peer
 	7,  // 3: veld.coord.v1.PeerEvent.signal:type_name -> veld.coord.v1.SignalEvent
-	2,  // 4: veld.coord.v1.Coord.Register:input_type -> veld.coord.v1.RegisterRequest
-	4,  // 5: veld.coord.v1.Coord.ListPeers:input_type -> veld.coord.v1.ListPeersRequest
-	6,  // 6: veld.coord.v1.Coord.Watch:input_type -> veld.coord.v1.WatchRequest
-	9,  // 7: veld.coord.v1.Coord.SendSignal:input_type -> veld.coord.v1.SendSignalRequest
-	11, // 8: veld.coord.v1.Coord.Leave:input_type -> veld.coord.v1.LeaveRequest
-	3,  // 9: veld.coord.v1.Coord.Register:output_type -> veld.coord.v1.RegisterResponse
-	5,  // 10: veld.coord.v1.Coord.ListPeers:output_type -> veld.coord.v1.ListPeersResponse
-	8,  // 11: veld.coord.v1.Coord.Watch:output_type -> veld.coord.v1.PeerEvent
-	10, // 12: veld.coord.v1.Coord.SendSignal:output_type -> veld.coord.v1.SendSignalResponse
-	12, // 13: veld.coord.v1.Coord.Leave:output_type -> veld.coord.v1.LeaveResponse
-	9,  // [9:14] is the sub-list for method output_type
-	4,  // [4:9] is the sub-list for method input_type
-	4,  // [4:4] is the sub-list for extension type_name
-	4,  // [4:4] is the sub-list for extension extendee
-	0,  // [0:4] is the sub-list for field type_name
+	8,  // 4: veld.coord.v1.PeerEvent.network_policy:type_name -> veld.coord.v1.NetworkPolicyEvent
+	2,  // 5: veld.coord.v1.Coord.Register:input_type -> veld.coord.v1.RegisterRequest
+	4,  // 6: veld.coord.v1.Coord.ListPeers:input_type -> veld.coord.v1.ListPeersRequest
+	6,  // 7: veld.coord.v1.Coord.Watch:input_type -> veld.coord.v1.WatchRequest
+	10, // 8: veld.coord.v1.Coord.SendSignal:input_type -> veld.coord.v1.SendSignalRequest
+	12, // 9: veld.coord.v1.Coord.Leave:input_type -> veld.coord.v1.LeaveRequest
+	14, // 10: veld.coord.v1.Coord.PushNetworkPolicy:input_type -> veld.coord.v1.PushNetworkPolicyRequest
+	3,  // 11: veld.coord.v1.Coord.Register:output_type -> veld.coord.v1.RegisterResponse
+	5,  // 12: veld.coord.v1.Coord.ListPeers:output_type -> veld.coord.v1.ListPeersResponse
+	9,  // 13: veld.coord.v1.Coord.Watch:output_type -> veld.coord.v1.PeerEvent
+	11, // 14: veld.coord.v1.Coord.SendSignal:output_type -> veld.coord.v1.SendSignalResponse
+	13, // 15: veld.coord.v1.Coord.Leave:output_type -> veld.coord.v1.LeaveResponse
+	15, // 16: veld.coord.v1.Coord.PushNetworkPolicy:output_type -> veld.coord.v1.PushNetworkPolicyResponse
+	11, // [11:17] is the sub-list for method output_type
+	5,  // [5:11] is the sub-list for method input_type
+	5,  // [5:5] is the sub-list for extension type_name
+	5,  // [5:5] is the sub-list for extension extendee
+	0,  // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_veld_coord_v1_coord_proto_init() }
@@ -1009,7 +1229,7 @@ func file_veld_coord_v1_coord_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_veld_coord_v1_coord_proto_rawDesc), len(file_veld_coord_v1_coord_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   12,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

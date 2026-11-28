@@ -11,7 +11,7 @@ Traffic flows directly between your devices. When direct connection isn't possib
 | | Tailscale | Veld |
 |---|---|---|
 | Traffic routing | Via relay if direct fails | Direct P2P for most NATs. Relay via a mesh peer when hole punching fails (e.g., symmetric NAT on both sides) — see [docs/RELAY.md](docs/RELAY.md). |
-| Coord server sees traffic | No (DERP relays forward encrypted WireGuard packets) | Coord server never carries or reads traffic. It stores public keys, names, VPN addresses, subnet routes, and hour-rounded last-seen on disk; endpoints are kept in memory only. |
+| Coord server sees traffic | No (DERP relays forward encrypted WireGuard packets) | Coord server never carries or reads traffic. It stores public keys, names, VPN addresses, subnet routes, network policy blobs, and hour-rounded last-seen on disk; endpoints are kept in memory only. |
 | Open source | Client only | Daemon + CE coord server (BSL) |
 | Pricing model | Per user | Per network |
 | Runs without a server | No | Yes (static config or LAN mDNS) |
@@ -127,7 +127,9 @@ Run `veld-daemon` from an elevated terminal (Run as administrator): creating the
                             ┌─────────────────┐
                             │ veld-coord      │  ← stores: pubkeys,
                             │ (coord server)  │    names, VPN addrs,
-                            └─────────────────┘    subnet routes, last-seen
+                            └─────────────────┘    subnet routes,
+                                                   network policy blobs,
+                                                   hour-rounded last-seen
                                      ▲
                             optional dashboard
                             (self-host or managed)

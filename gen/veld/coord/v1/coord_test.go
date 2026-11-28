@@ -58,6 +58,8 @@ func TestMessageTypes_Instantiate(t *testing.T) {
 	_ = &SendSignalResponse{}
 	_ = &LeaveRequest{Token: "t", PeerId: "p"}
 	_ = &LeaveResponse{}
+	_ = &PushNetworkPolicyRequest{NetworkId: "net", Token: "tok", PeerId: "p"}
+	_ = &PushNetworkPolicyResponse{Version: 1}
 }
 
 func TestEventType_Values(t *testing.T) {
@@ -69,6 +71,8 @@ func TestEventType_Values(t *testing.T) {
 		{EventType_LEAVE, "LEAVE"},
 		{EventType_ENDPOINT_UPDATE, "ENDPOINT_UPDATE"},
 		{EventType_ROUTE_UPDATE, "ROUTE_UPDATE"},
+		{EventType_SIGNAL, "SIGNAL"},
+		{EventType_NETWORK_POLICY, "NETWORK_POLICY"},
 	}
 	for _, tc := range cases {
 		if tc.e.String() != tc.want {
@@ -81,8 +85,8 @@ func TestServiceDesc(t *testing.T) {
 	if Coord_ServiceDesc.ServiceName != "veld.coord.v1.Coord" {
 		t.Errorf("ServiceName: got %q", Coord_ServiceDesc.ServiceName)
 	}
-	if len(Coord_ServiceDesc.Methods) != 4 {
-		t.Errorf("Methods: got %d, want 4", len(Coord_ServiceDesc.Methods))
+	if len(Coord_ServiceDesc.Methods) != 5 {
+		t.Errorf("Methods: got %d, want 5", len(Coord_ServiceDesc.Methods))
 	}
 	if len(Coord_ServiceDesc.Streams) != 1 {
 		t.Errorf("Streams: got %d, want 1", len(Coord_ServiceDesc.Streams))

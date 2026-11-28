@@ -13,7 +13,7 @@ import (
 
 // CallSignatureDomain is the domain-separation prefix of the message a peer
 // signs to act as itself in a coord RPC other than Register (Leave, Watch,
-// SendSignal): "veld-coord-call-v1" followed by a NUL byte. The shared
+// SendSignal, PushNetworkPolicy): "veld-coord-call-v1" followed by a NUL byte. The shared
 // token only proves membership of the account; the signature proves the
 // caller holds the private key of the peer it names.
 const CallSignatureDomain = "veld-coord-call-v1\x00"
@@ -24,9 +24,10 @@ const CallTimestampWindow = RegisterTimestampWindow
 
 // Coord RPC method names covered by call signatures.
 const (
-	CallLeave      = "Leave"
-	CallWatch      = "Watch"
-	CallSendSignal = "SendSignal"
+	CallLeave             = "Leave"
+	CallWatch             = "Watch"
+	CallSendSignal        = "SendSignal"
+	CallPushNetworkPolicy = "PushNetworkPolicy"
 )
 
 // CallClaims are the request fields covered by a call signature.
@@ -53,6 +54,15 @@ func WatchClaims(peerID, networkID string, ts int64) CallClaims {
 func SendSignalClaims(fromPeerID, toPeerID string, payload []byte, ts int64) CallClaims {
 	sum := sha256.Sum256(payload)
 	return CallClaims{Method: CallSendSignal, PeerID: fromPeerID, Args: []string{toPeerID, hex.EncodeToString(sum[:])}, TimestampUnix: ts}
+}
+
+// PushNetworkPolicyClaims returns the claims a PushNetworkPolicy request signs.
+// The envelope is covered by its SHA-256, so a signature cannot be reused for a
+// different policy. The network_id is the first argument to bind the signature
+// to the target network.
+func PushNetworkPolicyClaims(peerID, networkID string, envelope []byte, ts int64) CallClaims {
+	sum := sha256.Sum256(envelope)
+	return CallClaims{Method: CallPushNetworkPolicy, PeerID: peerID, Args: []string{networkID, hex.EncodeToString(sum[:])}, TimestampUnix: ts}
 }
 
 // CallSignedMessage returns the deterministic message signed for claims: the

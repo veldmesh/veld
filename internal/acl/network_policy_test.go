@@ -3,10 +3,13 @@
 package acl
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -730,8 +733,8 @@ ports = ["tcp/22"]
 	if loaded.Compiled == nil {
 		t.Error("expected compiled policy")
 	}
-	if loaded.SignerStr != formatPeerKey(pubKeyArr) {
-		t.Errorf("signer: got %q, want %q", loaded.SignerStr, formatPeerKey(pubKeyArr))
+	if loaded.SignerStr != FormatPeerKey(pubKeyArr) {
+		t.Errorf("signer: got %q, want %q", loaded.SignerStr, FormatPeerKey(pubKeyArr))
 	}
 
 	// Load again - should use stored version
@@ -867,8 +870,8 @@ ports = ["tcp/22"]
 	if status.Version != 1 {
 		t.Errorf("status version: got %d, want 1", status.Version)
 	}
-	if status.Signer != formatPeerKey(pubKeyArr) {
-		t.Errorf("status signer: got %q, want %q", status.Signer, formatPeerKey(pubKeyArr))
+	if status.Signer != FormatPeerKey(pubKeyArr) {
+		t.Errorf("status signer: got %q, want %q", status.Signer, FormatPeerKey(pubKeyArr))
 	}
 }
 
@@ -1245,4 +1248,367 @@ func TestDateDiff(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- NetworkPolicyLoader.StoreEnvelope tests ---
+
+func TestNetworkPolicyLoader_StoreEnvelope_OK(t *testing.T) {
+	tmpDir := t.TempDir()
+	identityPath := filepath.Join(tmpDir, "identity.json")
+	if err := os.WriteFile(identityPath, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write identity: %v", err)
+	}
+	policyPath := filepath.Join(tmpDir, "policy.signed")
+
+	privKey, pubKey, err := GenerateAdminKey()
+	if err != nil {
+		t.Fatalf("GenerateAdminKey: %v", err)
+	}
+
+	adminKeys := map[[32]byte]struct{}{}
+	var pubKeyArr [32]byte
+	copy(pubKeyArr[:], pubKey)
+	adminKeys[pubKeyArr] = struct{}{}
+
+	swap := &PolicySwap{}
+	loader := NewNetworkPolicyLoader(policyPath, identityPath, adminKeys, swap)
+
+	// Create a valid envelope
+	envelopeV1 := signPolicyEnvelope(t, 1, privKey)
+
+	// Store the envelope
+	stored, err := loader.StoreEnvelope(envelopeV1)
+	if err != nil {
+		t.Fatalf("StoreEnvelope: %v", err)
+	}
+	if !stored {
+		t.Error("expected stored=true")
+	}
+
+	// Verify the policy is in the swap
+	cp := swap.Load()
+	if cp == nil {
+		t.Fatal("expected compiled policy in swap")
+	}
+	if cp.Version() != 1 {
+		t.Errorf("swap version: got %d, want 1", cp.Version())
+	}
+}
+
+func TestNetworkPolicyLoader_StoreEnvelope_NoAdminKeys(t *testing.T) {
+	tmpDir := t.TempDir()
+	policyPath := filepath.Join(tmpDir, "policy.signed")
+
+	swap := &PolicySwap{}
+	loader := NewNetworkPolicyLoader(policyPath, "/tmp/identity.json", map[[32]byte]struct{}{}, swap)
+
+	adminPriv, _, _ := GenerateAdminKey()
+	envelope := signPolicyEnvelope(t, 1, adminPriv)
+
+	stored, err := loader.StoreEnvelope(envelope)
+	if err == nil {
+		t.Fatal("expected error for no admin keys")
+	}
+	if stored {
+		t.Error("expected stored=false")
+	}
+}
+
+func TestNetworkPolicyLoader_StoreEnvelope_InvalidEnvelope(t *testing.T) {
+	tmpDir := t.TempDir()
+	identityPath := filepath.Join(tmpDir, "identity.json")
+	if err := os.WriteFile(identityPath, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write identity: %v", err)
+	}
+	policyPath := filepath.Join(tmpDir, "policy.signed")
+
+	privKey, pubKey, err := GenerateAdminKey()
+	if err != nil {
+		t.Fatalf("GenerateAdminKey: %v", err)
+	}
+
+	adminKeys := map[[32]byte]struct{}{}
+	var pubKeyArr [32]byte
+	copy(pubKeyArr[:], pubKey)
+	adminKeys[pubKeyArr] = struct{}{}
+
+	swap := &PolicySwap{}
+	loader := NewNetworkPolicyLoader(policyPath, identityPath, adminKeys, swap)
+
+	// Create an invalid envelope (corrupt signature)
+	envelope := signPolicyEnvelope(t, 1, privKey)
+	envelope[len(envelope)-1] ^= 0xFF
+
+	stored, err := loader.StoreEnvelope(envelope)
+	if err == nil {
+		t.Fatal("expected error for invalid envelope")
+	}
+	if stored {
+		t.Error("expected stored=false")
+	}
+}
+
+func TestNetworkPolicyLoader_StoreEnvelope_VersionNotHigher(t *testing.T) {
+	tmpDir := t.TempDir()
+	identityPath := filepath.Join(tmpDir, "identity.json")
+	if err := os.WriteFile(identityPath, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write identity: %v", err)
+	}
+	policyPath := filepath.Join(tmpDir, "policy.signed")
+
+	privKey, pubKey, err := GenerateAdminKey()
+	if err != nil {
+		t.Fatalf("GenerateAdminKey: %v", err)
+	}
+
+	adminKeys := map[[32]byte]struct{}{}
+	var pubKeyArr [32]byte
+	copy(pubKeyArr[:], pubKey)
+	adminKeys[pubKeyArr] = struct{}{}
+
+	swap := &PolicySwap{}
+	loader := NewNetworkPolicyLoader(policyPath, identityPath, adminKeys, swap)
+
+	// Store version 2 first via the store directly
+	store := NewNetworkPolicyStore(identityPath)
+	envV2, _ := ParseNetworkPolicyEnvelope(signPolicyEnvelope(t, 2, privKey), adminKeys)
+	if _, err := store.Store(envV2, adminKeys); err != nil {
+		t.Fatalf("store v2: %v", err)
+	}
+
+	// Load to set current version
+	if err := loader.LoadStoredPolicy(); err != nil {
+		t.Fatalf("LoadStoredPolicy: %v", err)
+	}
+
+	// Try to store version 1 (should fail)
+	stored, err := loader.StoreEnvelope(signPolicyEnvelope(t, 1, privKey))
+	if err == nil {
+		t.Fatal("expected error for version not higher")
+	}
+	if stored {
+		t.Error("expected stored=false")
+	}
+
+	// Try to store version 2 again (should fail - not higher)
+	stored, err = loader.StoreEnvelope(signPolicyEnvelope(t, 2, privKey))
+	if err == nil {
+		t.Fatal("expected error for version not higher")
+	}
+	if stored {
+		t.Error("expected stored=false")
+	}
+
+	// Store version 3 (should succeed)
+	stored, err = loader.StoreEnvelope(signPolicyEnvelope(t, 3, privKey))
+	if err != nil {
+		t.Fatalf("StoreEnvelope v3: %v", err)
+	}
+	if !stored {
+		t.Error("expected stored=true for version 3")
+	}
+}
+
+func TestNetworkPolicyLoader_StoreEnvelope_UnpinnedSigner(t *testing.T) {
+	tmpDir := t.TempDir()
+	identityPath := filepath.Join(tmpDir, "identity.json")
+	if err := os.WriteFile(identityPath, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write identity: %v", err)
+	}
+	policyPath := filepath.Join(tmpDir, "policy.signed")
+
+	_, pubKey1, err := GenerateAdminKey()
+	if err != nil {
+		t.Fatalf("GenerateAdminKey: %v", err)
+	}
+	_, pubKey2, err := GenerateAdminKey()
+	if err != nil {
+		t.Fatalf("GenerateAdminKey: %v", err)
+	}
+
+	adminKeys := map[[32]byte]struct{}{}
+	var pubKey1Arr [32]byte
+	copy(pubKey1Arr[:], pubKey1)
+	adminKeys[pubKey1Arr] = struct{}{}
+
+	swap := &PolicySwap{}
+	loader := NewNetworkPolicyLoader(policyPath, identityPath, adminKeys, swap)
+
+	// Sign with key 2 (not pinned)
+	privKey3, _, _ := GenerateAdminKey()
+	envelope := signPolicyEnvelope(t, 1, privKey3)
+	_ = pubKey2 // unused
+
+	stored, err := loader.StoreEnvelope(envelope)
+	if err == nil {
+		t.Fatal("expected error for unpinned signer")
+	}
+	if stored {
+		t.Error("expected stored=false")
+	}
+}
+
+func TestNetworkPolicyLoader_StoreEnvelope_RefusedLoggedOnce(t *testing.T) {
+	tmpDir := t.TempDir()
+	identityPath := filepath.Join(tmpDir, "identity.json")
+	if err := os.WriteFile(identityPath, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write identity: %v", err)
+	}
+	policyPath := filepath.Join(tmpDir, "policy.signed")
+
+	privKey, pubKey, err := GenerateAdminKey()
+	if err != nil {
+		t.Fatalf("GenerateAdminKey: %v", err)
+	}
+
+	adminKeys := map[[32]byte]struct{}{}
+	var pubKeyArr [32]byte
+	copy(pubKeyArr[:], pubKey)
+	adminKeys[pubKeyArr] = struct{}{}
+
+	swap := &PolicySwap{}
+	loader := NewNetworkPolicyLoader(policyPath, identityPath, adminKeys, swap)
+
+	// Store version 2 first
+	store := NewNetworkPolicyStore(identityPath)
+	envV2, _ := ParseNetworkPolicyEnvelope(signPolicyEnvelope(t, 2, privKey), adminKeys)
+	if _, err := store.Store(envV2, adminKeys); err != nil {
+		t.Fatalf("store v2: %v", err)
+	}
+
+	if err := loader.LoadStoredPolicy(); err != nil {
+		t.Fatalf("LoadStoredPolicy: %v", err)
+	}
+
+	// Capture log output
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+
+	// Try to store version 1 twice - should only log once
+	stored1, err1 := loader.StoreEnvelope(signPolicyEnvelope(t, 1, privKey))
+	stored2, err2 := loader.StoreEnvelope(signPolicyEnvelope(t, 1, privKey))
+
+	if err1 == nil || err2 == nil {
+		t.Fatal("expected error for version not higher")
+	}
+	if stored1 || stored2 {
+		t.Error("expected stored=false")
+	}
+	// Both should return the same error (version not higher)
+	if err1.Error() != err2.Error() {
+		t.Errorf("errors should be consistent: %v vs %v", err1, err2)
+	}
+
+	// Verify log was written only once
+	logOutput := logBuf.String()
+	// Count occurrences of "version 1" in the log
+	count := 0
+	for i := 0; i < len(logOutput); i++ {
+		idx := bytes.Index(logBuf.Bytes()[i:], []byte("version 1"))
+		if idx == -1 {
+			break
+		}
+		count++
+		i += idx + 1
+	}
+	if count != 1 {
+		t.Errorf("expected log message for refused version 1 to appear exactly once, got %d times; log output: %s", count, logOutput)
+	}
+}
+
+func TestNetworkPolicyLoader_StoreEnvelope_DifferentVersionsLoggedSeparately(t *testing.T) {
+	tmpDir := t.TempDir()
+	identityPath := filepath.Join(tmpDir, "identity.json")
+	if err := os.WriteFile(identityPath, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write identity: %v", err)
+	}
+	policyPath := filepath.Join(tmpDir, "policy.signed")
+
+	privKey, pubKey, err := GenerateAdminKey()
+	if err != nil {
+		t.Fatalf("GenerateAdminKey: %v", err)
+	}
+
+	adminKeys := map[[32]byte]struct{}{}
+	var pubKeyArr [32]byte
+	copy(pubKeyArr[:], pubKey)
+	adminKeys[pubKeyArr] = struct{}{}
+
+	swap := &PolicySwap{}
+	loader := NewNetworkPolicyLoader(policyPath, identityPath, adminKeys, swap)
+
+	// Store version 3 first
+	store := NewNetworkPolicyStore(identityPath)
+	envV3, _ := ParseNetworkPolicyEnvelope(signPolicyEnvelope(t, 3, privKey), adminKeys)
+	if _, err := store.Store(envV3, adminKeys); err != nil {
+		t.Fatalf("store v3: %v", err)
+	}
+
+	if err := loader.LoadStoredPolicy(); err != nil {
+		t.Fatalf("LoadStoredPolicy: %v", err)
+	}
+
+	// Capture log output
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+
+	// Try to store version 1 twice - should log once for v1
+	loader.StoreEnvelope(signPolicyEnvelope(t, 1, privKey))
+	loader.StoreEnvelope(signPolicyEnvelope(t, 1, privKey))
+
+	// Try to store version 2 twice - should log once for v2
+	loader.StoreEnvelope(signPolicyEnvelope(t, 2, privKey))
+	loader.StoreEnvelope(signPolicyEnvelope(t, 2, privKey))
+
+	logOutput := logBuf.String()
+
+	// Count occurrences for each version
+	countV1 := 0
+	for i := 0; i < len(logOutput); i++ {
+		idx := bytes.Index(logBuf.Bytes()[i:], []byte("version 1"))
+		if idx == -1 {
+			break
+		}
+		countV1++
+		i += idx + 1
+	}
+
+	countV2 := 0
+	for i := 0; i < len(logOutput); i++ {
+		idx := bytes.Index(logBuf.Bytes()[i:], []byte("version 2"))
+		if idx == -1 {
+			break
+		}
+		countV2++
+		i += idx + 1
+	}
+
+	if countV1 != 1 {
+		t.Errorf("expected log message for refused version 1 to appear exactly once, got %d times", countV1)
+	}
+	if countV2 != 1 {
+		t.Errorf("expected log message for refused version 2 to appear exactly once, got %d times", countV2)
+	}
+}
+
+// Helper to create a signed policy envelope
+func signPolicyEnvelope(t *testing.T, version int, adminPriv ed25519.PrivateKey) []byte {
+	t.Helper()
+	policyTOML := fmt.Sprintf(`version = %d
+default = "deny"
+[peers]
+alice = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bob   = "ed25519:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+[[rule]]
+from = "alice"
+to   = "bob"
+ports = ["tcp/22"]
+`, version)
+	envelope, err := SignPolicy(policyTOML, adminPriv)
+	if err != nil {
+		t.Fatalf("SignPolicy: %v", err)
+	}
+	return envelope
 }

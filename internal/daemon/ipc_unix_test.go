@@ -16,7 +16,7 @@ func TestIPCServer_SocketPermissions(t *testing.T) {
 	defer syscall.Umask(old)
 
 	sock := tempSock(t)
-	srv := NewIPCServer(sock, func() {}, nil, nil)
+	srv := NewIPCServer(sock, func() {}, nil, nil, nil)
 	if err := srv.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestIPCServer_RefusesSharedDirectory(t *testing.T) {
 	if err := os.Chmod(dir, 0o777); err != nil {
 		t.Fatal(err)
 	}
-	srv := NewIPCServer(filepath.Join(dir, "daemon.sock"), func() {}, nil, nil)
+	srv := NewIPCServer(filepath.Join(dir, "daemon.sock"), func() {}, nil, nil, nil)
 	if err := srv.Start(); err == nil {
 		srv.Stop()
 		t.Fatal("started in a world-writable directory")
