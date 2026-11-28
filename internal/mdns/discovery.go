@@ -46,9 +46,13 @@ type Discovery struct {
 // name is the peer name to advertise (e.g. the machine hostname).
 // vpnAddr is the VPN IP that peers should use to reach this node.
 // dataPort is the UDP port the data plane is listening on.
+// tunName is the name of Veld's own tunnel interface ("" if unknown); its
+// addresses are never advertised, since peers cannot reach them before a
+// session exists.
 func New(
 	localID *crypto.Identity,
 	name string,
+	tunName string,
 	vpnAddr netip.Addr,
 	dataPort uint16,
 	onPeer PeerFoundFn,
@@ -61,7 +65,7 @@ func New(
 		"vpn=" + vpnAddr.String(),
 	}
 
-	ips := nonLoopbackIPv4s()
+	ips := advertisedIPv4s(localInterfaces(), tunName, vpnAddr, multicastSource())
 
 	svc, err := hashmDNS.NewMDNSService(name, serviceType, "", "", int(dataPort), ips, txt)
 	if err != nil {
@@ -268,16 +272,77 @@ func parsePeerEntry(e *hashmDNS.ServiceEntry) (*peer.Entry, netip.AddrPort, bool
 	return pe, ep, true
 }
 
-// nonLoopbackIPv4s returns all non-loopback IPv4 addresses on this machine.
-// Falls back to 127.0.0.1 if none are found.
-func nonLoopbackIPv4s() []net.IP {
-	addrs, _ := net.InterfaceAddrs()
+// iface is the part of a network interface that address selection looks at.
+type iface struct {
+	name  string
+	flags net.Flags
+	addrs []net.Addr
+}
+
+func localInterfaces() []iface {
+	ifs, err := net.Interfaces()
+	if err != nil {
+		log.Printf("warning: mDNS: list network interfaces: %v", err)
+		return nil
+	}
+	out := make([]iface, 0, len(ifs))
+	for _, i := range ifs {
+		addrs, err := i.Addrs()
+		if err != nil {
+			continue
+		}
+		out = append(out, iface{name: i.Name, flags: i.Flags, addrs: addrs})
+	}
+	return out
+}
+
+// multicastSource returns the local address the OS would send mDNS traffic
+// from, or the zero Addr if it cannot tell. Connecting a UDP socket sends
+// nothing.
+func multicastSource() netip.Addr {
+	c, err := net.Dial("udp4", "224.0.0.251:5353")
+	if err != nil {
+		return netip.Addr{}
+	}
+	defer func() { _ = c.Close() }()
+	if a, ok := c.LocalAddr().(*net.UDPAddr); ok {
+		return a.AddrPort().Addr().Unmap()
+	}
+	return netip.Addr{}
+}
+
+// advertisedIPv4s picks the LAN addresses to advertise. Interfaces that are
+// down, loopback or point-to-point (tunnels), Veld's own tunnel and the VPN
+// address are never used. Browsers built on hashicorp/mdns keep only one
+// address per host, so if preferred is among the candidates it is the only
+// one advertised; otherwise all candidates are. Falls back to 127.0.0.1 if
+// there are none.
+func advertisedIPv4s(ifs []iface, tunName string, vpnAddr, preferred netip.Addr) []net.IP {
 	var ips []net.IP
-	for _, a := range addrs {
-		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ip4 := ipnet.IP.To4(); ip4 != nil {
-				ips = append(ips, ip4)
+	for _, i := range ifs {
+		if i.flags&net.FlagUp == 0 || i.flags&(net.FlagLoopback|net.FlagPointToPoint) != 0 {
+			continue
+		}
+		if tunName != "" && i.name == tunName {
+			continue
+		}
+		for _, a := range i.addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok || ipnet.IP.IsLoopback() {
+				continue
 			}
+			ip4 := ipnet.IP.To4()
+			if ip4 == nil {
+				continue
+			}
+			addr := netip.AddrFrom4([4]byte(ip4))
+			if addr == vpnAddr {
+				continue
+			}
+			if addr == preferred {
+				return []net.IP{ip4}
+			}
+			ips = append(ips, ip4)
 		}
 	}
 	if len(ips) == 0 {

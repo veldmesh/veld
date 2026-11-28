@@ -23,7 +23,7 @@ func TestMDNS_StartStop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	disc, err := mdns.New(id, "e2e-node", netip.MustParseAddr("10.99.0.1"), 51820, nil)
+	disc, err := mdns.New(id, "e2e-node", "", netip.MustParseAddr("10.99.0.1"), 51820, nil)
 	if err != nil {
 		// Port 5353 may require elevated privileges (e.g. in CI without root).
 		t.Skipf("mdns.New: %v", err)
@@ -57,7 +57,7 @@ func TestMDNS_NilCallbackSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	disc, err := mdns.New(id, "nil-cb-node", netip.MustParseAddr("10.99.0.2"), 51821, nil)
+	disc, err := mdns.New(id, "nil-cb-node", "", netip.MustParseAddr("10.99.0.2"), 51821, nil)
 	if err != nil {
 		t.Skipf("mdns.New: %v", err)
 	}

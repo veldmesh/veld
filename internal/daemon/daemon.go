@@ -50,7 +50,9 @@ type Daemon struct {
 	natMgr    *nat.Manager
 	dnsSrv    *dns.Resolver
 	mdnsDisco *mdns.Discovery
-	routeMgr  route.Manager
+	// mdnsEndpoints maps a peer ID to the endpoint mDNS last set for it.
+	mdnsEndpoints sync.Map
+	routeMgr      route.Manager
 	// restoreIPForward puts IP forwarding back as it was before startup.
 	restoreIPForward func() error
 	ipcSrv           *IPCServer
@@ -636,8 +638,12 @@ func (d *Daemon) newMDNSDiscovery(cfg *intconfig.Config, conn net.PacketConn, vp
 	}
 
 	coordMode := cfg.Coord.Addr != ""
-	return mdns.New(d.localID, mdnsName, vpnAddr, dataPort,
-		func(e *peer.Entry, ep netip.AddrPort) { d.onMDNSPeer(e, ep, coordMode) })
+	allowUnknown := cfg.MDNS.AllowUnknown && !coordMode
+	if allowUnknown {
+		log.Printf("warning: mdns.allow_unknown is on: any host on this LAN can join by advertising itself")
+	}
+	return mdns.New(d.localID, mdnsName, d.selfInterface(), vpnAddr, dataPort,
+		func(e *peer.Entry, ep netip.AddrPort) { d.onMDNSPeer(e, ep, allowUnknown) })
 }
 
 // onVPNAddrAssigned returns the callback invoked when the coordinator
@@ -730,22 +736,30 @@ func (d *Daemon) onVPNAddrAssigned(cfg *intconfig.Config, conn net.PacketConn, u
 // unauthenticated, so they never change a known peer's identity, address or
 // name: for a peer already known (from the coordinator or static config) with
 // the same keys they only suggest an endpoint to try, and the handshake proves
-// it. With a coordinator, the coordinator decides membership and unknown LAN
-// peers are ignored. In LAN-only mode unknown peers are added, subject to the
-// peer table's rule that an address or name belongs to its first owner (and
-// to TOFU pinning on handshake).
-func (d *Daemon) onMDNSPeer(e *peer.Entry, ep netip.AddrPort, coordMode bool) {
+// it. Unknown hosts are ignored, with nothing sent to them, unless
+// allowUnknown is set (LAN-only mode with mdns.allow_unknown). They are then
+// added, subject to the peer table's rule that an address or name belongs to
+// its first owner (and to TOFU pinning on handshake).
+func (d *Daemon) onMDNSPeer(e *peer.Entry, ep netip.AddrPort, allowUnknown bool) {
 	if known, ok := d.peerTbl.LookupByID(e.ID); ok {
 		if known.X25519Pub != e.X25519Pub || !ep.IsValid() {
 			return
 		}
-		if !known.GetEndpoint().IsValid() {
-			d.peerTbl.UpdateEndpoint(known.ID, ep)
+		// Fill a missing endpoint. One that mDNS set may be stale or forged,
+		// so newer records replace it until a session exists. An endpoint set
+		// by anything else (config, coordinator, handshake) is left alone.
+		cur := known.GetEndpoint()
+		learned, _ := d.mdnsEndpoints.Load(known.ID)
+		ours := learned == cur && known.GetSession() == nil && known.GetPendingSession() == nil
+		if !cur.IsValid() || ours {
+			if d.peerTbl.UpdateEndpoint(known.ID, ep) {
+				d.mdnsEndpoints.Store(known.ID, ep)
+			}
 		}
 		d.hsMgr.Initiate(known)
 		return
 	}
-	if coordMode {
+	if !allowUnknown {
 		return
 	}
 	if ep.IsValid() {
@@ -754,6 +768,7 @@ func (d *Daemon) onMDNSPeer(e *peer.Entry, ep netip.AddrPort, coordMode bool) {
 	if !d.peerTbl.Upsert(e) {
 		return
 	}
+	d.mdnsEndpoints.Store(e.ID, ep)
 	d.hsMgr.Initiate(e)
 }
 
