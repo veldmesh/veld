@@ -106,6 +106,40 @@ func mustAddr(s string) netip.Addr {
 	return a
 }
 
+// mustReadDelivered reads from the TUN device with a timeout.
+// It fails the test if no packet is delivered within the given duration.
+// The default timeout is 2 seconds if d <= 0.
+func mustReadDelivered(t *testing.T, tunDev *tun.MemTUN, buf []byte, d time.Duration) int {
+	t.Helper()
+	if d <= 0 {
+		d = 2 * time.Second
+	}
+	done := make(chan struct {
+		n   int
+		err error
+	}, 1)
+	go func() {
+		n, err := tunDev.ReadDelivered(buf)
+		done <- struct {
+			n   int
+			err error
+		}{n, err}
+	}()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("ReadDelivered error: %v", res.err)
+		}
+		if res.n == 0 {
+			t.Fatalf("expected a packet to be delivered within %v, got 0 bytes", d)
+		}
+		return res.n
+	case <-time.After(d):
+		t.Fatalf("expected a packet to be delivered within %v", d)
+	}
+	return 0 // unreachable
+}
+
 // buildIPv4Packet builds a minimal IPv4 packet with the given source and dest IP.
 // Protocol is set to UDP (17) but no UDP header is included.
 // Use for testing IP extraction functions only.
