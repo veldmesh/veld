@@ -60,7 +60,7 @@ Veld runs in three operating modes:
 | Mode | Discovery | Requires a server? | Use case |
 |---|---|---|---|
 | **Static config** | Peer endpoints hard-coded in `config.toml` | No | VPS pairs, port-forwarded routers |
-| **LAN (mDNS)** | mDNS/DNS-SD on the local network | No | Peers already on the same LAN |
+| **LAN (mDNS)** | mDNS/DNS-SD finds the endpoints of listed peers | No | Peers already on the same LAN |
 | **Coord server** | Public-key directory with NAT traversal | Yes (or self-host) | Full mesh over the internet |
 
 ---
@@ -159,9 +159,29 @@ server and NAT traversal entirely.
 mDNS records are unauthenticated. For a peer already known from the coord server or static
 config they only suggest a LAN endpoint (the Noise handshake then proves the peer's key);
 they never change its keys, VPN address or name. With a coord server, unknown LAN peers are
-ignored. In LAN-only mode any host on the LAN can join by advertising itself, but it cannot
+ignored.
+
+In LAN-only mode unknown hosts are ignored too, and nothing is sent to them. List each peer
+under `[[peers]]` with its name, keys and VPN address; `endpoint` can be left out, and
+discovery fills it in. An endpoint learned this way is replaced by newer records until a
+session exists; a configured one is left alone.
+
+```toml
+[mdns]
+enabled = true
+# allow_unknown = true  # any host on the LAN can join, see below
+```
+
+With `allow_unknown = true` any host on the LAN can join by advertising itself. It cannot
 take a VPN address or name another peer already holds, and TOFU pins each address to the
-first key seen there.
+first key seen there, but nothing else decides who gets in. Use it only if you trust every
+device on the network. The daemon logs a warning at each start. The setting has no effect
+with a coord server.
+
+A node never advertises its own tunnel address. It advertises only the address it sends
+multicast traffic from, so on a machine with several networks discovery works on that one.
+If it cannot tell which that is, it advertises every non-tunnel IPv4 address, and peers
+may pick one they cannot reach.
 
 
 **Relay fallback (DERP-style).** When hole punching times out — e.g. both peers behind

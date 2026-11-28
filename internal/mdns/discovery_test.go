@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"net"
 	"net/netip"
+	"slices"
 	"testing"
 
 	hashmDNS "github.com/hashicorp/mdns"
@@ -272,5 +273,54 @@ func TestCollectThenParse_DeduplicatesByPointer(t *testing.T) {
 		if n != 1 {
 			t.Errorf("onPeer called %d times for peer %x, want exactly once", n, id)
 		}
+	}
+}
+
+func TestAdvertisedIPv4s(t *testing.T) {
+	ifc := func(name string, flags net.Flags, ips ...string) iface {
+		i := iface{name: name, flags: flags}
+		for _, s := range ips {
+			i.addrs = append(i.addrs, &net.IPNet{IP: net.ParseIP(s), Mask: net.CIDRMask(24, 32)})
+		}
+		return i
+	}
+	up := net.FlagUp | net.FlagMulticast
+	vpn := netip.MustParseAddr("10.100.0.1")
+	// The LAN is 10.x too: selection must not depend on address ranges.
+	ifs := []iface{
+		ifc("lo", up|net.FlagLoopback, "127.0.0.1"),
+		ifc("eth0", up, "10.1.2.3", "fe80::1"),
+		ifc("docker0", up, "172.17.0.1"),
+		ifc("othervpn", up|net.FlagPointToPoint, "100.64.0.1"),
+		ifc("off0", net.FlagMulticast, "192.168.9.9"),
+		ifc("veld0", up, "10.100.0.2"),
+		ifc("alias", up, "10.100.0.1"),
+	}
+	for _, tc := range []struct {
+		name      string
+		ifs       []iface
+		preferred string
+		want      []string
+	}{
+		{"preferred address only", ifs, "172.17.0.1", []string{"172.17.0.1"}},
+		{"preferred on a 10.x LAN", ifs, "10.1.2.3", []string{"10.1.2.3"}},
+		{"no preference", ifs, "", []string{"10.1.2.3", "172.17.0.1"}},
+		{"preferred is our tunnel", ifs, "10.100.0.2", []string{"10.1.2.3", "172.17.0.1"}},
+		{"preferred is the VPN address", ifs, "10.100.0.1", []string{"10.1.2.3", "172.17.0.1"}},
+		{"nothing usable", ifs[5:], "", []string{"127.0.0.1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var preferred netip.Addr
+			if tc.preferred != "" {
+				preferred = netip.MustParseAddr(tc.preferred)
+			}
+			var got []string
+			for _, ip := range advertisedIPv4s(tc.ifs, "veld0", vpn, preferred) {
+				got = append(got, ip.String())
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

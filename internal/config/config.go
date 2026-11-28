@@ -25,6 +25,10 @@ type DNSConfig struct {
 type MDNSConfig struct {
 	Enabled bool   `toml:"enabled"`
 	Name    string `toml:"name"` // peer name to advertise; defaults to hostname if empty
+	// AllowUnknown lets hosts that are not listed under [[peers]] join in
+	// LAN-only mode just by advertising themselves, so anyone on the LAN can
+	// join. Off by default; ignored when a coord server is configured.
+	AllowUnknown bool `toml:"allow_unknown"`
 }
 
 // Config is the top-level node configuration loaded from a TOML file.

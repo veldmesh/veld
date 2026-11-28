@@ -5,6 +5,14 @@ deployment coordination requirements are recorded here before they ship.
 
 ## Unreleased
 
+- **LAN discovery: only listed peers join by default.** In LAN-only mode,
+  hosts that are not listed under `[[peers]]` are now ignored. If you relied
+  on devices joining automatically, list them (`endpoint` can be left out), or
+  set `allow_unknown = true` under `[mdns]`, which lets any host on the LAN
+  join. Discovery also stops advertising the tunnel address, which peers could
+  not reach; it advertises the address the node sends multicast from, when it
+  can tell which that is.
+
 - **Coord: add proof of key possession to `Register`.** A daemon's `Register`
   request now carries `timestamp_unix` and `signature` — an Ed25519 signature
   by the machine's private key over the request's identity fields (network,

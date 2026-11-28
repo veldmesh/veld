@@ -24,7 +24,7 @@ Traffic flows directly between your devices. When direct connection isn't possib
 - **Custom Noise IK handshake** — Ed25519 identity keys, X25519 session keys, ChaCha20-Poly1305 encryption, forward secrecy
 - **No WireGuard kernel module or daemon** — needs only the kernel TUN driver (kmod-tun on OpenWrt)
 - **NAT traversal** — UDP hole-punching via ICE for most NATs. Where direct connection fails (symmetric NAT on both sides), traffic relays through a chosen mesh peer over a Noise IK-encrypted channel — never the coordination server. The relaying peer sees only encrypted packet sizes/timing, not content.
-- **Three operating modes** — static config (no server), LAN mDNS discovery, full coord server
+- **Three operating modes** — static config (no server), LAN mDNS discovery of listed peers, full coord server
 - **Name-based routing** — `ping server1.veld` via local DNS stub
 - **Subnet routing** — expose a whole LAN through one Veld node (IoT gateway)
 - **TOFU key pinning** — peer fingerprints saved on first connect; mismatches blocked
