@@ -182,6 +182,17 @@ jobs:
           go build ./cmd/veld-coord
           go build ./cmd/veld
 
+  release-notes:
+    name: Release notes generator
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Test release-notes.sh
+        run: sh packaging/release-notes_test.sh
+
   aur-pkgbuild:
     name: AUR PKGBUILD generator
     runs-on: ubuntu-latest
